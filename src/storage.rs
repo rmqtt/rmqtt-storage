@@ -4,6 +4,7 @@ use std::future::Future;
 
 use crate::storage_redis::{RedisStorageDB, RedisStorageList, RedisStorageMap};
 use crate::storage_sled::{SledStorageList, SledStorageMap};
+use crate::TimestampMillis;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -34,7 +35,7 @@ pub(crate) trait AsyncIterator {
 pub trait StorageDB: Send + Sync {
     type MapType: Map;
 
-    fn map<V: AsRef<[u8]>>(&self, name: V) -> Result<Self::MapType>;
+    fn map<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::MapType>;
 
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -47,6 +48,20 @@ pub trait StorageDB: Send + Sync {
         V: DeserializeOwned + Sync + Send;
 
     async fn remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool>;
+
+    async fn expire_at<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
+    async fn expire<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
+    async fn ttl<K>(&mut self, key: K) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send;
 }
@@ -173,7 +188,7 @@ pub enum DefaultStorageDB {
 
 impl DefaultStorageDB {
     #[inline]
-    pub fn map<V: AsRef<[u8]>>(&self, name: V) -> Result<StorageMap> {
+    pub fn map<V: AsRef<[u8]>>(&mut self, name: V) -> Result<StorageMap> {
         match self {
             DefaultStorageDB::Sled(db) => {
                 let s = db.map(name)?;
@@ -218,6 +233,47 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.remove(key).await,
             DefaultStorageDB::Redis(db) => db.remove(key).await,
+        }
+    }
+
+    #[inline]
+    pub async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.contains_key(key).await,
+            DefaultStorageDB::Redis(db) => db.contains_key(key).await,
+        }
+    }
+
+    #[inline]
+    pub async fn expire_at<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.expire_at(key, dur).await,
+            DefaultStorageDB::Redis(db) => db.expire_at(key, dur).await,
+        }
+    }
+
+    #[inline]
+    pub async fn expire<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.expire(key, dur).await,
+            DefaultStorageDB::Redis(db) => db.expire(key, dur).await,
+        }
+    }
+
+    #[inline]
+    pub async fn ttl<K>(&mut self, key: K) -> Result<Option<TimestampMillis>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.ttl(key).await,
+            DefaultStorageDB::Redis(db) => db.ttl(key).await,
         }
     }
 }

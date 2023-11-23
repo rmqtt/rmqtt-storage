@@ -5,16 +5,17 @@ extern crate core;
 use anyhow::Error;
 use serde::de;
 
+use storage_redis::RedisStorageDB;
 use storage_sled::SledStorageDB;
 
 mod storage;
 mod storage_redis;
 mod storage_sled;
 
-pub type Result<T> = anyhow::Result<T>;
-use crate::storage_redis::RedisStorageDB;
 pub use storage::{DefaultStorageDB, List, Map, StorageDB};
 pub use storage_sled::SledConfig;
+
+pub type Result<T> = anyhow::Result<T>;
 
 pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
     match cfg.storage_type {
@@ -81,6 +82,21 @@ impl<'de> de::Deserialize<'de> for StorageType {
     }
 }
 
+pub(crate) type TimestampMillis = usize;
+
+#[inline]
+pub(crate) fn timestamp_millis() -> TimestampMillis {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_millis() as TimestampMillis)
+        .unwrap_or_else(|_| {
+            let now = chrono::Local::now();
+            now.timestamp_millis() as TimestampMillis
+            //std::time::Duration::new(now.timestamp() as u64, now.timestamp_subsec_nanos())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,7 +137,7 @@ mod tests {
     #[test]
     async fn test_tree() {
         let cfg = get_cfg("tree");
-        let db = init_db(&cfg).await.unwrap();
+        let mut db = init_db(&cfg).await.unwrap();
 
         let mut kv001 = db.map("tree_kv001").unwrap();
         let kv_key_1 = b"kv_key_1";
@@ -180,7 +196,7 @@ mod tests {
     #[test]
     async fn test_batch() {
         let cfg = get_cfg("batch");
-        let db = init_db(&cfg).await.unwrap();
+        let mut db = init_db(&cfg).await.unwrap();
 
         let skv = db.map("batch_kv001").unwrap();
 
@@ -199,7 +215,7 @@ mod tests {
     #[test]
     async fn test_array() {
         let cfg = get_cfg("array");
-        let db = init_db(&cfg).await.unwrap();
+        let mut db = init_db(&cfg).await.unwrap();
 
         let mut skv = db.map("array_kv001").unwrap();
         let array_a = skv.list("array_a").unwrap();
@@ -448,7 +464,7 @@ mod tests {
     #[test]
     async fn test_iter() {
         let cfg = get_cfg("iter");
-        let db = init_db(&cfg).await.unwrap();
+        let mut db = init_db(&cfg).await.unwrap();
 
         let mut skv = db.map("iter_kv002").unwrap();
         skv.clear().await.unwrap();
@@ -522,5 +538,87 @@ mod tests {
                 (b"key2_4".to_vec(), 4)
             ]
         );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_expire() {
+        let cfg = get_cfg("expire");
+        let mut db = init_db(&cfg).await.unwrap();
+
+        let res_none = db.ttl("test_k001").await.unwrap();
+        println!("ttl res: {:?}", res_none);
+        assert_eq!(res_none, None);
+
+        let mut ttl_001 = db.map("ttl_001").unwrap();
+        ttl_001.clear().await.unwrap();
+        let ttl_001_res_none = db.ttl("ttl_001").await.unwrap();
+        println!("ttl_001_res_none: {:?}", ttl_001_res_none);
+        assert_eq!(ttl_001_res_none, None);
+
+        ttl_001.insert("k1", &1).await.unwrap();
+        ttl_001.insert("k2", &2).await.unwrap();
+        let list_1 = ttl_001.list("list_1").unwrap();
+        list_1.push(&"a").await.unwrap();
+        list_1.push(&"b").await.unwrap();
+
+        let ttl_001_res = db.ttl("ttl_001").await.unwrap();
+        println!("ttl_001_res: {:?}", ttl_001_res);
+        assert!(ttl_001_res.is_some());
+
+        let expire_res = db.expire("ttl_001", 60 * 1000).await.unwrap();
+        println!("expire_res: {:?}", expire_res);
+        assert_eq!(expire_res, expire_res);
+
+        let ttl_001_res = db.ttl("ttl_001").await.unwrap().unwrap();
+        println!("ttl_001_res: {:?}", ttl_001_res);
+        assert!(ttl_001_res <= 60 * 1000);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_db_contains_key() {
+        let cfg = get_cfg("contains_key");
+        let mut db = init_db(&cfg).await.unwrap();
+        db.remove("test_c_001").await.unwrap();
+        let c_res = db.contains_key("test_c_001").await.unwrap();
+        assert!(!c_res);
+
+        db.insert("test_c_001", &"val_001").await.unwrap();
+        let c_res = db.contains_key("test_c_001").await.unwrap();
+        assert!(c_res);
+
+        let mut map_001 = db.map("map_001").unwrap();
+        map_001.clear().await.unwrap();
+        map_001.insert("k1", &1).await.unwrap();
+        let c_res = db.contains_key("map_001").await.unwrap();
+        assert!(c_res);
+        map_001.clear().await.unwrap();
+        //println!("map_001.len: {:?}", map_001.len().await.unwrap());
+        let c_res = db.contains_key("map_001").await.unwrap();
+        assert!(!c_res);
+        let l1 = map_001.list("l1").unwrap();
+        l1.push(&"aa").await.unwrap();
+        l1.push(&"bb").await.unwrap();
+
+        let c_res = db.contains_key("map_001").await.unwrap();
+        assert!(c_res);
+
+        let _ = db.map("map_002").unwrap();
+        let c_res = db.contains_key("map_002").await.unwrap();
+        assert!(!c_res);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_map() {
+        let cfg = get_cfg("map");
+        let mut db = init_db(&cfg).await.unwrap();
+        let now = std::time::Instant::now();
+        for i in 0..100_000 {
+            let sess = db.map(format!("session_id_{}", i)).unwrap();
+            sess.insert("k001", &i).await.unwrap();
+        }
+        println!("test_map cost time: {:?}", now.elapsed());
     }
 }

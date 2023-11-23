@@ -6,8 +6,10 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashSet;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+
 use sled::transaction::{
     ConflictableTransactionError, ConflictableTransactionResult, TransactionalTree,
 };
@@ -16,10 +18,11 @@ use sled::{Batch, IVec};
 use tokio::task::{block_in_place, spawn_blocking};
 
 use crate::storage::{IsList, IterItem, Key, List, Map, StorageDB, StorageList, Value};
-use crate::{Error, Result};
+use crate::{timestamp_millis, Error, Result, TimestampMillis};
 
 const LIST_KEY_COUNT_PREFIX: &[u8] = b"@count@";
 const LIST_KEY_CONTENT_PREFIX: &[u8] = b"@content@";
+const EXPIRE_AT_KEY_PREFIX: &[u8] = b"@expireat@";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SledConfig {
@@ -53,13 +56,59 @@ impl SledConfig {
 #[derive(Clone)]
 pub struct SledStorageDB {
     db: Arc<sled::Db>,
+    tree_names: Arc<DashSet<IVec>>,
 }
 
 impl SledStorageDB {
     #[inline]
     pub(crate) fn new(cfg: sled::Config) -> Result<Self> {
-        let db = Arc::new(cfg.open()?);
-        Ok(Self { db })
+        let (db, tree_names) = block_in_place(move || {
+            cfg.open().map(|db| {
+                let tree_names = db.tree_names();
+                (Arc::new(db), tree_names)
+            })
+        })?;
+
+        let tree_names = tree_names
+            .into_iter()
+            //.map(|name| name.to_vec())
+            .collect::<DashSet<_>>();
+
+        Ok(Self {
+            db,
+            tree_names: Arc::new(tree_names),
+        })
+    }
+
+    #[inline]
+    fn make_expire_key<K>(key: K) -> Key
+    where
+        K: AsRef<[u8]>,
+    {
+        [EXPIRE_AT_KEY_PREFIX, key.as_ref()].concat()
+    }
+
+    #[inline]
+    fn _contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        if self.tree_names.contains(key.as_ref()) {
+            let tree = self.db.open_tree(key.as_ref())?;
+            Ok(!tree.is_empty())
+        } else {
+            Ok(self.db.contains_key(key)?)
+        }
+    }
+
+    #[inline]
+    fn _remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        if self.tree_names.contains(key.as_ref()) {
+            self.db.drop_tree(key.as_ref())?;
+            self.tree_names.remove(key.as_ref());
+        }
+        self.db.remove(key)?;
+        Ok(())
     }
 }
 
@@ -68,12 +117,15 @@ impl StorageDB for SledStorageDB {
     type MapType = SledStorageMap;
 
     #[inline]
-    fn map<V: AsRef<[u8]>>(&self, name: V) -> Result<Self::MapType> {
-        let tree = self.db.open_tree(name.as_ref())?;
-        Ok(SledStorageMap {
-            //name: name.as_ref().to_vec(),
-            tree,
-        })
+    fn map<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::MapType> {
+        let tree = block_in_place(move || {
+            let tree = self.db.open_tree(name.as_ref());
+            if tree.is_ok() && !self.tree_names.contains(name.as_ref()) {
+                self.tree_names.insert(IVec::from(name.as_ref()));
+            }
+            tree
+        })?;
+        Ok(SledStorageMap { tree })
     }
 
     #[inline]
@@ -108,16 +160,90 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let db = self.db.clone();
+        let this = self.clone();
         let key = key.as_ref().to_vec();
-        spawn_blocking(move || db.remove(key)).await??;
+        spawn_blocking(move || this._remove(key)).await??;
         Ok(())
+    }
+
+    #[inline]
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
+        if self.tree_names.contains(key.as_ref()) {
+            let db = self.db.clone();
+            let key = key.as_ref().to_vec();
+            let is_empty =
+                spawn_blocking(move || db.open_tree(key).map(|tree| tree.is_empty())).await??;
+            Ok(!is_empty)
+        } else {
+            let key = key.as_ref().to_vec();
+            let db = self.db.clone();
+            Ok(spawn_blocking(move || db.contains_key(key)).await??)
+        }
+    }
+
+    #[inline]
+    async fn expire_at<K>(&mut self, key: K, at: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let db = self.db.clone();
+        let key = Self::make_expire_key(key);
+        let _ = spawn_blocking(move || {
+            db.insert(key, at.to_be_bytes().as_slice())
+                .map_err(|e| anyhow!(e))
+        })
+        .await??;
+        Ok(true)
+    }
+
+    #[inline]
+    async fn expire<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let at = timestamp_millis() + dur;
+        self.expire_at(key, at).await
+    }
+
+    #[inline]
+    async fn ttl<K>(&mut self, key: K) -> Result<Option<TimestampMillis>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let c_key = key.as_ref().to_vec();
+        let e_key = Self::make_expire_key(key.as_ref());
+        let this = self.clone();
+        let ttl_res = spawn_blocking(move || match this.db.get(e_key) {
+            Ok(Some(v)) => Ok(Some(TimestampMillis::from_be_bytes(v.as_ref().try_into()?))),
+            Ok(None) => {
+                if this._contains_key(c_key)? {
+                    Ok(Some(TimestampMillis::MAX))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => Err(anyhow!(e)),
+        })
+        .await??;
+
+        let ttl_res = if let Some(at) = ttl_res {
+            let now = timestamp_millis();
+            if now > at {
+                //is expire
+                None
+            } else {
+                Some(at - now)
+            }
+        } else {
+            None
+        };
+        Ok(ttl_res)
     }
 }
 
 #[derive(Clone)]
 pub struct SledStorageMap {
-    //name: Key,
+    //_db: SledStorageDB,
     pub(crate) tree: sled::Tree,
 }
 
@@ -293,8 +419,13 @@ impl Map for SledStorageMap {
 
     #[inline]
     async fn clear(&mut self) -> Result<()> {
+        //let db = self.db.clone();
         let tree = self.tree.clone();
-        spawn_blocking(move || tree.clear()).await??;
+        spawn_blocking(move || {
+            tree.clear()
+            //            db._remove(tree.name().as_ref())
+        })
+        .await??;
         Ok(())
     }
 

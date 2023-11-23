@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::task::block_in_place;
 
 use crate::storage::{IsList, IterItem, Key, Map, StorageDB, StorageList, Value};
-use crate::{List, Result};
+use crate::{List, Result, TimestampMillis};
 
 #[derive(Clone)]
 pub struct RedisStorageDB {
@@ -50,7 +50,7 @@ impl StorageDB for RedisStorageDB {
     type MapType = RedisStorageMap;
 
     #[inline]
-    fn map<V: AsRef<[u8]>>(&self, name: V) -> Result<Self::MapType> {
+    fn map<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::MapType> {
         Ok(RedisStorageMap::new(name.as_ref().to_vec(), self.clone()))
     }
 
@@ -90,6 +90,80 @@ impl StorageDB for RedisStorageDB {
     {
         self.async_conn().del(key.as_ref()).await?;
         Ok(())
+    }
+
+    #[inline]
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
+        //HEXISTS key field
+        let res = self.async_conn().exists(key.as_ref()).await?;
+        if res {
+            Ok(true)
+        } else {
+            let mut m = self.map(key.as_ref())?;
+            let mut iter = m.list_key_iter().await?;
+            Ok(iter.next().is_some())
+        }
+    }
+
+    #[inline]
+    async fn expire_at<K>(&mut self, key: K, e_at: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let res = self
+            .async_conn_mut()
+            .pexpire_at::<_, bool>(key.as_ref(), e_at)
+            .await?;
+        if res {
+            let mut m = self.map(key.as_ref())?;
+
+            let list_keys = m.list_key_iter().await?.collect::<Result<Vec<_>>>()?;
+
+            for list_key in list_keys {
+                let list_key = [key.as_ref(), b"@", list_key.as_slice()].concat();
+                let _ = self
+                    .async_conn()
+                    .pexpire_at::<_, ()>(list_key, e_at)
+                    .await?;
+            }
+        }
+
+        Ok(res)
+    }
+
+    #[inline]
+    async fn expire<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let res = self
+            .async_conn_mut()
+            .pexpire::<_, bool>(key.as_ref(), dur)
+            .await?;
+        if res {
+            let mut m = self.map(key.as_ref())?;
+
+            let list_keys = m.list_key_iter().await?.collect::<Result<Vec<_>>>()?;
+
+            for list_key in list_keys {
+                let list_key = [key.as_ref(), b"@", list_key.as_slice()].concat();
+                let _ = self.async_conn().pexpire::<_, ()>(list_key, dur).await?;
+            }
+        }
+
+        Ok(res)
+    }
+
+    async fn ttl<K>(&mut self, key: K) -> Result<Option<TimestampMillis>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let res = self.async_conn_mut().pttl::<_, isize>(key.as_ref()).await?;
+        match res {
+            -2 => Ok(None),
+            -1 => Ok(Some(TimestampMillis::MAX)),
+            _ => Ok(Some(res as TimestampMillis)),
+        }
     }
 }
 
