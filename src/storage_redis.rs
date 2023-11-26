@@ -673,6 +673,25 @@ impl List for RedisStorageList {
         }
     }
 
+    async fn pop<V>(&self) -> Result<Option<V>>
+    where
+        V: DeserializeOwned + Sync + Send,
+    {
+        //LPOP key
+        let removed = self
+            .async_conn()
+            .lpop::<_, Option<Vec<u8>>>(self.name.as_slice(), None)
+            .await?;
+
+        let removed = if let Some(v) = removed {
+            Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
+        } else {
+            None
+        };
+
+        Ok(removed)
+    }
+
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send,
@@ -719,25 +738,6 @@ impl List for RedisStorageList {
     async fn clear(&self) -> Result<()> {
         self.async_conn().del(self.name.as_slice()).await?;
         Ok(())
-    }
-
-    async fn pop<V>(&self) -> Result<Option<V>>
-    where
-        V: DeserializeOwned + Sync + Send,
-    {
-        //LPOP key
-        let removed = self
-            .async_conn()
-            .lpop::<_, Option<Vec<u8>>>(self.name.as_slice(), None)
-            .await?;
-
-        let removed = if let Some(v) = removed {
-            Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
-        } else {
-            None
-        };
-
-        Ok(removed)
     }
 
     fn iter<'a, V>(&'a self) -> Result<Box<dyn Iterator<Item = Result<V>> + 'a>>

@@ -157,6 +157,10 @@ pub trait List: Sync + Send {
         V: serde::ser::Serialize + Sync + Send,
         V: DeserializeOwned;
 
+    async fn pop<V>(&self) -> Result<Option<V>>
+    where
+        V: DeserializeOwned + Sync + Send;
+
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send;
@@ -170,10 +174,6 @@ pub trait List: Sync + Send {
     async fn is_empty(&self) -> Result<bool>;
 
     async fn clear(&self) -> Result<()>;
-
-    async fn pop<V>(&self) -> Result<Option<V>>
-    where
-        V: DeserializeOwned + Sync + Send;
 
     fn iter<'a, V>(&'a self) -> Result<Box<dyn Iterator<Item = Result<V>> + 'a>>
     where
