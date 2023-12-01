@@ -1,5 +1,4 @@
 use core::fmt;
-use std::fmt::Debug;
 use std::future::Future;
 
 use crate::storage_redis::{RedisStorageDB, RedisStorageList, RedisStorageMap};
@@ -13,41 +12,29 @@ use super::storage_sled::SledStorageDB;
 use super::Result;
 
 pub type Key = Vec<u8>;
-pub type IsList = bool;
 
-#[derive(Debug)]
-pub enum Value<V> {
-    Val(V),
-    List(StorageList),
-}
-
-//pub type IterItem<'a, V> = BoxFuture<'a, Result<(Key, Value<V>)>>;
-//pub type IterItem<'a, V> = Result<(Key, Value<V>)>;
 pub type IterItem<'a, V> = Result<(Key, V)>;
-
-#[async_trait]
-pub(crate) trait AsyncIterator {
-    type Item;
-    async fn next(&mut self) -> Option<Self::Item>;
-}
 
 #[async_trait]
 pub trait StorageDB: Send + Sync {
     type MapType: Map;
+    type ListType: List;
 
     fn map<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::MapType>;
 
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    fn list<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::ListType>;
+
+    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send;
 
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send;
 
-    async fn remove<K>(&self, key: K) -> Result<()>
+    async fn remove<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send;
 
@@ -68,52 +55,42 @@ pub trait StorageDB: Send + Sync {
 
 #[async_trait]
 pub trait Map: Sync + Send {
-    type ListType: List;
-
-    fn list<V: AsRef<[u8]>>(&self, name: V) -> Result<Self::ListType>;
-
-    async fn list_iter<'a>(
-        &'a mut self,
-    ) -> Result<Box<dyn Iterator<Item = Result<(Key, StorageList)>> + 'a>>;
-
-    async fn list_key_iter<'a>(&'a mut self) -> Result<Box<dyn Iterator<Item = Result<Key>> + 'a>>;
-
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send + ?Sized;
 
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send;
 
-    async fn remove<K>(&self, key: K) -> Result<()>
+    async fn remove<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send;
 
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool>;
 
-    async fn len(&self) -> Result<usize>;
+    async fn len(&mut self) -> Result<usize>;
 
-    async fn is_empty(&self) -> Result<bool>;
+    async fn is_empty(&mut self) -> Result<bool>;
 
     async fn clear(&mut self) -> Result<()>;
 
-    async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn remove_and_fetch<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send;
 
-    async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
+    async fn remove_with_prefix<K>(&mut self, prefix: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send;
 
-    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    async fn batch_insert<V>(&mut self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
         V: serde::ser::Serialize + Sync + Send;
 
-    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()>;
+    async fn batch_remove(&mut self, keys: Vec<Key>) -> Result<()>;
 
     async fn iter<'a, V>(&'a mut self) -> Result<Box<dyn Iterator<Item = IterItem<'a, V>> + 'a>>
     where
@@ -131,13 +108,13 @@ pub trait Map: Sync + Send {
 
     async fn retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, Value<V>)>) -> Out + Send + Sync,
+        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a;
 
     async fn retain_with_key<'a, F, Out>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, IsList)>) -> Out + Send + Sync,
+        F: Fn(Result<Key>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a;
 }
 
@@ -202,7 +179,15 @@ impl DefaultStorageDB {
     }
 
     #[inline]
-    pub async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    pub fn list<V: AsRef<[u8]>>(&mut self, name: V) -> Result<StorageList> {
+        Ok(match self {
+            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name)?),
+            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name)?),
+        })
+    }
+
+    #[inline]
+    pub async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send,
@@ -214,7 +199,7 @@ impl DefaultStorageDB {
     }
 
     #[inline]
-    pub async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    pub async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
@@ -226,7 +211,7 @@ impl DefaultStorageDB {
     }
 
     #[inline]
-    pub async fn remove<K>(&self, key: K) -> Result<()>
+    pub async fn remove<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -286,31 +271,23 @@ pub enum StorageMap {
 
 #[async_trait]
 impl Map for StorageMap {
-    type ListType = StorageList;
-    fn list<V: AsRef<[u8]>>(&self, name: V) -> Result<Self::ListType> {
-        Ok(match self {
-            StorageMap::Sled(map) => StorageList::Sled(map.list(name)?),
-            StorageMap::Redis(map) => StorageList::Redis(map.list(name)?),
-        })
-    }
+    // async fn list_iter<'a>(
+    //     &'a mut self,
+    // ) -> Result<Box<dyn Iterator<Item = Result<(Key, StorageList)>> + 'a>> {
+    //     match self {
+    //         StorageMap::Sled(tree) => tree.list_iter().await,
+    //         StorageMap::Redis(tree) => tree.list_iter().await,
+    //     }
+    // }
+    //
+    // async fn list_key_iter<'a>(&'a mut self) -> Result<Box<dyn Iterator<Item = Result<Key>> + 'a>> {
+    //     match self {
+    //         StorageMap::Sled(tree) => tree.list_key_iter().await,
+    //         StorageMap::Redis(tree) => tree.list_key_iter().await,
+    //     }
+    // }
 
-    async fn list_iter<'a>(
-        &'a mut self,
-    ) -> Result<Box<dyn Iterator<Item = Result<(Key, StorageList)>> + 'a>> {
-        match self {
-            StorageMap::Sled(tree) => tree.list_iter().await,
-            StorageMap::Redis(tree) => tree.list_iter().await,
-        }
-    }
-
-    async fn list_key_iter<'a>(&'a mut self) -> Result<Box<dyn Iterator<Item = Result<Key>> + 'a>> {
-        match self {
-            StorageMap::Sled(tree) => tree.list_key_iter().await,
-            StorageMap::Redis(tree) => tree.list_key_iter().await,
-        }
-    }
-
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send + ?Sized,
@@ -321,7 +298,7 @@ impl Map for StorageMap {
         }
     }
 
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
@@ -332,7 +309,7 @@ impl Map for StorageMap {
         }
     }
 
-    async fn remove<K>(&self, key: K) -> Result<()>
+    async fn remove<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -342,21 +319,21 @@ impl Map for StorageMap {
         }
     }
 
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
         match self {
             StorageMap::Sled(tree) => tree.contains_key(key).await,
             StorageMap::Redis(tree) => tree.contains_key(key).await,
         }
     }
 
-    async fn len(&self) -> Result<usize> {
+    async fn len(&mut self) -> Result<usize> {
         match self {
             StorageMap::Sled(tree) => tree.len().await,
             StorageMap::Redis(tree) => tree.len().await,
         }
     }
 
-    async fn is_empty(&self) -> Result<bool> {
+    async fn is_empty(&mut self) -> Result<bool> {
         match self {
             StorageMap::Sled(tree) => tree.is_empty().await,
             StorageMap::Redis(tree) => tree.is_empty().await,
@@ -370,7 +347,7 @@ impl Map for StorageMap {
         }
     }
 
-    async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn remove_and_fetch<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
@@ -381,7 +358,7 @@ impl Map for StorageMap {
         }
     }
 
-    async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
+    async fn remove_with_prefix<K>(&mut self, prefix: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -391,7 +368,7 @@ impl Map for StorageMap {
         }
     }
 
-    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    async fn batch_insert<V>(&mut self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
         V: Serialize + Sync + Send,
     {
@@ -401,7 +378,7 @@ impl Map for StorageMap {
         }
     }
 
-    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+    async fn batch_remove(&mut self, keys: Vec<Key>) -> Result<()> {
         match self {
             StorageMap::Sled(tree) => tree.batch_remove(keys).await,
             StorageMap::Redis(tree) => tree.batch_remove(keys).await,
@@ -441,7 +418,7 @@ impl Map for StorageMap {
 
     async fn retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, Value<V>)>) -> Out + Send + Sync,
+        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a,
     {
@@ -453,7 +430,7 @@ impl Map for StorageMap {
 
     async fn retain_with_key<'a, F, Out>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, IsList)>) -> Out + Send + Sync,
+        F: Fn(Result<Key>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
     {
         match self {
@@ -509,6 +486,16 @@ impl List for StorageList {
         }
     }
 
+    async fn pop<V>(&self) -> Result<Option<V>>
+    where
+        V: DeserializeOwned + Sync + Send,
+    {
+        match self {
+            StorageList::Sled(list) => list.pop().await,
+            StorageList::Redis(list) => list.pop().await,
+        }
+    }
+
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send,
@@ -547,16 +534,6 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.clear().await,
             StorageList::Redis(list) => list.clear().await,
-        }
-    }
-
-    async fn pop<V>(&self) -> Result<Option<V>>
-    where
-        V: DeserializeOwned + Sync + Send,
-    {
-        match self {
-            StorageList::Sled(list) => list.pop().await,
-            StorageList::Redis(list) => list.pop().await,
         }
     }
 

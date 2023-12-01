@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::task::block_in_place;
 
-use crate::storage::{IsList, IterItem, Key, Map, StorageDB, StorageList, Value};
+use crate::storage::{IterItem, Key, Map, StorageDB};
 use crate::{List, Result, TimestampMillis};
 
 #[derive(Clone)]
@@ -48,32 +48,37 @@ impl RedisStorageDB {
 #[async_trait]
 impl StorageDB for RedisStorageDB {
     type MapType = RedisStorageMap;
+    type ListType = RedisStorageList;
 
     #[inline]
     fn map<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::MapType> {
         Ok(RedisStorageMap::new(name.as_ref().to_vec(), self.clone()))
     }
 
+    fn list<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::ListType> {
+        Ok(RedisStorageList::new(name.as_ref().to_vec(), self.clone()))
+    }
+
     #[inline]
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send,
     {
-        self.async_conn()
+        self.async_conn_mut()
             .set(key.as_ref(), bincode::serialize(val)?)
             .await?;
         Ok(())
     }
 
     #[inline]
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
         if let Some(v) = self
-            .async_conn()
+            .async_conn_mut()
             .get::<_, Option<Vec<u8>>>(key.as_ref())
             .await?
         {
@@ -84,25 +89,18 @@ impl StorageDB for RedisStorageDB {
     }
 
     #[inline]
-    async fn remove<K>(&self, key: K) -> Result<()>
+    async fn remove<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        self.async_conn().del(key.as_ref()).await?;
+        self.async_conn_mut().del(key.as_ref()).await?;
         Ok(())
     }
 
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
         //HEXISTS key field
-        let res = self.async_conn().exists(key.as_ref()).await?;
-        if res {
-            Ok(true)
-        } else {
-            let mut m = self.map(key.as_ref())?;
-            let mut iter = m.list_key_iter().await?;
-            Ok(iter.next().is_some())
-        }
+        Ok(self.async_conn_mut().exists(key.as_ref()).await?)
     }
 
     #[inline]
@@ -114,20 +112,6 @@ impl StorageDB for RedisStorageDB {
             .async_conn_mut()
             .pexpire_at::<_, bool>(key.as_ref(), e_at)
             .await?;
-        if res {
-            let mut m = self.map(key.as_ref())?;
-
-            let list_keys = m.list_key_iter().await?.collect::<Result<Vec<_>>>()?;
-
-            for list_key in list_keys {
-                let list_key = [key.as_ref(), b"@", list_key.as_slice()].concat();
-                let _ = self
-                    .async_conn()
-                    .pexpire_at::<_, ()>(list_key, e_at)
-                    .await?;
-            }
-        }
-
         Ok(res)
     }
 
@@ -140,17 +124,6 @@ impl StorageDB for RedisStorageDB {
             .async_conn_mut()
             .pexpire::<_, bool>(key.as_ref(), dur)
             .await?;
-        if res {
-            let mut m = self.map(key.as_ref())?;
-
-            let list_keys = m.list_key_iter().await?.collect::<Result<Vec<_>>>()?;
-
-            for list_key in list_keys {
-                let list_key = [key.as_ref(), b"@", list_key.as_slice()].concat();
-                let _ = self.async_conn().pexpire::<_, ()>(list_key, dur).await?;
-            }
-        }
-
         Ok(res)
     }
 
@@ -179,41 +152,14 @@ impl RedisStorageMap {
         Self { name, db }
     }
 
-    #[inline]
-    fn async_conn(&self) -> MultiplexedConnection {
-        self.db.async_conn()
-    }
+    // #[inline]
+    // fn async_conn(&self) -> MultiplexedConnection {
+    //     self.db.async_conn()
+    // }
 
     #[inline]
     fn async_conn_mut(&mut self) -> &mut MultiplexedConnection {
         self.db.async_conn_mut()
-    }
-
-    //#[inline]
-    //pub(crate) fn conn(&self) -> Result<Connection> {
-    //    self.db.conn()
-    //}
-
-    #[inline]
-    fn list_pattern_and_prefix(name: Key) -> (Vec<u8>, Vec<u8>) {
-        let mut list_pattern = name;
-        list_pattern.push(b'@');
-        let list_prefix = list_pattern.to_vec();
-        list_pattern.push(b'*');
-        (list_pattern, list_prefix)
-    }
-
-    #[inline]
-    async fn _list_key_iter<'a>(
-        name: Key,
-        async_conn: &'a mut MultiplexedConnection,
-    ) -> Result<Box<dyn Iterator<Item = Result<Key>> + 'a>> {
-        let (list_pattern, list_prefix) = Self::list_pattern_and_prefix(name);
-        let iter = MapListKeyIter {
-            list_prefix,
-            iter: async_conn.scan_match::<_, Key>(list_pattern).await?,
-        };
-        Ok(Box::new(iter))
     }
 
     #[inline]
@@ -230,11 +176,10 @@ impl RedisStorageMap {
     #[inline]
     async fn _retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, Value<V>)>) -> Out + Send + Sync,
+        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a,
     {
-        let db = self.db.clone();
         let name = self.name.clone();
         let async_conn_mut = self.async_conn_mut();
         let batch_size = 20;
@@ -247,7 +192,7 @@ impl RedisStorageMap {
         while let Some((key, val)) = iter.next_item().await {
             match bincode::deserialize::<V>(val.as_ref()) {
                 Ok(v) => {
-                    if !f(Ok((key.clone(), Value::Val(v)))).await {
+                    if !f(Ok((key.clone(), v))).await {
                         removeds.push(key);
                     }
                 }
@@ -264,27 +209,16 @@ impl RedisStorageMap {
             async_conn_mut.hdel(name.as_slice(), batch).await?;
         }
 
-        let (list_pattern, list_prefix) = Self::list_pattern_and_prefix(name);
-        //Remove List
-        let mut iter = async_conn_mut.scan_match::<_, Key>(list_pattern).await?;
-        while let Some(list_name) = iter.next_item().await {
-            let key = list_name[list_prefix.len()..].as_ref().to_vec();
-            let l = RedisStorageList::new(list_name, db.clone());
-            if !f(Ok((key, Value::List(StorageList::Redis(l.clone()))))).await {
-                l.clear().await?;
-            }
-        }
         Ok(())
     }
 
     #[inline]
     async fn _retain_with_key<'a, F, Out>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, IsList)>) -> Out + Send + Sync,
+        F: Fn(Result<Key>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
     {
         let name = self.name.clone();
-        let mut async_conn = self.async_conn();
         let async_conn_mut = self.async_conn_mut();
 
         let batch_size = 20;
@@ -295,7 +229,7 @@ impl RedisStorageMap {
             .hscan::<_, (Key, ())>(name.as_slice())
             .await?;
         while let Some((key, _)) = iter.next_item().await {
-            if !f(Ok((key.clone(), false))).await {
+            if !f(Ok(key.clone())).await {
                 removeds.push(key);
             }
         }
@@ -305,84 +239,35 @@ impl RedisStorageMap {
             async_conn_mut.hdel(name.as_slice(), batch).await?;
         }
 
-        let (list_pattern, list_prefix) = Self::list_pattern_and_prefix(name);
-        //Remove List
-        let mut iter = async_conn_mut.scan_match::<_, Key>(list_pattern).await?;
-        while let Some(list_name) = iter.next_item().await {
-            let key = list_name[list_prefix.len()..].as_ref().to_vec();
-            if !f(Ok((key, true))).await {
-                async_conn.del(list_name).await?;
-            }
-        }
         Ok(())
     }
 }
 
 #[async_trait]
 impl Map for RedisStorageMap {
-    type ListType = RedisStorageList;
-
     #[inline]
-    fn list<V: AsRef<[u8]>>(&self, name: V) -> Result<Self::ListType> {
-        let mut list_name = self.name.clone();
-        list_name.push(b'@');
-        list_name.extend_from_slice(name.as_ref());
-        Ok(RedisStorageList::new(list_name, self.db.clone()))
-    }
-
-    #[inline]
-    async fn list_iter<'a>(
-        &'a mut self,
-    ) -> Result<Box<dyn Iterator<Item = Result<(Key, StorageList)>> + 'a>> {
-        let (list_pattern, list_prefix) = Self::list_pattern_and_prefix(self.name.clone());
-        let iter = MapListIter {
-            map: self.clone(),
-            list_prefix,
-            iter: self
-                .async_conn_mut()
-                .scan_match::<_, Key>(list_pattern)
-                .await?,
-        };
-        Ok(Box::new(iter))
-    }
-
-    #[inline]
-    async fn list_key_iter<'a>(&'a mut self) -> Result<Box<dyn Iterator<Item = Result<Key>> + 'a>> {
-        let (list_pattern, list_prefix) = Self::list_pattern_and_prefix(self.name.clone());
-        let iter = MapListKeyIter {
-            list_prefix,
-            iter: self
-                .async_conn_mut()
-                .scan_match::<_, Key>(list_pattern)
-                .await?,
-        };
-        Ok(Box::new(iter))
-    }
-
-    #[inline]
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send + ?Sized,
     {
         //HSET key field value
-        self.async_conn()
-            .hset(self.name.as_slice(), key.as_ref(), bincode::serialize(val)?)
+        let name = self.name.clone();
+        self.async_conn_mut()
+            .hset(name, key.as_ref(), bincode::serialize(val)?)
             .await?;
         Ok(())
     }
 
     #[inline]
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
         //HSET key field value
-        let res: Option<Vec<u8>> = self
-            .async_conn()
-            .hget(self.name.as_slice(), key.as_ref())
-            .await?;
+        let name = self.name.clone();
+        let res: Option<Vec<u8>> = self.async_conn_mut().hget(name, key.as_ref()).await?;
         if let Some(res) = res {
             Ok(Some(bincode::deserialize::<V>(res.as_ref())?))
         } else {
@@ -391,39 +276,38 @@ impl Map for RedisStorageMap {
     }
 
     #[inline]
-    async fn remove<K>(&self, key: K) -> Result<()>
+    async fn remove<K>(&mut self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
         //HDEL key field [field ...]
-        self.async_conn()
-            .hdel(self.name.as_slice(), key.as_ref())
-            .await?;
+        let name = self.name.clone();
+        self.async_conn_mut().hdel(name, key.as_ref()).await?;
         Ok(())
     }
 
     #[inline]
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
         //HEXISTS key field
-        let res = self
-            .async_conn()
-            .hexists(self.name.as_slice(), key.as_ref())
-            .await?;
+        let name = self.name.clone();
+        let res = self.async_conn_mut().hexists(name, key.as_ref()).await?;
         Ok(res)
     }
 
     #[inline]
-    async fn len(&self) -> Result<usize> {
+    async fn len(&mut self) -> Result<usize> {
         //HLEN key
-        Ok(self.async_conn().hlen(self.name.as_slice()).await?)
+        let name = self.name.clone();
+        Ok(self.async_conn_mut().hlen(name).await?)
     }
 
     #[inline]
-    async fn is_empty(&self) -> Result<bool> {
+    async fn is_empty(&mut self) -> Result<bool> {
         //HSCAN key cursor [MATCH pattern] [COUNT count]
+        let name = self.name.clone();
         let res = self
-            .async_conn()
-            .hscan::<_, Vec<u8>>(self.name.as_slice())
+            .async_conn_mut()
+            .hscan::<_, Vec<u8>>(name)
             .await?
             .next_item()
             .await
@@ -435,31 +319,25 @@ impl Map for RedisStorageMap {
     async fn clear(&mut self) -> Result<()> {
         //DEL key [key ...]
         let name = self.name.clone();
-        self.async_conn_mut().del(name.as_slice()).await?;
-
-        let list_names = self.list_key_iter().await?.collect::<Result<Vec<Key>>>()?;
-        for list_name in list_names {
-            self.async_conn_mut()
-                .del([name.clone(), vec![b'@'], list_name].concat())
-                .await?;
-        }
+        self.async_conn_mut().del(name).await?;
         Ok(())
     }
 
     #[inline]
-    async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
+    async fn remove_and_fetch<K, V>(&mut self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
         //HSET key field value
         //HDEL key field [field ...]
-        let mut conn = self.async_conn();
+        let name = self.name.clone();
+        let conn = self.async_conn_mut();
         let (res, _): (Option<Vec<u8>>, isize) = redis::pipe()
             .atomic()
-            .hget(self.name.as_slice(), key.as_ref())
-            .hdel(self.name.as_slice(), key.as_ref())
-            .query_async(&mut conn)
+            .hget(name.as_slice(), key.as_ref())
+            .hdel(name.as_slice(), key.as_ref())
+            .query_async(conn)
             .await?;
 
         if let Some(res) = res {
@@ -470,37 +348,36 @@ impl Map for RedisStorageMap {
     }
 
     #[inline]
-    async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
+    async fn remove_with_prefix<K>(&mut self, prefix: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let mut conn = self.async_conn();
+        let name = self.name.clone();
+        let conn = self.async_conn_mut();
         let mut conn2 = conn.clone();
         let mut prefix = prefix.as_ref().to_vec();
         prefix.push(b'*');
         let mut removeds = Vec::new();
         while let Some(key) = conn
-            .hscan_match::<_, _, Vec<u8>>(self.name.as_slice(), prefix.as_slice())
+            .hscan_match::<_, _, Vec<u8>>(name.as_slice(), prefix.as_slice())
             .await?
             .next_item()
             .await
         {
             removeds.push(key);
             if removeds.len() > 20 {
-                conn2
-                    .hdel(self.name.as_slice(), removeds.as_slice())
-                    .await?;
+                conn2.hdel(name.as_slice(), removeds.as_slice()).await?;
                 removeds.clear();
             }
         }
         if !removeds.is_empty() {
-            conn.hdel(self.name.as_slice(), removeds).await?;
+            conn.hdel(name.as_slice(), removeds).await?;
         }
         Ok(())
     }
 
     #[inline]
-    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    async fn batch_insert<V>(&mut self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
         V: Serialize + Sync + Send,
     {
@@ -512,15 +389,17 @@ impl Map for RedisStorageMap {
                     .map_err(|e| anyhow!(e))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.async_conn()
-            .hset_multiple(self.name.as_slice(), key_vals.as_slice())
+        let name = self.name.clone();
+        self.async_conn_mut()
+            .hset_multiple(name, key_vals.as_slice())
             .await?;
         Ok(())
     }
 
     #[inline]
-    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
-        self.async_conn().hdel(self.name.as_slice(), keys).await?;
+    async fn batch_remove(&mut self, keys: Vec<Key>) -> Result<()> {
+        let name = self.name.clone();
+        self.async_conn_mut().hdel(name, keys).await?;
         Ok(())
     }
 
@@ -574,7 +453,7 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, Value<V>)>) -> Out + Send + Sync,
+        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a,
     {
@@ -584,7 +463,7 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn retain_with_key<'a, F, Out>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, IsList)>) -> Out + Send + Sync,
+        F: Fn(Result<Key>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
     {
         self._retain_with_key(f).await
@@ -608,10 +487,6 @@ impl RedisStorageList {
         self.name.as_slice()
     }
 
-    //#[inline]
-    //pub(crate) fn async_conn_mut(&mut self) -> &mut MultiplexedConnection {
-    //    self.db.async_conn_mut()
-    //}
     #[inline]
     pub(crate) fn async_conn(&self) -> MultiplexedConnection {
         self.db.async_conn()
@@ -824,7 +699,6 @@ where
             tokio::runtime::Handle::current().block_on(async move {
                 let item = self.iter.next_item().await;
                 item.map(|(key, v)| match bincode::deserialize::<V>(v.as_ref()) {
-                    //Ok(v) => Some(Ok((key, Value::Val(v)))),
                     Ok(v) => Ok((key, v)),
                     Err(e) => Err(anyhow::Error::new(e)),
                 })
@@ -845,30 +719,6 @@ impl<'a> Iterator for KeyIter<'a> {
         block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async move { self.iter.next_item().await.map(|(key, _)| Ok(key)) })
-        })
-    }
-}
-
-pub struct MapListIter<'a> {
-    map: RedisStorageMap,
-    list_prefix: Key,
-    iter: redis::AsyncIter<'a, Key>,
-}
-
-impl<'a> Iterator for MapListIter<'a> {
-    type Item = Result<(Key, StorageList)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                self.iter.next_item().await.map(|key| {
-                    let key = key[self.list_prefix.len()..].to_vec();
-                    match self.map.list(key.as_slice()) {
-                        Ok(l) => Ok((key, StorageList::Redis(l))),
-                        Err(e) => Err(e),
-                    }
-                })
-            })
         })
     }
 }
