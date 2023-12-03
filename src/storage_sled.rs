@@ -1,14 +1,17 @@
-use anyhow::anyhow;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Timelike;
+use convert::Bytesize;
+use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tokio::task::spawn_blocking;
 
 use sled::transaction::{
     ConflictableTransactionError, ConflictableTransactionResult, TransactionError,
@@ -16,25 +19,23 @@ use sled::transaction::{
 };
 use sled::Batch;
 
-use tokio::task::{block_in_place, spawn_blocking};
-
-use crate::storage::{IterItem, Key, List, Map, StorageDB};
-use crate::{timestamp_millis, Error, Result, TimestampMillis};
+use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
+use crate::{timestamp_millis, Error, Result, StorageList, StorageMap, TimestampMillis};
 
 const SEPARATOR: &[u8] = b"@";
-const DEF_TREE: &[u8] = b"__@default_tree@";
-const MAP_NAME_PREFIX: &[u8] = b"__@map@";
-const MAP_KEY_SEPARATOR: &[u8] = b"@item@";
-const MAP_KEY_COUNT_SUFFIX: &[u8] = b"count@";
-const LIST_NAME_PREFIX: &[u8] = b"__@list@";
-const LIST_KEY_COUNT_SUFFIX: &[u8] = b"count@";
-const LIST_KEY_CONTENT_SUFFIX: &[u8] = b"content@";
-const EXPIRE_AT_KEY_PREFIX: &[u8] = b"__@expireat@";
+const DEF_TREE: &[u8] = b"__default_tree@";
+const MAP_NAME_PREFIX: &[u8] = b"__map@";
+const MAP_KEY_SEPARATOR: &[u8] = b"@__item@";
+const MAP_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
+const LIST_NAME_PREFIX: &[u8] = b"__list@";
+const LIST_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
+const LIST_KEY_CONTENT_SUFFIX: &[u8] = b"@__content@";
+const EXPIRE_AT_KEY_PREFIX: &[u8] = b"__expireat@";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SledConfig {
     pub path: String,
-    pub cache_capacity: u64,
+    pub cache_capacity: Bytesize,
     pub gc_at_hour: u32,
     pub gc_at_minute: u32,
 }
@@ -43,7 +44,7 @@ impl Default for SledConfig {
     fn default() -> Self {
         SledConfig {
             path: String::default(),
-            cache_capacity: 1024 * 1024 * 1024,
+            cache_capacity: Bytesize::from(1024 * 1024 * 1024),
             gc_at_hour: 2,
             gc_at_minute: 30,
         }
@@ -58,7 +59,7 @@ impl SledConfig {
         }
         let sled_cfg = sled::Config::default()
             .path(self.path.trim())
-            .cache_capacity(self.cache_capacity)
+            .cache_capacity(self.cache_capacity.as_u64())
             .mode(sled::Mode::HighThroughput);
         Ok(sled_cfg)
     }
@@ -104,14 +105,15 @@ pub struct SledStorageDB {
 
 impl SledStorageDB {
     #[inline]
-    pub(crate) fn new(cfg: SledConfig) -> Result<Self> {
+    pub(crate) async fn new(cfg: SledConfig) -> Result<Self> {
         let sled_cfg = cfg.to_sled_config()?;
-        let (db, def_tree) = block_in_place(move || {
+        let (db, def_tree) = spawn_blocking(move || {
             sled_cfg.open().map(|db| {
                 let def_tree = db.open_tree(DEF_TREE);
                 (Arc::new(db), def_tree)
             })
-        })?;
+        })
+        .await??;
         let def_tree = def_tree?;
         let db = Self { db, def_tree };
         let mut sled_db = db.clone();
@@ -224,10 +226,20 @@ impl SledStorageDB {
         [
             MAP_NAME_PREFIX,
             name.as_ref(),
-            SEPARATOR,
+            //SEPARATOR,
             MAP_KEY_COUNT_SUFFIX,
         ]
         .concat()
+    }
+
+    #[inline]
+    fn map_count_key_to_name(key: &[u8]) -> &[u8] {
+        key[MAP_NAME_PREFIX.len()..key.as_ref().len() - MAP_KEY_COUNT_SUFFIX.len()].as_ref()
+    }
+
+    #[inline]
+    fn is_map_count_key(key: &[u8]) -> bool {
+        key.starts_with(MAP_NAME_PREFIX) && key.ends_with(MAP_KEY_COUNT_SUFFIX)
     }
 
     #[inline]
@@ -235,7 +247,17 @@ impl SledStorageDB {
     where
         K: AsRef<[u8]>,
     {
-        [LIST_NAME_PREFIX, name.as_ref(), SEPARATOR].concat()
+        [LIST_NAME_PREFIX, name.as_ref()].concat()
+    }
+
+    #[inline]
+    fn list_count_key_to_name(key: &[u8]) -> &[u8] {
+        key[LIST_NAME_PREFIX.len()..key.as_ref().len() - LIST_KEY_COUNT_SUFFIX.len()].as_ref()
+    }
+
+    #[inline]
+    fn is_list_count_key(key: &[u8]) -> bool {
+        key.starts_with(LIST_NAME_PREFIX) && key.ends_with(LIST_KEY_COUNT_SUFFIX)
     }
 
     #[inline]
@@ -243,11 +265,11 @@ impl SledStorageDB {
         if self.db.contains_key(key.as_ref())? {
             Ok(true)
         } else {
-            let m = self.map(key.as_ref())?;
+            let m = self.map(key.as_ref());
             if !m._is_empty() {
                 Ok(true)
             } else {
-                let l = self.list(key.as_ref())?;
+                let l = self.list(key.as_ref());
                 Ok(!l._is_empty()?)
             }
         }
@@ -259,8 +281,8 @@ impl SledStorageDB {
         K: AsRef<[u8]>,
     {
         self.db.remove(key.as_ref())?;
-        self.map(key.as_ref())?._clear()?;
-        self.list(key.as_ref())?._clear()?;
+        self.map(key.as_ref())._clear()?;
+        self.list(key.as_ref())._clear()?;
         Self::_remove_expire_key(self.db.as_ref(), key.as_ref())
             .map_err(|e| anyhow!(format!("{:?}", e)))?;
         Ok(())
@@ -375,26 +397,26 @@ impl StorageDB for SledStorageDB {
     type ListType = SledStorageList;
 
     #[inline]
-    fn map<K: AsRef<[u8]>>(&mut self, name: K) -> Result<Self::MapType> {
+    fn map<K: AsRef<[u8]>>(&self, name: K) -> Self::MapType {
         let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_ref());
         let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_ref());
         let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_ref());
-        Ok(SledStorageMap {
+        SledStorageMap {
             name: name.as_ref().to_vec(),
             map_prefix_name,
             map_item_prefix_name,
             map_count_key_name,
             db: self.clone(),
-        })
+        }
     }
 
     #[inline]
-    fn list<V: AsRef<[u8]>>(&mut self, name: V) -> Result<Self::ListType> {
-        Ok(SledStorageList {
+    fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
+        SledStorageList {
             name: name.as_ref().to_vec(),
             prefix_name: SledStorageDB::make_list_prefix(name),
             db: self.clone(),
-        })
+        }
     }
 
     #[inline]
@@ -510,6 +532,32 @@ impl StorageDB for SledStorageDB {
         let mut this = self.clone();
         Ok(spawn_blocking(move || this._ttl(key)).await??)
     }
+
+    #[inline]
+    async fn map_iter<'a>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageMap>> + Send + 'a>> {
+        let this = self.clone();
+        let iter = spawn_blocking(move || {
+            let iter = Arc::new(RwLock::new(this.def_tree.scan_prefix(MAP_NAME_PREFIX)));
+            Box::new(AsyncMapIter { db: this, iter })
+        })
+        .await?;
+        Ok(iter)
+    }
+
+    #[inline]
+    async fn list_iter<'a>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>> {
+        let this = self.clone();
+        let iter = spawn_blocking(move || {
+            let iter = Arc::new(RwLock::new(this.def_tree.scan_prefix(LIST_NAME_PREFIX)));
+            Box::new(AsyncListIter { db: this, iter })
+        })
+        .await?;
+        Ok(iter)
+    }
 }
 
 #[derive(Clone)]
@@ -533,7 +581,7 @@ impl SledStorageMap {
     }
 
     #[inline]
-    fn map_count_key_to_name(map_prefix_len: usize, key: &[u8]) -> &[u8] {
+    fn map_item_key_to_name(map_prefix_len: usize, key: &[u8]) -> &[u8] {
         key[map_prefix_len..].as_ref()
     }
 
@@ -713,7 +761,7 @@ impl SledStorageMap {
         {
             match key {
                 Ok(k) => {
-                    let name = SledStorageMap::map_count_key_to_name(
+                    let name = SledStorageMap::map_item_key_to_name(
                         self.map_item_prefix_name.len(),
                         k.as_ref(),
                     );
@@ -741,7 +789,7 @@ impl SledStorageMap {
     }
 
     #[inline]
-    async fn _retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
+    async fn _retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
     where
         F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
         Out: Future<Output = bool> + Send + 'a,
@@ -756,7 +804,7 @@ impl SledStorageMap {
             let (k, v) = item?;
             match bincode::deserialize::<V>(v.as_ref()) {
                 Ok(v) => {
-                    let name = SledStorageMap::map_count_key_to_name(
+                    let name = SledStorageMap::map_item_key_to_name(
                         self.map_item_prefix_name.len(),
                         k.as_ref(),
                     );
@@ -815,6 +863,11 @@ impl SledStorageMap {
 
 #[async_trait]
 impl Map for SledStorageMap {
+    #[inline]
+    fn name(&self) -> &[u8] {
+        self.name.as_slice()
+    }
+
     #[inline]
     async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
     where
@@ -1032,103 +1085,128 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn iter<'a, V>(&'a mut self) -> Result<Box<dyn Iterator<Item = IterItem<'a, V>> + 'a>>
+    async fn iter<'a, V>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
     where
-        V: DeserializeOwned + Sync + Send + 'a,
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        block_in_place(move || {
-            if self.db._is_expired(self.name.as_slice())? {
-                let iter: Box<dyn Iterator<Item = IterItem<V>>> = Box::new(EmptyIter {
-                    _m: std::marker::PhantomData,
-                });
-                Ok(iter)
+        let mut this = self.clone();
+        let res = spawn_blocking(move || {
+            if this.db._is_expired(this.name.as_slice())? {
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
             } else {
-                let tem_prefix_name = self.map_item_prefix_name.len();
-                let iter: Box<dyn Iterator<Item = IterItem<V>>> = Box::new(Iter {
+                let tem_prefix_name = this.map_item_prefix_name.len();
+                let iter = Arc::new(RwLock::new(
+                    this.tree()
+                        .scan_prefix(this.map_item_prefix_name.as_slice()),
+                ));
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
                     prefix_len: tem_prefix_name,
-                    _tree: self,
-                    iter: self
-                        .tree()
-                        .scan_prefix(self.map_item_prefix_name.as_slice()),
+                    iter,
                     _m: std::marker::PhantomData,
                 });
-                Ok(iter)
+                Ok::<_, anyhow::Error>(iter)
             }
         })
+        .await??;
+        Ok(res)
     }
 
     #[inline]
-    async fn key_iter<'a>(&'a mut self) -> Result<Box<dyn Iterator<Item = Result<Key>> + 'a>> {
-        block_in_place(move || {
-            if self.db._is_expired(self.name.as_slice())? {
-                let iter: Box<dyn Iterator<Item = Result<Key>>> = Box::new(EmptyIter {
-                    _m: std::marker::PhantomData,
-                });
-                Ok(iter)
+    async fn key_iter<'a>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
+        let mut this = self.clone();
+        let res = spawn_blocking(move || {
+            if this.db._is_expired(this.name.as_slice())? {
+                let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
             } else {
-                let iter: Box<dyn Iterator<Item = Result<Key>>> = Box::new(KeyIter {
-                    prefix_len: self.map_item_prefix_name.len(),
-                    iter: self
-                        .tree()
-                        .scan_prefix(self.map_item_prefix_name.as_slice()),
-                });
-                Ok(iter)
+                let iter = Arc::new(RwLock::new(
+                    this.tree()
+                        .scan_prefix(this.map_item_prefix_name.as_slice()),
+                ));
+                let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
+                    Box::new(AsyncKeyIter {
+                        prefix_len: this.map_item_prefix_name.len(),
+                        iter,
+                    });
+                Ok::<_, anyhow::Error>(iter)
             }
         })
+        .await??;
+        Ok(res)
     }
 
     #[inline]
     async fn prefix_iter<'a, P, V>(
         &'a mut self,
         prefix: P,
-    ) -> Result<Box<dyn Iterator<Item = IterItem<'a, V>> + 'a>>
+    ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
     where
         P: AsRef<[u8]> + Send,
-        V: DeserializeOwned + Sync + Send + 'a,
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        block_in_place(move || {
-            if self.db._is_expired(self.name.as_slice())? {
-                let iter: Box<dyn Iterator<Item = IterItem<V>>> = Box::new(EmptyIter {
-                    _m: std::marker::PhantomData,
-                });
-                Ok(iter)
+        let mut this = self.clone();
+        let prefix = prefix.as_ref().to_vec();
+        let res = spawn_blocking(move || {
+            if this.db._is_expired(this.name.as_slice())? {
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
             } else {
-                let iter: Box<dyn Iterator<Item = IterItem<V>>> = Box::new(Iter {
-                    prefix_len: self.map_item_prefix_name.len(),
-                    _tree: self,
-                    iter: self.tree().scan_prefix(
-                        [self.map_item_prefix_name.as_slice(), prefix.as_ref()].concat(),
-                    ),
+                let iter = Arc::new(RwLock::new(this.tree().scan_prefix(
+                    [this.map_item_prefix_name.as_slice(), prefix.as_ref()].concat(),
+                )));
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
+                    prefix_len: this.map_item_prefix_name.len(),
+                    iter,
                     _m: std::marker::PhantomData,
                 });
-                Ok(iter)
+                Ok::<_, anyhow::Error>(iter)
             }
         })
+        .await??;
+        Ok(res)
     }
 
     #[inline]
     async fn retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
+        F: Fn(Result<(Key, V)>) -> Out + Send + Sync + 'static,
         Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a,
     {
-        block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move { self._retain(f).await })
-        })?;
+        let this = self.clone();
+        spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move { this._retain(f).await })
+        })
+        .await??;
         Ok(())
     }
 
     #[inline]
     async fn retain_with_key<'a, F, Out>(&'a mut self, f: F) -> Result<()>
     where
-        F: Fn(Result<Key>) -> Out + Send + Sync,
+        F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
         Out: Future<Output = bool> + Send + 'a,
     {
-        block_in_place(move || {
+        let this = self.clone();
+        spawn_blocking(move || {
             tokio::runtime::Handle::current()
-                .block_on(async move { self._retain_with_key(f).await })
-        })?;
+                .block_on(async move { this._retain_with_key(f).await })
+        })
+        .await??;
         Ok(())
     }
 }
@@ -1260,6 +1338,11 @@ impl SledStorageList {
 
 #[async_trait]
 impl List for SledStorageList {
+    #[inline]
+    fn name(&self) -> &[u8] {
+        self.name.as_slice()
+    }
+
     #[inline]
     async fn push<V>(&self, val: &V) -> Result<()>
     where
@@ -1524,110 +1607,205 @@ impl List for SledStorageList {
     }
 
     #[inline]
-    fn iter<'a, V>(&'a self) -> Result<Box<dyn Iterator<Item = Result<V>> + 'a>>
+    async fn iter<'a, V>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<V>> + Send + 'a>>
     where
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         let mut this = self.clone();
-        block_in_place(move || {
-            if this.db._is_expired(self.name.as_slice())? {
-                let iter: Box<dyn Iterator<Item = Result<V>>> = Box::new(EmptyIter {
-                    _m: std::marker::PhantomData,
-                });
-                Ok(iter)
+        let res = spawn_blocking(move || {
+            if this.db._is_expired(this.name.as_slice())? {
+                let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
             } else {
                 let list_content_prefix = this.make_list_content_prefix(None);
-                let iter: Box<dyn Iterator<Item = Result<V>>> = Box::new(ListValIter {
-                    iter: this.tree().scan_prefix(list_content_prefix),
-                    _m: std::marker::PhantomData,
-                });
-                Ok(iter)
+                let iter = Arc::new(RwLock::new(this.tree().scan_prefix(list_content_prefix)));
+                let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
+                    Box::new(AsyncListValIter {
+                        iter,
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
             }
         })
+        .await??;
+        Ok(res)
     }
 }
 
-pub struct Iter<'a, V> {
+pub struct AsyncIter<V> {
     prefix_len: usize,
-    _tree: &'a SledStorageMap,
-    iter: sled::Iter,
+    iter: Arc<RwLock<sled::Iter>>,
     _m: std::marker::PhantomData<V>,
 }
 
-impl<'a, V> Iterator for Iter<'a, V>
+#[async_trait]
+impl<V> AsyncIterator for AsyncIter<V>
 where
-    V: DeserializeOwned + Sync + Send + 'a,
+    V: DeserializeOwned + Sync + Send + 'static,
 {
-    type Item = IterItem<'a, V>;
+    type Item = IterItem<V>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let item = block_in_place(|| match self.iter.next() {
+    async fn next(&mut self) -> Option<Self::Item> {
+        let iter = self.iter.clone();
+        let prefix_len = self.prefix_len;
+        let item = spawn_blocking(move || match iter.write().next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, v))) => {
-                let name = k.as_ref()[self.prefix_len..].to_vec();
+                let name = k.as_ref()[prefix_len..].to_vec();
                 match bincode::deserialize::<V>(v.as_ref()) {
                     Ok(v) => Some(Ok((name, v))),
                     Err(e) => Some(Err(anyhow::Error::new(e))),
                 }
             }
-        });
-        item
+        })
+        .await;
+        match item {
+            Err(e) => Some(Err(anyhow!(e))),
+            Ok(item) => item,
+        }
     }
 }
 
-pub struct KeyIter {
+pub struct AsyncKeyIter {
     prefix_len: usize,
-    iter: sled::Iter,
+    iter: Arc<RwLock<sled::Iter>>,
 }
 
-impl Iterator for KeyIter {
+#[async_trait]
+impl AsyncIterator for AsyncKeyIter {
     type Item = Result<Key>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        block_in_place(|| {
-            return match self.iter.next() {
+    async fn next(&mut self) -> Option<Self::Item> {
+        let iter = self.iter.clone();
+        let prefix_len = self.prefix_len;
+        let item = spawn_blocking(move || {
+            return match iter.write().next() {
                 None => None,
                 Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
-                    let name = k.as_ref()[self.prefix_len..].to_vec();
+                    let name = k.as_ref()[prefix_len..].to_vec();
                     Some(Ok(name))
                 }
             };
         })
+        .await;
+        match item {
+            Err(e) => Some(Err(anyhow!(e))),
+            Ok(item) => item,
+        }
     }
 }
 
-pub struct ListValIter<V> {
-    iter: sled::Iter,
+pub struct AsyncListValIter<V> {
+    iter: Arc<RwLock<sled::Iter>>,
     _m: std::marker::PhantomData<V>,
 }
 
-impl<V> Iterator for ListValIter<V>
+#[async_trait]
+impl<V> AsyncIterator for AsyncListValIter<V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
     type Item = Result<V>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        block_in_place(|| match self.iter.next() {
+    async fn next(&mut self) -> Option<Self::Item> {
+        let iter = self.iter.clone();
+        spawn_blocking(move || match iter.write().next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((_k, v))) => {
                 Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
             }
         })
+        .await
+        .unwrap()
     }
 }
 
-pub struct EmptyIter<T> {
+pub struct AsyncEmptyIter<T> {
     _m: std::marker::PhantomData<T>,
 }
 
-impl<T> Iterator for EmptyIter<T> {
+#[async_trait]
+impl<T> AsyncIterator for AsyncEmptyIter<T>
+where
+    T: Send + Sync + 'static,
+{
     type Item = T;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    async fn next(&mut self) -> Option<Self::Item> {
         None
+    }
+}
+
+pub struct AsyncMapIter {
+    db: SledStorageDB,
+    iter: Arc<RwLock<sled::Iter>>,
+}
+
+#[async_trait]
+impl AsyncIterator for AsyncMapIter {
+    type Item = Result<StorageMap>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        let iter = self.iter.clone();
+        let db = self.db.clone();
+        let res = spawn_blocking(move || loop {
+            match iter.write().next() {
+                None => return None,
+                Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+                Some(Ok((k, _))) => {
+                    if !SledStorageDB::is_map_count_key(k.as_ref()) {
+                        continue;
+                    }
+                    let name = SledStorageDB::map_count_key_to_name(k.as_ref());
+                    return Some(Ok(StorageMap::Sled(db.map(name))));
+                }
+            }
+        })
+        .await;
+        match res {
+            Err(e) => Some(Err(anyhow!(e))),
+            Ok(item) => item,
+        }
+    }
+}
+
+pub struct AsyncListIter {
+    db: SledStorageDB,
+    iter: Arc<RwLock<sled::Iter>>,
+}
+
+#[async_trait]
+impl AsyncIterator for AsyncListIter {
+    type Item = Result<StorageList>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        let iter = self.iter.clone();
+        let db = self.db.clone();
+        let res = spawn_blocking(move || loop {
+            match iter.write().next() {
+                None => return None,
+                Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+                Some(Ok((k, _))) => {
+                    if !SledStorageDB::is_list_count_key(k.as_ref()) {
+                        continue;
+                    }
+                    let name = SledStorageDB::list_count_key_to_name(k.as_ref());
+                    return Some(Ok(StorageList::Sled(db.list(name))));
+                }
+            }
+        })
+        .await;
+        match res {
+            Err(e) => Some(Err(anyhow!(e))),
+            Ok(item) => item,
+        }
     }
 }
