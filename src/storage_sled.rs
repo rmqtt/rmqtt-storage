@@ -121,6 +121,8 @@ impl SledStorageDB {
         std::thread::spawn(move || {
             let db = sled_db.db.clone();
             if let Err(e) = Self::run_scheduler_task(cfg.gc_at_hour, cfg.gc_at_minute, move || {
+                let now = std::time::Instant::now();
+                log::info!("Start Cleanup Operation ... ");
                 for item in db.scan_prefix(EXPIRE_AT_KEY_PREFIX) {
                     match item {
                         Ok((expire_key, v)) => {
@@ -143,6 +145,7 @@ impl SledStorageDB {
                         }
                     }
                 }
+                log::info!("Completed cleanup operation in {:?}", now.elapsed());
             }) {
                 log::warn!("{:?}", e);
             }
@@ -155,6 +158,8 @@ impl SledStorageDB {
     where
         F: FnMut(),
     {
+        let one_day = Duration::from_secs(24 * 60 * 60);
+
         // Get the current time.
         let current_timestamp = chrono::Local::now().timestamp(); //current_time.as_secs();
         let next_execution_time = chrono::Local::now()
@@ -165,16 +170,17 @@ impl SledStorageDB {
         let duration_until_next_execution = if next_execution_time > current_timestamp {
             Duration::from_secs((next_execution_time - current_timestamp) as u64)
         } else {
-            Duration::ZERO
+            Duration::from_secs(
+                one_day.as_secs() - (current_timestamp - next_execution_time) as u64,
+            )
         };
-
-        // Wait until the next specified time.
+        log::info!(
+            "duration_until_next_execution: {:?}",
+            duration_until_next_execution
+        );
         thread::sleep(duration_until_next_execution);
         loop {
-            // Execute the provided daily task logic.
             task();
-            // Set up a loop to run at the specified time every day.
-            let one_day = Duration::from_secs(24 * 60 * 60);
             thread::sleep(one_day);
         }
     }
