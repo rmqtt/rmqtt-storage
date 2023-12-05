@@ -104,7 +104,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            storage_type: StorageType::Sled,
+            storage_type: StorageType::Redis,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 gc_at_hour: 13,
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     async fn test_stress() {
         let cfg = get_cfg("stress");
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
             db.insert(i.to_be_bytes(), &i).await.unwrap();
@@ -132,7 +132,7 @@ mod tests {
         println!("9999: {:?}, cost time: {:?}", k_9999_val, now.elapsed());
         assert_eq!(k_9999_val, Some(9999));
 
-        let mut s_m_1 = db.map("s_m_1");
+        let s_m_1 = db.map("s_m_1");
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
             s_m_1.insert(i.to_be_bytes(), &i).await.unwrap();
@@ -169,7 +169,7 @@ mod tests {
 
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
-            let mut s_m = db.map(format!("s_m_{}", i));
+            let s_m = db.map(format!("s_m_{}", i));
             s_m.insert(i.to_be_bytes(), &i).await.unwrap();
         }
         println!("s_m, cost time: {:?}", now.elapsed());
@@ -187,7 +187,7 @@ mod tests {
     async fn test_expiration_cleaning() {
         //Clear Expired Cleanup
         let cfg = get_cfg("expiration_cleaning");
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
         for i in 0..3usize {
             let key = format!("k_{}", i);
             db.insert(key.as_bytes(), &format!("v_{}", (i * 10)))
@@ -197,7 +197,7 @@ mod tests {
             println!("expire res: {:?}", res);
         }
 
-        let mut m_1 = db.map("m_1");
+        let m_1 = db.map("m_1");
         m_1.insert("m_k_1", &1).await.unwrap();
         m_1.insert("m_k_2", &2).await.unwrap();
         let res = db.expire("m_1", 1500).await.unwrap();
@@ -232,7 +232,7 @@ mod tests {
     async fn test_db_insert() {
         let cfg = get_cfg("db_insert");
 
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
         let db_key_1 = b"key_1";
         let db_key_2 = b"key_2";
         let db_val_1 = String::from("val_001");
@@ -263,11 +263,11 @@ mod tests {
 
         assert!(db.contains_key(db_key_1).await.unwrap());
 
-        let mut map_1 = db.map("map_1");
+        let map_1 = db.map("map_1");
         map_1.insert("m_k_1", &100).await.unwrap();
         assert!(db.contains_key("map_1").await.unwrap());
 
-        let mut map_2 = db.map("map_2");
+        let map_2 = db.map("map_2");
         map_2.clear().await.unwrap();
         println!(
             "test_db_insert contains_key(map_2) {:?}",
@@ -291,7 +291,7 @@ mod tests {
     async fn test_db_remove() {
         let cfg = get_cfg("db_remove");
 
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
         let db_key_1 = b"key_11";
         let db_key_2 = b"key_22";
         let db_val_1 = String::from("val_001");
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(db.get::<_, String>(db_key_1).await.unwrap(), None);
         assert_eq!(db.contains_key(db_key_1).await.unwrap(), false);
 
-        let mut m2 = db.map(db_key_2);
+        let m2 = db.map(db_key_2);
         m2.clear().await.unwrap();
         assert_eq!(db.contains_key(db_key_2).await.unwrap(), false);
         m2.insert("m_k_1", &100).await.unwrap();
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     async fn test_db_contains_key() {
         let cfg = get_cfg("db_contains_key");
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
         db.remove("test_c_001").await.unwrap();
         let c_res = db.contains_key("test_c_001").await.unwrap();
         assert!(!c_res);
@@ -332,7 +332,7 @@ mod tests {
         let c_res = db.contains_key("test_c_001").await.unwrap();
         assert!(c_res);
 
-        let mut map_001 = db.map("map_001");
+        let map_001 = db.map("map_001");
         map_001.clear().await.unwrap();
         map_001.insert("k1", &1).await.unwrap();
         assert_eq!(map_001.is_empty().await.unwrap(), false);
@@ -352,7 +352,7 @@ mod tests {
         let c_res = db.contains_key("list_001").await.unwrap();
         assert!(c_res);
 
-        let mut map_002 = db.map("map_002");
+        let map_002 = db.map("map_002");
         map_002.clear().await.unwrap();
         println!("test_db_contains_key len: {}", map_002.len().await.unwrap());
         println!(
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     async fn test_db_expire() {
         let cfg = get_cfg("expire");
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
 
         let res_none = db.ttl("test_k001").await.unwrap();
         println!("ttl res_none: {:?}", res_none);
@@ -664,7 +664,7 @@ mod tests {
         let cfg = get_cfg("map_insert");
         let db = init_db(&cfg).await.unwrap();
 
-        let mut map001 = db.map("001");
+        let map001 = db.map("001");
         map001.clear().await.unwrap();
         assert_eq!(map001.len().await.unwrap(), 0);
 
@@ -691,7 +691,7 @@ mod tests {
         let cfg = get_cfg("map_contains_key");
         let db = init_db(&cfg).await.unwrap();
 
-        let mut map001 = db.map("m001");
+        let map001 = db.map("m001");
         map001.clear().await.unwrap();
         assert_eq!(map001.len().await.unwrap(), 0);
         assert_eq!(map001.contains_key("k001").await.unwrap(), false);
@@ -710,7 +710,7 @@ mod tests {
         let cfg = get_cfg("map");
         let db = init_db(&cfg).await.unwrap();
 
-        let mut kv001 = db.map("tree_kv001");
+        let kv001 = db.map("tree_kv001");
         let kv_key_1 = b"kv_key_1";
 
         kv001.clear().await.unwrap();
@@ -770,7 +770,7 @@ mod tests {
         let cfg = get_cfg("map_retain");
         let db = init_db(&cfg).await.unwrap();
 
-        let mut map1 = db.map("map1");
+        let map1 = db.map("map1");
         map1.clear().await.unwrap();
         for i in 0..100usize {
             map1.insert(format!("mk_{}", i), &i).await.unwrap();
@@ -809,7 +809,7 @@ mod tests {
         let cfg = get_cfg("batch");
         let db = init_db(&cfg).await.unwrap();
 
-        let mut skv = db.map("batch_kv001");
+        let skv = db.map("batch_kv001");
 
         let mut kvs = Vec::new();
         for i in 0..100 {
@@ -907,7 +907,7 @@ mod tests {
     #[test]
     async fn test_list() {
         let cfg = get_cfg("array");
-        let mut db = init_db(&cfg).await.unwrap();
+        let db = init_db(&cfg).await.unwrap();
 
         let array_a = db.list("array_a");
         let array_b = db.list("array_b");
@@ -977,7 +977,7 @@ mod tests {
         let cfg = get_cfg("map_list");
         let db = init_db(&cfg).await.unwrap();
 
-        let mut ml001 = db.map("m_l_001");
+        let ml001 = db.map("m_l_001");
         ml001.clear().await.unwrap();
         assert_eq!(ml001.len().await.unwrap(), 0);
         assert_eq!(ml001.is_empty().await.unwrap(), true);
@@ -1086,9 +1086,9 @@ mod tests {
         let cfg = get_cfg("async_map_iter");
         let mut db = init_db(&cfg).await.unwrap();
 
-        let mut m1 = db.map("m1");
-        let mut m2 = db.map("m2");
-        let mut m3 = db.map("m3");
+        let m1 = db.map("m1");
+        let m2 = db.map("m2");
+        let m3 = db.map("m3");
 
         m1.insert("k1", &1).await.unwrap();
         m2.insert("k1", &1).await.unwrap();
@@ -1099,7 +1099,7 @@ mod tests {
 
         let mut iter = db.map_iter().await.unwrap();
         while let Some(m) = iter.next().await {
-            let mut m = m.unwrap();
+            let m = m.unwrap();
             let name = String::from_utf8(m.name().to_vec());
             println!("map name: {:?}, len: {:?}", name, m.len().await);
             let len = m.len().await.unwrap();

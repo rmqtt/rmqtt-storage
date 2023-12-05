@@ -116,7 +116,7 @@ impl SledStorageDB {
         .await??;
         let def_tree = def_tree?;
         let db = Self { db, def_tree };
-        let mut sled_db = db.clone();
+        let sled_db = db.clone();
 
         std::thread::spawn(move || {
             let db = sled_db.db.clone();
@@ -267,7 +267,7 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
+    fn _contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         if self.db.contains_key(key.as_ref())? {
             Ok(true)
         } else {
@@ -282,7 +282,7 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _remove<K>(&mut self, key: K) -> Result<()>
+    fn _remove<K>(&self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
@@ -315,7 +315,7 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _is_expired<K>(&mut self, key: K) -> Result<bool>
+    fn _is_expired<K>(&self, key: K) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -327,7 +327,7 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _ttl<K>(&mut self, key: K) -> Result<Option<TimestampMillis>>
+    fn _ttl<K>(&self, key: K) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -336,7 +336,7 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _ttl2<K>(&mut self, c_key: K, expire_key: K) -> Result<Option<TimestampMillis>>
+    fn _ttl2<K>(&self, c_key: K, expire_key: K) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -373,7 +373,7 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _ttl3<K>(&mut self, c_key: K, ttl_val: &[u8]) -> Result<Option<TimestampMillis>>
+    fn _ttl3<K>(&self, c_key: K, ttl_val: &[u8]) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -426,7 +426,7 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
+    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send,
@@ -450,12 +450,12 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let key = key.as_ref().to_vec();
         match spawn_blocking(move || {
             let res: Result<_> = if this._is_expired(key.as_slice())? {
@@ -473,19 +473,19 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn remove<K>(&mut self, key: K) -> Result<()>
+    async fn remove<K>(&self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let key = key.as_ref().to_vec();
         spawn_blocking(move || this._remove(key)).await??;
         Ok(())
     }
 
     #[inline]
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
-        let mut this = self.clone();
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        let this = self.clone();
         let key = key.as_ref().to_vec();
         Ok(spawn_blocking(move || {
             if this._is_expired(key.as_slice())? {
@@ -498,11 +498,11 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn expire_at<K>(&mut self, key: K, at: TimestampMillis) -> Result<bool>
+    async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let mut db = self.clone();
+        let db = self.clone();
         let expire_key = Self::make_expire_key(key.as_ref());
         let key = key.as_ref().to_vec();
         let res = spawn_blocking(move || {
@@ -521,7 +521,7 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn expire<K>(&mut self, key: K, dur: TimestampMillis) -> Result<bool>
+    async fn expire<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -530,12 +530,12 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn ttl<K>(&mut self, key: K) -> Result<Option<TimestampMillis>>
+    async fn ttl<K>(&self, key: K) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
         let key = key.as_ref().to_vec();
-        let mut this = self.clone();
+        let this = self.clone();
         Ok(spawn_blocking(move || this._ttl(key)).await??)
     }
 
@@ -592,35 +592,8 @@ impl SledStorageMap {
     }
 
     #[inline]
-    fn _len_inc(&self) -> Result<()> {
-        self._counter_inc(self.map_count_key_name.as_slice())?;
-        Ok(())
-    }
-
-    #[inline]
-    fn _len_dec(&self) -> Result<()> {
-        self._counter_dec(self.map_count_key_name.as_slice())?;
-        Ok(())
-    }
-
-    #[inline]
     fn _len_get(&self) -> Result<isize> {
         self._counter_get(self.map_count_key_name.as_slice())
-    }
-
-    #[inline]
-    fn _len_clear(&self) -> Result<()> {
-        self._counter_set(self.map_count_key_name.as_slice(), 0)?;
-        Ok(())
-    }
-
-    #[inline]
-    fn _tx_len_clear<K: AsRef<[u8]>>(
-        tx: &TransactionalTree,
-        count_name: K,
-    ) -> ConflictableTransactionResult<()> {
-        tx.insert(count_name.as_ref(), 0isize.to_be_bytes().as_slice())?;
-        Ok(())
     }
 
     #[inline]
@@ -718,38 +691,12 @@ impl SledStorageMap {
     }
 
     #[inline]
-    fn _counter_inc<K: AsRef<[u8]>>(&self, key: K) -> Result<isize> {
-        let res = if let Some(res) = self.tree().update_and_fetch(key.as_ref(), _increment)? {
-            isize::from_be_bytes(res.as_ref().try_into()?)
-        } else {
-            0
-        };
-        Ok(res)
-    }
-
-    #[inline]
-    fn _counter_dec<K: AsRef<[u8]>>(&self, key: K) -> Result<isize> {
-        let res = if let Some(res) = self.tree().update_and_fetch(key.as_ref(), _decrement)? {
-            isize::from_be_bytes(res.as_ref().try_into()?)
-        } else {
-            0
-        };
-        Ok(res)
-    }
-
-    #[inline]
     fn _counter_get<K: AsRef<[u8]>>(&self, key: K) -> Result<isize> {
         if let Some(v) = self.tree().get(key)? {
             Ok(isize::from_be_bytes(v.as_ref().try_into()?))
         } else {
             Ok(0)
         }
-    }
-
-    #[inline]
-    fn _counter_set<K: AsRef<[u8]>>(&self, key: K, val: isize) -> Result<()> {
-        self.tree().insert(key, val.to_be_bytes().as_slice())?;
-        Ok(())
     }
 
     #[inline]
@@ -875,7 +822,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn insert<K, V>(&mut self, key: K, val: &V) -> Result<()>
+    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send + ?Sized,
@@ -885,7 +832,7 @@ impl Map for SledStorageMap {
         let item_key = self.make_map_item_key(key.as_ref());
         let count_key = self.map_count_key_name.clone();
 
-        let mut this = self.clone();
+        let this = self.clone();
         spawn_blocking(move || {
             tree.transaction(move |tx| {
                 if tx.insert(item_key.as_slice(), val.as_slice())?.is_none() {
@@ -909,12 +856,12 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn get<K, V>(&mut self, key: K) -> Result<Option<V>>
+    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let item_key = self.make_map_item_key(key.as_ref());
         match spawn_blocking(move || {
             if !this.db._is_expired(this.name.as_slice())? {
@@ -931,7 +878,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn remove<K>(&mut self, key: K) -> Result<()>
+    async fn remove<K>(&self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -952,15 +899,15 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&mut self, key: K) -> Result<bool> {
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let tree = self.tree().clone();
         let key = self.make_map_item_key(key.as_ref());
         Ok(spawn_blocking(move || tree.contains_key(key)).await??)
     }
 
     #[inline]
-    async fn len(&mut self) -> Result<usize> {
-        let mut this = self.clone();
+    async fn len(&self) -> Result<usize> {
+        let this = self.clone();
         let len = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 Ok(0)
@@ -973,8 +920,8 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn is_empty(&mut self) -> Result<bool> {
-        let mut this = self.clone();
+    async fn is_empty(&self) -> Result<bool> {
+        let this = self.clone();
         spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 Ok(true)
@@ -986,20 +933,20 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn clear(&mut self) -> Result<()> {
+    async fn clear(&self) -> Result<()> {
         let this = self.clone();
         spawn_blocking(move || this._clear()).await??;
         Ok(())
     }
 
     #[inline]
-    async fn remove_and_fetch<K, V>(&mut self, key: K) -> Result<Option<V>>
+    async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
         let key = self.make_map_item_key(key.as_ref());
-        let mut this = self.clone();
+        let this = self.clone();
         let removed = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice()).map_err(|e| {
                 TransactionError::Storage(sled::Error::Io(io::Error::new(
@@ -1031,7 +978,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn remove_with_prefix<K>(&mut self, prefix: K) -> Result<()>
+    async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
@@ -1072,7 +1019,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn batch_insert<V>(&mut self, key_vals: Vec<(Key, V)>) -> Result<()>
+    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
         V: serde::ser::Serialize + Sync + Send,
     {
@@ -1083,7 +1030,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn batch_remove(&mut self, keys: Vec<Key>) -> Result<()> {
+    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         for k in keys {
             self.remove(k).await?;
         }
@@ -1097,7 +1044,7 @@ impl Map for SledStorageMap {
     where
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let res = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
@@ -1127,7 +1074,7 @@ impl Map for SledStorageMap {
     async fn key_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
-        let mut this = self.clone();
+        let this = self.clone();
         let res = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
@@ -1161,7 +1108,7 @@ impl Map for SledStorageMap {
         P: AsRef<[u8]> + Send,
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let prefix = prefix.as_ref().to_vec();
         let res = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
@@ -1187,7 +1134,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn retain<'a, F, Out, V>(&'a mut self, f: F) -> Result<()>
+    async fn retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
     where
         F: Fn(Result<(Key, V)>) -> Out + Send + Sync + 'static,
         Out: Future<Output = bool> + Send + 'a,
@@ -1202,7 +1149,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn retain_with_key<'a, F, Out>(&'a mut self, f: F) -> Result<()>
+    async fn retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
     where
         F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
         Out: Future<Output = bool> + Send + 'a,
@@ -1358,7 +1305,7 @@ impl List for SledStorageList {
         let tree = self.tree().clone();
         let this = self.clone();
         spawn_blocking(move || {
-            let mut this1 = this.clone();
+            let this1 = this.clone();
             tree.transaction(move |tx| {
                 let list_count_key = this.make_list_count_key();
                 let (start, mut end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
@@ -1402,7 +1349,7 @@ impl List for SledStorageList {
         let this = self.clone();
 
         let removed = spawn_blocking(move || {
-            let mut this1 = this.clone();
+            let this1 = this.clone();
             let res = tree.transaction(move |tx| {
                 let list_count_key = this.make_list_count_key();
                 let (mut start, mut end) = Self::tx_list_count_get::<
@@ -1466,7 +1413,7 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let removed = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice()).map_err(|e| {
                 TransactionError::Storage(sled::Error::Io(io::Error::new(
@@ -1509,7 +1456,7 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let res = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 Ok(vec![])
@@ -1535,7 +1482,7 @@ impl List for SledStorageList {
         V: DeserializeOwned + Sync + Send,
     {
         let tree = self.tree().clone();
-        let mut this = self.clone();
+        let this = self.clone();
         let res = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice()).map_err(|e| {
                 TransactionError::Storage(sled::Error::Io(io::Error::new(
@@ -1575,7 +1522,7 @@ impl List for SledStorageList {
 
     #[inline]
     async fn len(&self) -> Result<usize> {
-        let mut this = self.clone();
+        let this = self.clone();
         spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 Ok(0)
@@ -1594,7 +1541,7 @@ impl List for SledStorageList {
 
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
-        let mut this = self.clone();
+        let this = self.clone();
         Ok(spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 Ok(true)
@@ -1619,7 +1566,7 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let mut this = self.clone();
+        let this = self.clone();
         let res = spawn_blocking(move || {
             if this.db._is_expired(this.name.as_slice())? {
                 let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
