@@ -1369,6 +1369,13 @@ impl SledStorageList {
     }
 
     #[inline]
+    fn make_list_content_keys(&self, start: usize, end: usize) -> Vec<Vec<u8>> {
+        (start..end)
+            .map(|idx| self.make_list_content_key(idx))
+            .collect()
+    }
+
+    #[inline]
     fn tx_list_count_get<K, E>(
         tx: &TransactionalTree,
         list_count_key: K,
@@ -1420,6 +1427,23 @@ impl SledStorageList {
         V: AsRef<[u8]>,
     {
         tx.insert(key_content.as_ref(), data.as_ref())?;
+        Ok(())
+    }
+
+    #[inline]
+    fn tx_list_content_batch_set<K, V, E>(
+        tx: &TransactionalTree,
+        key_contents: Vec<(K, V)>,
+    ) -> ConflictableTransactionResult<(), E>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let mut batch = Batch::default();
+        for (k, v) in key_contents {
+            batch.insert(k.as_ref(), v.as_ref());
+        }
+        tx.apply_batch(&batch)?;
         Ok(())
     }
 
@@ -1480,6 +1504,54 @@ impl List for SledStorageList {
 
                 let list_content_key = this.make_list_content_key(end);
                 Self::tx_list_content_set(tx, list_content_key.as_slice(), &data)?;
+                Ok(())
+            })?;
+
+            if this1.db._is_expired(this1.name.as_slice()).map_err(|e| {
+                TransactionError::Storage(sled::Error::Io(io::Error::new(
+                    ErrorKind::InvalidData,
+                    e,
+                )))
+            })? {
+                SledStorageDB::_remove_expire_key(this1.db.db.as_ref(), this1.name.as_slice())?;
+            }
+            Ok::<(), TransactionError<()>>(())
+        })
+        .await?
+        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+
+        Ok(())
+    }
+
+    #[inline]
+    async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
+    where
+        V: Serialize + Sync + Send,
+    {
+        let vals = vals
+            .into_iter()
+            .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
+            .collect::<Result<Vec<_>>>()?;
+        let tree = self.tree().clone();
+        let this = self.clone();
+
+        spawn_blocking(move || {
+            let this1 = this.clone();
+            tree.transaction(move |tx| {
+                let list_count_key = this.make_list_count_key();
+                let (start, mut end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
+
+                let mut list_content_keys =
+                    this.make_list_content_keys(end + 1, end + vals.len() + 1);
+                //assert_eq!(vals.len(), list_content_keys.len());
+                end += vals.len();
+                Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
+
+                let list_contents = vals
+                    .iter()
+                    .map(|val| (list_content_keys.remove(0), val))
+                    .collect::<Vec<_>>();
+                Self::tx_list_content_batch_set(tx, list_contents)?;
                 Ok(())
             })?;
 

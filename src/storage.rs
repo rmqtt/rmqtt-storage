@@ -167,6 +167,10 @@ pub trait List: Sync + Send {
     where
         V: serde::ser::Serialize + Sync + Send;
 
+    async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
+    where
+        V: serde::ser::Serialize + Sync + Send;
+
     async fn push_limit<V>(
         &self,
         val: &V,
@@ -591,6 +595,16 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.push(val).await,
             StorageList::Redis(list) => list.push(val).await,
+        }
+    }
+
+    async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
+    where
+        V: serde::ser::Serialize + Sync + Send,
+    {
+        match self {
+            StorageList::Sled(list) => list.pushs(vals).await,
+            StorageList::Redis(list) => list.pushs(vals).await,
         }
     }
 

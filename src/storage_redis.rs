@@ -721,6 +721,22 @@ impl List for RedisStorageList {
     }
 
     #[inline]
+    async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
+    where
+        V: Serialize + Sync + Send,
+    {
+        //RPUSH key value [value ...]
+        let vals = vals
+            .into_iter()
+            .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
+            .collect::<Result<Vec<_>>>()?;
+        self.async_conn()
+            .rpush(self.full_name.as_slice(), vals)
+            .await?;
+        Ok(())
+    }
+
+    #[inline]
     async fn push_limit<V>(
         &self,
         val: &V,

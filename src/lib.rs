@@ -104,7 +104,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            storage_type: StorageType::Redis,
+            storage_type: StorageType::Sled,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 gc_at_hour: 13,
@@ -1171,5 +1171,37 @@ mod tests {
             keys.push(format!("key_{}", i).as_bytes().to_vec());
         }
         db.batch_remove(keys).await.unwrap();
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_pushs() {
+        let cfg = get_cfg("list_pushs");
+        let db = init_db(&cfg).await.unwrap();
+        let l11 = db.list("l11");
+        l11.clear().await.unwrap();
+        let mut vals = Vec::new();
+        for i in 0..10 {
+            vals.push(i);
+        }
+        l11.pushs(vals).await.unwrap();
+        assert_eq!(l11.len().await.unwrap(), 10);
+        println!("{:?}", l11.all::<i32>().await.unwrap());
+        assert_eq!(
+            l11.all::<i32>().await.unwrap(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
+
+        let mut vals = Vec::new();
+        for i in 20..25 {
+            vals.push(i);
+        }
+        l11.pushs(vals).await.unwrap();
+        assert_eq!(l11.len().await.unwrap(), 15);
+        println!("{:?}", l11.all::<i32>().await.unwrap());
+        assert_eq!(
+            l11.all::<i32>().await.unwrap(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24]
+        );
     }
 }
