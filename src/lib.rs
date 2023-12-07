@@ -1106,4 +1106,37 @@ mod tests {
             assert!(len == 1 || len == 2 || len == 3);
         }
     }
+
+    #[tokio::main]
+    #[test]
+    async fn test_counter() {
+        let cfg = get_cfg("incr");
+        let db = init_db(&cfg).await.unwrap();
+
+        db.remove("incr1").await.unwrap();
+        db.remove("incr2").await.unwrap();
+        db.remove("incr3").await.unwrap();
+
+        db.counter_incr("incr1", 3).await.unwrap();
+        db.counter_incr("incr2", -3).await.unwrap();
+        db.counter_incr("incr3", 10).await.unwrap();
+
+        assert_eq!(db.counter_get("incr1").await.unwrap(), Some(3));
+        assert_eq!(db.counter_get("incr2").await.unwrap(), Some(-3));
+        assert_eq!(db.counter_get("incr3").await.unwrap(), Some(10));
+
+        db.counter_decr("incr3", 2).await.unwrap();
+        assert_eq!(db.counter_get("incr3").await.unwrap(), Some(8));
+
+        db.counter_decr("incr3", -3).await.unwrap();
+        assert_eq!(db.counter_get("incr3").await.unwrap(), Some(11));
+
+        db.counter_set("incr3", 100).await.unwrap();
+        assert_eq!(db.counter_get("incr3").await.unwrap(), Some(100));
+
+        db.counter_incr("incr3", 10).await.unwrap();
+        assert_eq!(db.counter_get("incr3").await.unwrap(), Some(110));
+
+        assert_eq!(db.counter_get("incr4").await.unwrap(), None);
+    }
 }

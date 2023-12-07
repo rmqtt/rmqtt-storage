@@ -43,6 +43,22 @@ pub trait StorageDB: Send + Sync {
     where
         K: AsRef<[u8]> + Sync + Send;
 
+    async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
+    async fn counter_decr<K>(&self, key: K, increment: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
+    async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
+    async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
     async fn expire_at<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
@@ -235,6 +251,50 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.remove(key).await,
             DefaultStorageDB::Redis(db) => db.remove(key).await,
+        }
+    }
+
+    #[inline]
+    pub async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.counter_incr(key, increment).await,
+            DefaultStorageDB::Redis(db) => db.counter_incr(key, increment).await,
+        }
+    }
+
+    #[inline]
+    pub async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.counter_decr(key, decrement).await,
+            DefaultStorageDB::Redis(db) => db.counter_decr(key, decrement).await,
+        }
+    }
+
+    #[inline]
+    pub async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.counter_get(key).await,
+            DefaultStorageDB::Redis(db) => db.counter_get(key).await,
+        }
+    }
+
+    #[inline]
+    pub async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.counter_set(key, val).await,
+            DefaultStorageDB::Redis(db) => db.counter_set(key, val).await,
         }
     }
 

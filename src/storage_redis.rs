@@ -184,6 +184,45 @@ impl StorageDB for RedisStorageDB {
     }
 
     #[inline]
+    async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+        self.async_conn().incr(full_key, increment).await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+        self.async_conn().decr(full_key, decrement).await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+        Ok(self.async_conn().get::<_, Option<isize>>(full_key).await?)
+    }
+
+    #[inline]
+    async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+        self.async_conn().set(full_key, val).await?;
+        Ok(())
+    }
+
+    #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         //HEXISTS key field
         let mut async_conn = self.async_conn();

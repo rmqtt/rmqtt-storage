@@ -484,6 +484,103 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
+    async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let this = self.clone();
+        let key = key.as_ref().to_vec();
+        spawn_blocking(move || {
+            this.db.fetch_and_update(key, |old: Option<&[u8]>| {
+                let number = match old {
+                    Some(bytes) => {
+                        if let Ok(array) = bytes.try_into() {
+                            let number = isize::from_be_bytes(array);
+                            number + increment
+                        } else {
+                            increment
+                        }
+                    }
+                    None => increment,
+                };
+                Some(number.to_be_bytes().to_vec())
+            })
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let this = self.clone();
+        let key = key.as_ref().to_vec();
+        spawn_blocking(move || {
+            this.db.fetch_and_update(key, |old: Option<&[u8]>| {
+                let number = match old {
+                    Some(bytes) => {
+                        if let Ok(array) = bytes.try_into() {
+                            let number = isize::from_be_bytes(array);
+                            number - decrement
+                        } else {
+                            -decrement
+                        }
+                    }
+                    None => -decrement,
+                };
+                Some(number.to_be_bytes().to_vec())
+            })
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let this = self.clone();
+        let key = key.as_ref().to_vec();
+        spawn_blocking(move || {
+            let res: Result<_> = if this._is_expired(key.as_slice())? {
+                Ok(None)
+            } else if let Some(v) = this.db.get(key)? {
+                Ok(Some(isize::from_be_bytes(v.as_ref().try_into()?)))
+            } else {
+                Ok(None)
+            };
+            res
+        })
+        .await?
+    }
+
+    #[inline]
+    async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let db = self.db.clone();
+        let key = key.as_ref().to_vec();
+        let val = val.to_be_bytes().to_vec();
+        spawn_blocking(move || {
+            // db.insert(key.as_slice(), val.as_slice())?;
+            // Self::_remove_expire_key(&db, key.as_slice())?;
+            // Ok::<(), TransactionError<()>>(())
+            db.transaction(move |tx| {
+                tx.insert(key.as_slice(), val.as_slice())?;
+                Self::_tx_remove_expire_key(tx, key.as_slice())?;
+                Ok(())
+            })
+        })
+        .await?
+        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        Ok(())
+    }
+
+    #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let this = self.clone();
         let key = key.as_ref().to_vec();
