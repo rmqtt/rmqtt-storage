@@ -305,6 +305,15 @@ impl SledStorageDB {
     }
 
     #[inline]
+    fn _batch_remove_expire_key<K>(b: &mut Batch, key: K)
+    where
+        K: AsRef<[u8]>,
+    {
+        let expire_key = Self::make_expire_key(key);
+        b.remove(expire_key);
+    }
+
+    #[inline]
     fn _tx_remove_expire_key<K>(tx: &TransactionalTree, key: K) -> ConflictableTransactionResult<()>
     where
         K: AsRef<[u8]>,
@@ -480,6 +489,66 @@ impl StorageDB for SledStorageDB {
         let this = self.clone();
         let key = key.as_ref().to_vec();
         spawn_blocking(move || this._remove(key)).await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    where
+        V: Serialize + Sync + Send,
+    {
+        let mut batch = Batch::default();
+        for (k, v) in key_vals.iter() {
+            batch.insert(k.as_slice(), bincode::serialize(v)?);
+        }
+
+        let keys = key_vals.into_iter().map(|(k, _)| k).collect::<Vec<Key>>();
+
+        let this = self.clone();
+        spawn_blocking(move || {
+            let mut remove_expire_batch = Batch::default();
+            for k in keys {
+                if this._is_expired(k.as_slice())? {
+                    SledStorageDB::_batch_remove_expire_key(&mut remove_expire_batch, k);
+                }
+            }
+
+            this.db
+                .transaction(move |tx| {
+                    tx.apply_batch(&batch)?;
+                    tx.apply_batch(&remove_expire_batch)?;
+                    Ok(())
+                })
+                .map_err(|e: TransactionError<sled::Error>| anyhow!(e))?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+        let this = self.clone();
+        spawn_blocking(move || {
+            let mut batch = Batch::default();
+            for k in keys.iter() {
+                batch.remove(k.as_slice());
+            }
+
+            let mut remove_expire_batch = Batch::default();
+            for k in keys.iter() {
+                SledStorageDB::_batch_remove_expire_key(&mut remove_expire_batch, k);
+            }
+            this.db
+                .transaction(move |tx| {
+                    tx.apply_batch(&batch)?;
+                    tx.apply_batch(&remove_expire_batch)?;
+                    Ok(())
+                })
+                .map_err(|e: TransactionError<sled::Error>| anyhow!(e))?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 

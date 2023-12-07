@@ -43,6 +43,12 @@ pub trait StorageDB: Send + Sync {
     where
         K: AsRef<[u8]> + Sync + Send;
 
+    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    where
+        V: serde::ser::Serialize + Sync + Send;
+
+    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()>;
+
     async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send;
@@ -251,6 +257,25 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.remove(key).await,
             DefaultStorageDB::Redis(db) => db.remove(key).await,
+        }
+    }
+
+    #[inline]
+    pub async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    where
+        V: serde::ser::Serialize + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.batch_insert(key_vals).await,
+            DefaultStorageDB::Redis(db) => db.batch_insert(key_vals).await,
+        }
+    }
+
+    #[inline]
+    pub async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.batch_remove(keys).await,
+            DefaultStorageDB::Redis(db) => db.batch_remove(keys).await,
         }
     }
 

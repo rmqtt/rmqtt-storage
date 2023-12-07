@@ -1139,4 +1139,37 @@ mod tests {
 
         assert_eq!(db.counter_get("incr4").await.unwrap(), None);
     }
+
+    #[tokio::main]
+    #[test]
+    async fn test_db_batch() {
+        let cfg = get_cfg("db_batch_insert");
+        let db = init_db(&cfg).await.unwrap();
+
+        let mut key_vals = Vec::new();
+        for i in 0..100 {
+            key_vals.push((format!("key_{}", i).as_bytes().to_vec(), i));
+        }
+
+        db.batch_insert(key_vals).await.unwrap();
+
+        assert_eq!(db.get("key_99").await.unwrap(), Some(99));
+        assert_eq!(db.get::<_, usize>("key_100").await.unwrap(), None);
+
+        let mut keys = Vec::new();
+        for i in 0..50 {
+            keys.push(format!("key_{}", i).as_bytes().to_vec());
+        }
+        db.batch_remove(keys).await.unwrap();
+
+        assert_eq!(db.get::<_, usize>("key_0").await.unwrap(), None);
+        assert_eq!(db.get::<_, usize>("key_49").await.unwrap(), None);
+        assert_eq!(db.get("key_50").await.unwrap(), Some(50));
+
+        let mut keys = Vec::new();
+        for i in 50..100 {
+            keys.push(format!("key_{}", i).as_bytes().to_vec());
+        }
+        db.batch_remove(keys).await.unwrap();
+    }
 }
