@@ -104,7 +104,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            storage_type: StorageType::Sled,
+            storage_type: StorageType::Redis,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 gc_at_hour: 13,
@@ -1203,5 +1203,74 @@ mod tests {
             l11.all::<i32>().await.unwrap(),
             vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24]
         );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_pop() {
+        let cfg = get_cfg("list_pop");
+        let db = init_db(&cfg).await.unwrap();
+        let l11 = db.list("l11");
+        l11.clear().await.unwrap();
+        for i in 0..10 {
+            l11.push(&i).await.unwrap();
+        }
+        println!("{:?}", l11.all::<i32>().await.unwrap());
+        println!(
+            "l11.get_index(): {:?}",
+            l11.get_index::<i32>(0).await.unwrap()
+        );
+        println!("l11.pop(): {:?}", l11.pop::<i32>().await.unwrap());
+        println!("l11.pop(): {:?}", l11.pop::<i32>().await.unwrap());
+        println!(
+            "all: {:?}, len: {:?}",
+            l11.all::<i32>().await.unwrap(),
+            l11.len().await
+        );
+        assert_eq!(l11.len().await.unwrap(), 8);
+        assert_eq!(
+            l11.all::<i32>().await.unwrap(),
+            vec![2, 3, 4, 5, 6, 7, 8, 9]
+        );
+
+        let pop_v = l11
+            .pop_f::<_, i32>(|v| {
+                println!("left val: {:?}", v);
+                *v == 2
+            })
+            .await
+            .unwrap();
+        println!("pop val: {:?}", pop_v);
+        println!(
+            "all: {:?}, len: {:?}",
+            l11.all::<i32>().await.unwrap(),
+            l11.len().await
+        );
+        assert_eq!(l11.len().await.unwrap(), 7);
+        assert_eq!(l11.all::<i32>().await.unwrap(), vec![3, 4, 5, 6, 7, 8, 9]);
+
+        let pop_v = l11.pop_f::<_, i32>(|v| *v == 2).await.unwrap();
+        println!("pop val: {:?}", pop_v);
+        println!(
+            "all: {:?}, len: {:?}",
+            l11.all::<i32>().await.unwrap(),
+            l11.len().await
+        );
+        assert_eq!(l11.len().await.unwrap(), 7);
+        assert_eq!(l11.all::<i32>().await.unwrap(), vec![3, 4, 5, 6, 7, 8, 9]);
+
+        l11.clear().await.unwrap();
+        assert_eq!(l11.len().await.unwrap(), 0);
+        assert_eq!(l11.all::<i32>().await.unwrap(), vec![]);
+
+        let pop_v = l11.pop_f::<_, i32>(|_| true).await.unwrap();
+        println!("pop val: {:?}", pop_v);
+        println!(
+            "all: {:?}, len: {:?}",
+            l11.all::<i32>().await.unwrap(),
+            l11.len().await
+        );
+        assert_eq!(l11.len().await.unwrap(), 0);
+        assert_eq!(l11.all::<i32>().await.unwrap(), vec![]);
     }
 }

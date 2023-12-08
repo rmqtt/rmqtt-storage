@@ -185,6 +185,12 @@ pub trait List: Sync + Send {
     where
         V: DeserializeOwned + Sync + Send;
 
+    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
+    where
+        F: Fn(&V) -> bool + Send + Sync + 'static,
+        //Out: Future<Output = bool> + Send + 'a,
+        V: DeserializeOwned + Sync + Send + 'a + 'static;
+
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send;
@@ -631,6 +637,17 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.pop().await,
             StorageList::Redis(list) => list.pop().await,
+        }
+    }
+
+    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
+    where
+        F: Fn(&V) -> bool + Send + Sync + 'static,
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
+    {
+        match self {
+            StorageList::Sled(list) => list.pop_f(f).await,
+            StorageList::Redis(list) => list.pop_f(f).await,
         }
     }
 

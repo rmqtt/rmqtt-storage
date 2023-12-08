@@ -1690,6 +1690,58 @@ impl List for SledStorageList {
     }
 
     #[inline]
+    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
+    where
+        F: Fn(&V) -> bool + Send + Sync + 'static,
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
+    {
+        let this = self.clone();
+        let removed = spawn_blocking(move || {
+            if this.db._is_expired(this.name.as_slice()).map_err(|e| {
+                TransactionError::Storage(sled::Error::Io(io::Error::new(
+                    ErrorKind::InvalidData,
+                    e,
+                )))
+            })? {
+                Ok(None)
+            } else {
+                let removed = this.tree().clone().transaction(move |tx| {
+                    let list_count_key = this.make_list_count_key();
+                    let (start, end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
+
+                    let mut removed = None;
+                    if (end - start) > 0 {
+                        let removed_content_key = this.make_list_content_key(start + 1);
+                        let saved_val = tx.get(removed_content_key.as_slice())?;
+                        if let Some(v) = saved_val {
+                            let val = bincode::deserialize::<V>(v.as_ref()).map_err(|e| {
+                                ConflictableTransactionError::Storage(sled::Error::Io(
+                                    io::Error::new(ErrorKind::InvalidData, e),
+                                ))
+                            })?;
+                            if f(&val) {
+                                tx.remove(removed_content_key)?;
+                                removed = Some(val);
+                                Self::tx_list_count_set(
+                                    tx,
+                                    list_count_key.as_slice(),
+                                    start + 1,
+                                    end,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(removed)
+                });
+                removed
+            }
+        })
+        .await?
+        .map_err(|e: TransactionError<sled::Error>| anyhow!(e))?;
+        Ok(removed)
+    }
+
+    #[inline]
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send,

@@ -795,6 +795,32 @@ impl List for RedisStorageList {
     }
 
     #[inline]
+    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
+    where
+        F: Fn(&V) -> bool + Send + Sync + 'static,
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
+    {
+        let mut async_conn = self.async_conn();
+        let v = async_conn
+            .lindex::<_, Option<Vec<u8>>>(self.full_name.as_slice(), 0)
+            .await?;
+        let removed = if let Some(v) = v {
+            let val = bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?;
+            if f(&val) {
+                async_conn
+                    .lpop::<_, Option<Vec<u8>>>(self.full_name.as_slice(), None)
+                    .await?;
+                Some(val)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(removed)
+    }
+
+    #[inline]
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send,
