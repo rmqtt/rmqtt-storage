@@ -188,26 +188,30 @@ impl StorageDB for RedisStorageDB {
     where
         V: Serialize + Sync + Send,
     {
-        let key_vals = key_vals
-            .into_iter()
-            .map(|(k, v)| {
-                let full_key = self.make_full_key(k);
-                bincode::serialize(&v)
-                    .map(move |v| (full_key, v))
-                    .map_err(|e| anyhow!(e))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.async_conn().mset(key_vals.as_slice()).await?;
+        if !key_vals.is_empty() {
+            let key_vals = key_vals
+                .into_iter()
+                .map(|(k, v)| {
+                    let full_key = self.make_full_key(k);
+                    bincode::serialize(&v)
+                        .map(move |v| (full_key, v))
+                        .map_err(|e| anyhow!(e))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.async_conn().mset(key_vals.as_slice()).await?;
+        }
         Ok(())
     }
 
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
-        let keys = keys
-            .into_iter()
-            .map(|k| self.make_full_key(k))
-            .collect::<Vec<_>>();
-        self.async_conn().del(keys).await?;
+        if !keys.is_empty() {
+            let keys = keys
+                .into_iter()
+                .map(|k| self.make_full_key(k))
+                .collect::<Vec<_>>();
+            self.async_conn().del(keys).await?;
+        }
         Ok(())
     }
 
@@ -407,7 +411,9 @@ impl RedisStorageMap {
 
         drop(iter);
         for batch in removeds.chunks(batch_size) {
-            async_conn.hdel(name.as_slice(), batch).await?;
+            if !batch.is_empty() {
+                async_conn.hdel(name.as_slice(), batch).await?;
+            }
         }
 
         Ok(())
@@ -435,7 +441,9 @@ impl RedisStorageMap {
 
         drop(iter);
         for batch in removeds.chunks(batch_size) {
-            async_conn.hdel(name.as_slice(), batch).await?;
+            if !batch.is_empty() {
+                async_conn.hdel(name.as_slice(), batch).await?;
+            }
         }
 
         Ok(())
@@ -585,25 +593,29 @@ impl Map for RedisStorageMap {
     where
         V: Serialize + Sync + Send,
     {
-        let key_vals = key_vals
-            .into_iter()
-            .map(|(k, v)| {
-                bincode::serialize(&v)
-                    .map(move |v| (k, v))
-                    .map_err(|e| anyhow!(e))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let name = self.full_name.clone();
-        self.async_conn()
-            .hset_multiple(name, key_vals.as_slice())
-            .await?;
+        if !key_vals.is_empty() {
+            let key_vals = key_vals
+                .into_iter()
+                .map(|(k, v)| {
+                    bincode::serialize(&v)
+                        .map(move |v| (k, v))
+                        .map_err(|e| anyhow!(e))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let name = self.full_name.clone();
+            self.async_conn()
+                .hset_multiple(name, key_vals.as_slice())
+                .await?;
+        }
         Ok(())
     }
 
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
-        let name = self.full_name.clone();
-        self.async_conn().hdel(name, keys).await?;
+        if !keys.is_empty() {
+            let name = self.full_name.clone();
+            self.async_conn().hdel(name, keys).await?;
+        }
         Ok(())
     }
 

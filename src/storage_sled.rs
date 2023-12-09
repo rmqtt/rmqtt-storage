@@ -497,6 +497,10 @@ impl StorageDB for SledStorageDB {
     where
         V: Serialize + Sync + Send,
     {
+        if key_vals.is_empty() {
+            return Ok(());
+        }
+
         let mut batch = Batch::default();
         for (k, v) in key_vals.iter() {
             batch.insert(k.as_slice(), bincode::serialize(v)?);
@@ -528,6 +532,10 @@ impl StorageDB for SledStorageDB {
 
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
         let this = self.clone();
         spawn_blocking(move || {
             let mut batch = Batch::default();
@@ -1528,6 +1536,10 @@ impl List for SledStorageList {
     where
         V: Serialize + Sync + Send,
     {
+        if vals.is_empty() {
+            return Ok(());
+        }
+
         let vals = vals
             .into_iter()
             .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
