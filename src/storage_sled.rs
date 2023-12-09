@@ -282,13 +282,33 @@ impl SledStorageDB {
     }
 
     #[inline]
+    fn _map_remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.map(key.as_ref())._clear()?;
+        Self::_remove_expire_key(self.db.as_ref(), key.as_ref())
+            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn _list_remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.list(key.as_ref())._clear()?;
+        Self::_remove_expire_key(self.db.as_ref(), key.as_ref())
+            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        Ok(())
+    }
+
+    #[inline]
     fn _remove<K>(&self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
         self.db.remove(key.as_ref())?;
-        self.map(key.as_ref())._clear()?;
-        self.list(key.as_ref())._clear()?;
         Self::_remove_expire_key(self.db.as_ref(), key.as_ref())
             .map_err(|e| anyhow!(format!("{:?}", e)))?;
         Ok(())
@@ -426,12 +446,34 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
+    async fn map_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let this = self.clone();
+        let name = name.as_ref().to_vec();
+        spawn_blocking(move || this._map_remove(name)).await??;
+        Ok(())
+    }
+
+    #[inline]
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
         SledStorageList {
             name: name.as_ref().to_vec(),
             prefix_name: SledStorageDB::make_list_prefix(name),
             db: self.clone(),
         }
+    }
+
+    #[inline]
+    async fn list_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let this = self.clone();
+        let name = name.as_ref().to_vec();
+        spawn_blocking(move || this._list_remove(name)).await??;
+        Ok(())
     }
 
     #[inline]

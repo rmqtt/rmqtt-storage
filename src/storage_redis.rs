@@ -129,9 +129,28 @@ impl StorageDB for RedisStorageDB {
     }
 
     #[inline]
+    async fn map_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let map_full_name = self.make_map_full_name(name.as_ref());
+        self.async_conn().del(map_full_name).await?;
+        Ok(())
+    }
+
+    #[inline]
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
         let full_name = self.make_list_full_name(name.as_ref());
         RedisStorageList::new(name.as_ref().to_vec(), full_name, self.clone())
+    }
+
+    async fn list_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let list_full_name = self.make_list_full_name(name.as_ref());
+        self.async_conn().del(list_full_name).await?;
+        Ok(())
     }
 
     #[inline]
@@ -170,16 +189,8 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let mut async_conn = self.async_conn();
-
         let full_key = self.make_full_key(key.as_ref());
-        async_conn.del(full_key).await?;
-
-        let map_full_name = self.make_map_full_name(key.as_ref());
-        async_conn.del(map_full_name).await?;
-
-        let list_full_name = self.make_list_full_name(key.as_ref());
-        async_conn.del(list_full_name).await?;
+        self.async_conn().del(full_key).await?;
         Ok(())
     }
 

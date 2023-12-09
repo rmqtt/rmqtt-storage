@@ -27,7 +27,15 @@ pub trait StorageDB: Send + Sync {
 
     fn map<V: AsRef<[u8]>>(&self, name: V) -> Self::MapType;
 
+    async fn map_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send;
+
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType;
+
+    async fn list_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send;
 
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -228,10 +236,32 @@ impl DefaultStorageDB {
     }
 
     #[inline]
+    pub async fn map_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.map_remove(name).await,
+            DefaultStorageDB::Redis(db) => db.map_remove(name).await,
+        }
+    }
+
+    #[inline]
     pub fn list<V: AsRef<[u8]>>(&self, name: V) -> StorageList {
         match self {
             DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name)),
             DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name)),
+        }
+    }
+
+    #[inline]
+    pub async fn list_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.list_remove(name).await,
+            DefaultStorageDB::Redis(db) => db.list_remove(name).await,
         }
     }
 
