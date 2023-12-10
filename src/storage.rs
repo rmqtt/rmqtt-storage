@@ -8,7 +8,10 @@ use serde::Serialize;
 use crate::storage_redis::{RedisStorageDB, RedisStorageList, RedisStorageMap};
 use crate::storage_sled::SledStorageDB;
 use crate::storage_sled::{SledStorageList, SledStorageMap};
-use crate::{Result, TimestampMillis};
+use crate::Result;
+
+#[allow(unused_imports)]
+use crate::TimestampMillis;
 
 pub type Key = Vec<u8>;
 
@@ -31,11 +34,15 @@ pub trait StorageDB: Send + Sync {
     where
         K: AsRef<[u8]> + Sync + Send;
 
+    async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
+
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType;
 
     async fn list_remove<K>(&self, name: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send;
+
+    async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -75,14 +82,17 @@ pub trait StorageDB: Send + Sync {
 
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
+    #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send;
 
+    #[cfg(feature = "ttl")]
     async fn expire<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send;
 
+    #[cfg(feature = "ttl")]
     async fn ttl<K>(&self, key: K) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send;
@@ -94,6 +104,10 @@ pub trait StorageDB: Send + Sync {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>>;
+
+    async fn active_task_count(&self) -> isize;
+
+    async fn waiting_task_count(&self) -> isize;
 }
 
 #[async_trait]
@@ -101,6 +115,11 @@ pub trait Map: Sync + Send {
     fn name(&self) -> &[u8];
 
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: serde::ser::Serialize + Sync + Send + ?Sized;
+
+    async fn insert_not_atomic<K, V>(&self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send + ?Sized;
@@ -116,6 +135,7 @@ pub trait Map: Sync + Send {
 
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
+    #[cfg(feature = "map_len")]
     async fn len(&self) -> Result<usize>;
 
     async fn is_empty(&self) -> Result<bool>;
@@ -165,6 +185,15 @@ pub trait Map: Sync + Send {
     where
         F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
         Out: Future<Output = bool> + Send + 'a;
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool>;
+
+    #[cfg(feature = "ttl")]
+    async fn expire(&self, dur: TimestampMillis) -> Result<bool>;
+
+    #[cfg(feature = "ttl")]
+    async fn ttl(&self) -> Result<Option<TimestampMillis>>;
 }
 
 #[async_trait]
@@ -218,6 +247,15 @@ pub trait List: Sync + Send {
     ) -> Result<Box<dyn AsyncIterator<Item = Result<V>> + Send + 'a>>
     where
         V: DeserializeOwned + Sync + Send + 'a + 'static;
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool>;
+
+    #[cfg(feature = "ttl")]
+    async fn expire(&self, dur: TimestampMillis) -> Result<bool>;
+
+    #[cfg(feature = "ttl")]
+    async fn ttl(&self) -> Result<Option<TimestampMillis>>;
 }
 
 #[derive(Clone)]
@@ -247,6 +285,14 @@ impl DefaultStorageDB {
     }
 
     #[inline]
+    pub async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.map_contains_key(key).await,
+            DefaultStorageDB::Redis(db) => db.map_contains_key(key).await,
+        }
+    }
+
+    #[inline]
     pub fn list<V: AsRef<[u8]>>(&self, name: V) -> StorageList {
         match self {
             DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name)),
@@ -262,6 +308,14 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.list_remove(name).await,
             DefaultStorageDB::Redis(db) => db.list_remove(name).await,
+        }
+    }
+
+    #[inline]
+    pub async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.list_contains_key(key).await,
+            DefaultStorageDB::Redis(db) => db.list_contains_key(key).await,
         }
     }
 
@@ -372,6 +426,7 @@ impl DefaultStorageDB {
     }
 
     #[inline]
+    #[cfg(feature = "ttl")]
     pub async fn expire_at<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
@@ -383,6 +438,7 @@ impl DefaultStorageDB {
     }
 
     #[inline]
+    #[cfg(feature = "ttl")]
     pub async fn expire<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
@@ -394,6 +450,7 @@ impl DefaultStorageDB {
     }
 
     #[inline]
+    #[cfg(feature = "ttl")]
     pub async fn ttl<K>(&self, key: K) -> Result<Option<TimestampMillis>>
     where
         K: AsRef<[u8]> + Sync + Send,
@@ -423,6 +480,22 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.list_iter().await,
         }
     }
+
+    #[inline]
+    pub async fn active_task_count(&self) -> isize {
+        match self {
+            DefaultStorageDB::Sled(db) => db.active_task_count().await,
+            DefaultStorageDB::Redis(db) => db.active_task_count().await,
+        }
+    }
+
+    #[inline]
+    pub async fn waiting_task_count(&self) -> isize {
+        match self {
+            DefaultStorageDB::Sled(db) => db.waiting_task_count().await,
+            DefaultStorageDB::Redis(db) => db.waiting_task_count().await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -448,6 +521,17 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.insert(key, val).await,
             StorageMap::Redis(m) => m.insert(key, val).await,
+        }
+    }
+
+    async fn insert_not_atomic<K, V>(&self, key: K, val: &V) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: serde::ser::Serialize + Sync + Send + ?Sized,
+    {
+        match self {
+            StorageMap::Sled(m) => m.insert_not_atomic(key, val).await,
+            StorageMap::Redis(m) => m.insert_not_atomic(key, val).await,
         }
     }
 
@@ -479,6 +563,7 @@ impl Map for StorageMap {
         }
     }
 
+    #[cfg(feature = "map_len")]
     async fn len(&self) -> Result<usize> {
         match self {
             StorageMap::Sled(m) => m.len().await,
@@ -593,6 +678,30 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.retain_with_key(f).await,
             StorageMap::Redis(m) => m.retain_with_key(f).await,
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool> {
+        match self {
+            StorageMap::Sled(m) => m.expire_at(dur).await,
+            StorageMap::Redis(m) => m.expire_at(dur).await,
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
+        match self {
+            StorageMap::Sled(m) => m.expire(dur).await,
+            StorageMap::Redis(m) => m.expire(dur).await,
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn ttl(&self) -> Result<Option<TimestampMillis>> {
+        match self {
+            StorageMap::Sled(m) => m.ttl().await,
+            StorageMap::Redis(m) => m.ttl().await,
         }
     }
 }
@@ -731,6 +840,30 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.iter().await,
             StorageList::Redis(list) => list.iter().await,
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool> {
+        match self {
+            StorageList::Sled(l) => l.expire_at(dur).await,
+            StorageList::Redis(l) => l.expire_at(dur).await,
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
+        match self {
+            StorageList::Sled(l) => l.expire(dur).await,
+            StorageList::Redis(l) => l.expire(dur).await,
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn ttl(&self) -> Result<Option<TimestampMillis>> {
+        match self {
+            StorageList::Sled(l) => l.ttl().await,
+            StorageList::Redis(l) => l.ttl().await,
         }
     }
 }

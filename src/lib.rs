@@ -1,6 +1,5 @@
 #[macro_use]
 extern crate serde;
-extern crate core;
 
 use anyhow::Error;
 use serde::de;
@@ -82,8 +81,10 @@ impl<'de> de::Deserialize<'de> for StorageType {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) type TimestampMillis = usize;
 
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn timestamp_millis() -> TimestampMillis {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -133,10 +134,12 @@ mod tests {
         assert_eq!(k_9999_val, Some(9999));
 
         let s_m_1 = db.map("s_m_1");
+        s_m_1.clear().await.unwrap();
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
             s_m_1.insert(i.to_be_bytes(), &i).await.unwrap();
         }
+        #[cfg(feature = "map_len")]
         assert_eq!(s_m_1.len().await.unwrap(), 10_000);
         let k_9999_val = s_m_1
             .get::<_, usize>(9999usize.to_be_bytes())
@@ -182,6 +185,7 @@ mod tests {
         println!("s_l, cost time: {:?}", now.elapsed());
     }
 
+    #[cfg(feature = "ttl")]
     #[tokio::main]
     #[test]
     async fn test_expiration_cleaning() {
@@ -200,7 +204,7 @@ mod tests {
         let m_1 = db.map("m_1");
         m_1.insert("m_k_1", &1).await.unwrap();
         m_1.insert("m_k_2", &2).await.unwrap();
-        let res = db.expire("m_1", 1500).await.unwrap();
+        let res = m_1.expire(1500).await.unwrap();
         println!("m_1 expire res: {:?}", res);
 
         let l_1 = db.list("l_1");
@@ -208,7 +212,7 @@ mod tests {
         l_1.push(&11).await.unwrap();
         l_1.push(&22).await.unwrap();
 
-        let res = db.expire("l_1", 1500).await.unwrap();
+        let res = l_1.expire(1500).await.unwrap();
         println!("l_1 expire res: {:?}", res);
 
         tokio::time::sleep(Duration::from_millis(1700)).await;
@@ -265,25 +269,25 @@ mod tests {
 
         let map_1 = db.map("map_1");
         map_1.insert("m_k_1", &100).await.unwrap();
-        assert!(db.contains_key("map_1").await.unwrap());
+        assert!(db.map_contains_key("map_1").await.unwrap());
 
         let map_2 = db.map("map_2");
         map_2.clear().await.unwrap();
         println!(
             "test_db_insert contains_key(map_2) {:?}",
-            db.contains_key("map_2").await
+            db.map_contains_key("map_2").await
         );
-        assert!(!db.contains_key("map_2").await.unwrap());
+        assert!(!db.map_contains_key("map_2").await.unwrap());
 
         let list_1 = db.list("list_1");
         list_1.clear().await.unwrap();
         println!(
             "test_db_insert contains_key(list_1) {:?}",
-            db.contains_key("list_1").await
+            db.list_contains_key("list_1").await
         );
-        assert!(!db.contains_key("list_1").await.unwrap());
+        assert!(!db.list_contains_key("list_1").await.unwrap());
         list_1.push(&20).await.unwrap();
-        assert!(db.contains_key("list_1").await.unwrap());
+        assert!(db.list_contains_key("list_1").await.unwrap());
     }
 
     #[tokio::main]
@@ -310,13 +314,13 @@ mod tests {
         m2.clear().await.unwrap();
         assert_eq!(db.contains_key(db_key_2).await.unwrap(), false);
         m2.insert("m_k_1", &100).await.unwrap();
-        assert_eq!(db.contains_key(db_key_2).await.unwrap(), true);
+        assert_eq!(db.map_contains_key(db_key_2).await.unwrap(), true);
         m2.clear().await.unwrap();
-        assert_eq!(db.contains_key(db_key_2).await.unwrap(), false);
+        assert_eq!(db.map_contains_key(db_key_2).await.unwrap(), false);
         m2.insert("m_k_1", &100).await.unwrap();
-        assert_eq!(db.contains_key(db_key_2).await.unwrap(), true);
+        assert_eq!(db.map_contains_key(db_key_2).await.unwrap(), true);
         m2.remove("m_k_1").await.unwrap();
-        assert_eq!(db.contains_key(db_key_2).await.unwrap(), false);
+        assert_eq!(db.map_contains_key(db_key_2).await.unwrap(), false);
     }
 
     #[tokio::main]
@@ -336,40 +340,45 @@ mod tests {
         map_001.clear().await.unwrap();
         map_001.insert("k1", &1).await.unwrap();
         assert_eq!(map_001.is_empty().await.unwrap(), false);
+        #[cfg(feature = "map_len")]
         assert_eq!(map_001.len().await.unwrap(), 1);
-        let c_res = db.contains_key("map_001").await.unwrap();
+        let c_res = db.map_contains_key("map_001").await.unwrap();
         assert!(c_res);
         map_001.clear().await.unwrap();
         assert_eq!(map_001.is_empty().await.unwrap(), true);
+        #[cfg(feature = "map_len")]
         assert_eq!(map_001.len().await.unwrap(), 0);
-        let c_res = db.contains_key("map_001").await.unwrap();
+        let c_res = db.map_contains_key("map_001").await.unwrap();
         assert!(!c_res);
 
         let l1 = db.list("list_001");
         l1.push(&"aa").await.unwrap();
         l1.push(&"bb").await.unwrap();
         assert_eq!(l1.is_empty().await.unwrap(), false);
-        let c_res = db.contains_key("list_001").await.unwrap();
+        let c_res = db.list_contains_key("list_001").await.unwrap();
         assert!(c_res);
 
         let map_002 = db.map("map_002");
         map_002.clear().await.unwrap();
+        #[cfg(feature = "map_len")]
         println!("test_db_contains_key len: {}", map_002.len().await.unwrap());
         println!(
             "test_db_contains_key is_empty: {}",
             map_002.is_empty().await.unwrap()
         );
-        let c_res = db.contains_key("map_002").await.unwrap();
+        let c_res = db.map_contains_key("map_002").await.unwrap();
         assert!(!c_res);
         assert_eq!(map_002.is_empty().await.unwrap(), true);
+        #[cfg(feature = "map_len")]
         assert_eq!(map_002.len().await.unwrap(), 0);
 
         let list_002 = db.list("list_002");
-        let c_res = db.contains_key("list_002").await.unwrap();
+        let c_res = db.list_contains_key("list_002").await.unwrap();
         assert!(!c_res);
         assert_eq!(list_002.is_empty().await.unwrap(), true);
     }
 
+    #[cfg(feature = "ttl")]
     #[tokio::main]
     #[test]
     async fn test_db_expire() {
@@ -481,15 +490,15 @@ mod tests {
 
         assert_eq!(ttl_001.is_empty().await.unwrap(), false);
         assert_eq!(ttl_001.len().await.unwrap(), 2);
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap();
         println!("2 test_db_expire map ttl_001_res: {:?}", ttl_001_res);
         assert_eq!(ttl_001_res.is_some(), true);
 
-        let expire_res = db.expire("ttl_001", 1 * 1000).await.unwrap();
+        let expire_res = ttl_001.expire(1 * 1000).await.unwrap();
         println!("3 test_db_expire map expire_res: {:?}", expire_res);
         assert_eq!(expire_res, true);
 
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap().unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap().unwrap();
         println!("4 test_db_expire map ttl_001_res: {:?}", ttl_001_res);
         assert!(ttl_001_res <= 1 * 1000);
 
@@ -501,7 +510,7 @@ mod tests {
         assert_eq!(k2_v, Some(22));
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        assert_eq!(db.contains_key("ttl_001").await.unwrap(), false);
+        assert_eq!(db.map_contains_key("ttl_001").await.unwrap(), false);
         assert_eq!(ttl_001.len().await.unwrap(), 0);
         assert_eq!(ttl_001.is_empty().await.unwrap(), true);
         assert_eq!(
@@ -534,65 +543,65 @@ mod tests {
         assert_eq!(k1_v, None);
         assert_eq!(k2_v, None);
 
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap();
         println!("ttl_001_res: {:?}", ttl_001_res);
         assert!(ttl_001_res.is_none());
         ttl_001.insert("k1", &11).await.unwrap();
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap();
         println!("xxxx ttl_001_res: {:?}", ttl_001_res);
         assert!(ttl_001_res.is_some());
-        let expire_res = db.expire("ttl_001", 1 * 1000).await.unwrap();
+        let expire_res = ttl_001.expire(1 * 1000).await.unwrap();
         println!("expire_res: {:?}", expire_res);
         assert_eq!(expire_res, expire_res);
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap().unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap().unwrap();
         println!("x0 ttl_001_res: {:?}", ttl_001_res);
         assert!(ttl_001_res <= 1 * 1000);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap().unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap().unwrap();
         println!("x1 ttl_001_res: {:?}", ttl_001_res);
         assert!(ttl_001_res <= 500);
         ttl_001.insert("k1", &11).await.unwrap();
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap().unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap().unwrap();
         println!("x2 ttl_001_res: {:?}", ttl_001_res);
         assert!(ttl_001_res <= 500);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         ttl_001.insert("k1", &11).await.unwrap();
-        let ttl_001_res = db.ttl("ttl_001").await.unwrap().unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap().unwrap();
         println!(
             "x3 ttl_001_res: {:?}  {:?}",
             ttl_001_res,
             (TimestampMillis::MAX - ttl_001_res)
         );
         assert!(ttl_001_res >= 10000);
-        assert_eq!(db.contains_key("ttl_001").await.unwrap(), true);
+        assert_eq!(db.map_contains_key("ttl_001").await.unwrap(), true);
 
         //-----------------------------------------------------------------------------
         let mut l_ttl_001 = db.list("l_ttl_001");
         l_ttl_001.clear().await.unwrap();
-        let l_ttl_001_res_none = db.ttl("l_ttl_001").await.unwrap();
+        let l_ttl_001_res_none = l_ttl_001.ttl().await.unwrap();
         println!(
             "1 test_db_expire list l_ttl_001_res_none: {:?}",
             l_ttl_001_res_none
         );
-        assert_eq!(db.contains_key("l_ttl_001").await.unwrap(), false);
+        assert_eq!(db.list_contains_key("l_ttl_001").await.unwrap(), false);
         assert_eq!(l_ttl_001.is_empty().await.unwrap(), true);
         assert_eq!(l_ttl_001.len().await.unwrap(), 0);
         assert_eq!(l_ttl_001_res_none, None);
 
         l_ttl_001.push(&11).await.unwrap();
         l_ttl_001.push(&22).await.unwrap();
-        assert_eq!(db.contains_key("l_ttl_001").await.unwrap(), true);
+        assert_eq!(db.list_contains_key("l_ttl_001").await.unwrap(), true);
         assert_eq!(l_ttl_001.is_empty().await.unwrap(), false);
         assert_eq!(l_ttl_001.len().await.unwrap(), 2);
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap();
         println!("2 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert_eq!(l_ttl_001_res.is_some(), true);
 
-        let expire_res = db.expire("l_ttl_001", 1 * 1000).await.unwrap();
+        let expire_res = l_ttl_001.expire(1 * 1000).await.unwrap();
         println!("3 test_db_expire list expire_res: {:?}", expire_res);
         assert_eq!(expire_res, true);
 
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap().unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
         println!("4 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert!(l_ttl_001_res <= 1 * 1000);
 
@@ -604,7 +613,7 @@ mod tests {
         assert_eq!(k2_v, Some(22));
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        assert_eq!(db.contains_key("l_ttl_001").await.unwrap(), false);
+        assert_eq!(db.list_contains_key("l_ttl_001").await.unwrap(), false);
         assert_eq!(l_ttl_001.len().await.unwrap(), 0);
         assert_eq!(l_ttl_001.is_empty().await.unwrap(), true);
         assert_eq!(l_ttl_001.all::<i32>().await.unwrap().len(), 0);
@@ -623,33 +632,36 @@ mod tests {
         assert_eq!(k1_v, None);
         assert_eq!(k2_v, None);
 
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap();
         println!("test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert!(l_ttl_001_res.is_none());
         l_ttl_001.push(&11).await.unwrap();
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap();
         println!(
             "xxxx test_db_expire list l_ttl_001_res: {:?}",
             l_ttl_001_res
         );
         assert!(l_ttl_001_res.is_some());
-        let expire_res = db.expire("l_ttl_001", 1 * 1000).await.unwrap();
+        let expire_res = l_ttl_001.expire(1 * 1000).await.unwrap();
         println!("test_db_expire list expire_res: {:?}", expire_res);
         assert_eq!(expire_res, expire_res);
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap().unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
         println!("x0 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert!(l_ttl_001_res <= 1 * 1000);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap().unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
         println!("x1 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert!(l_ttl_001_res <= 500);
         l_ttl_001.push(&11).await.unwrap();
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap().unwrap();
+
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
         println!("x2 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert!(l_ttl_001_res <= 500);
+
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         l_ttl_001.push(&11).await.unwrap();
-        let l_ttl_001_res = db.ttl("l_ttl_001").await.unwrap().unwrap();
+
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
         println!(
             "x3 test_db_expire list l_ttl_001_res: {:?}  {:?}",
             l_ttl_001_res,
@@ -666,10 +678,12 @@ mod tests {
 
         let map001 = db.map("001");
         map001.clear().await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(map001.len().await.unwrap(), 0);
 
         map001.insert("key_1", &1).await.unwrap();
         map001.insert("key_2", &2).await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(map001.len().await.unwrap(), 2);
 
         let val = map001.get::<_, i32>("key_1").await.unwrap();
@@ -681,7 +695,9 @@ mod tests {
         println!("test_map_insert val: {:?}", val);
         assert_eq!(val, None);
 
+        #[cfg(feature = "map_len")]
         println!("test_map_insert len: {:?}", map001.len().await.unwrap());
+        #[cfg(feature = "map_len")]
         assert_eq!(map001.len().await.unwrap(), 1);
     }
 
@@ -693,6 +709,7 @@ mod tests {
 
         let map001 = db.map("m001");
         map001.clear().await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(map001.len().await.unwrap(), 0);
         assert_eq!(map001.contains_key("k001").await.unwrap(), false);
 
@@ -701,6 +718,7 @@ mod tests {
 
         map001.remove::<_>("k001").await.unwrap();
         assert_eq!(map001.contains_key("k001").await.unwrap(), false);
+        #[cfg(feature = "map_len")]
         assert_eq!(map001.len().await.unwrap(), 0);
     }
 
@@ -714,6 +732,7 @@ mod tests {
         let kv_key_1 = b"kv_key_1";
 
         kv001.clear().await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(kv001.len().await.unwrap(), 0);
 
         let kv_val_1 = String::from("kv_val_001");
@@ -726,6 +745,7 @@ mod tests {
             Some(kv_val_1.clone())
         );
         assert_eq!(kv001.get::<_, String>(b"kv_key_2").await.unwrap(), None);
+        #[cfg(feature = "map_len")]
         assert_eq!(kv001.len().await.unwrap(), 1);
         assert_eq!(kv001.is_empty().await.unwrap(), false);
 
@@ -734,6 +754,7 @@ mod tests {
         kv001.remove(kv_key_1).await.unwrap();
         assert_eq!(kv001.get::<_, String>(kv_key_1).await.unwrap(), None);
         assert!(!kv001.contains_key(kv_key_1).await.unwrap());
+        #[cfg(feature = "map_len")]
         assert_eq!(kv001.len().await.unwrap(), 0);
         assert_eq!(kv001.is_empty().await.unwrap(), true);
 
@@ -758,8 +779,10 @@ mod tests {
         kv001.insert(b"kv_key_4", "4").await.unwrap();
         kv001.insert(b"kv_key_5", "5").await.unwrap();
         kv001.insert(b"kv_key_6", "6").await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(kv001.len().await.unwrap(), 4);
         kv001.remove_with_prefix("kv_key_").await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(kv001.len().await.unwrap(), 0);
         assert_eq!(kv001.is_empty().await.unwrap(), true);
     }
@@ -775,6 +798,7 @@ mod tests {
         for i in 0..100usize {
             map1.insert(format!("mk_{}", i), &i).await.unwrap();
         }
+        #[cfg(feature = "map_len")]
         assert_eq!(map1.len().await.unwrap(), 100);
         map1.retain::<_, _, usize>(|item| async {
             match item {
@@ -787,6 +811,7 @@ mod tests {
         })
         .await
         .unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(map1.len().await.unwrap(), 99);
 
         map1.retain_with_key(|item| async {
@@ -800,6 +825,7 @@ mod tests {
         })
         .await
         .unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(map1.len().await.unwrap(), 98);
     }
 
@@ -816,6 +842,7 @@ mod tests {
             kvs.push((format!("key_{}", i).as_bytes().to_vec(), i));
         }
         skv.batch_insert(kvs.clone()).await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(skv.len().await.unwrap(), 100);
 
         let mut ks = Vec::new();
@@ -823,6 +850,7 @@ mod tests {
             ks.push(format!("key_{}", i).as_bytes().to_vec());
         }
         skv.batch_remove(ks).await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(skv.len().await.unwrap(), 50);
     }
 
@@ -979,6 +1007,7 @@ mod tests {
 
         let ml001 = db.map("m_l_001");
         ml001.clear().await.unwrap();
+        #[cfg(feature = "map_len")]
         assert_eq!(ml001.len().await.unwrap(), 0);
         assert_eq!(ml001.is_empty().await.unwrap(), true);
 
@@ -1101,9 +1130,12 @@ mod tests {
         while let Some(m) = iter.next().await {
             let m = m.unwrap();
             let name = String::from_utf8(m.name().to_vec());
-            println!("map name: {:?}, len: {:?}", name, m.len().await);
-            let len = m.len().await.unwrap();
-            assert!(len == 1 || len == 2 || len == 3);
+            println!("map name: {:?}", name);
+            #[cfg(feature = "map_len")]
+            {
+                let len = m.len().await.unwrap();
+                assert!(len == 1 || len == 2 || len == 3);
+            }
         }
     }
 
