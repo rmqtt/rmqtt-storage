@@ -82,7 +82,7 @@ impl<'de> de::Deserialize<'de> for StorageType {
 }
 
 #[allow(dead_code)]
-pub(crate) type TimestampMillis = usize;
+pub(crate) type TimestampMillis = i64;
 
 #[allow(dead_code)]
 #[inline]
