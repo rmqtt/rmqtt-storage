@@ -354,14 +354,6 @@ impl StorageDB for RedisStorageDB {
         };
         Ok(Box::new(iter))
     }
-
-    async fn active_task_count(&self) -> isize {
-        0
-    }
-
-    async fn waiting_task_count(&self) -> isize {
-        0
-    }
 }
 
 #[derive(Clone)]
@@ -482,14 +474,6 @@ impl Map for RedisStorageMap {
             .hset(name, key.as_ref(), bincode::serialize(val)?)
             .await?;
         Ok(())
-    }
-
-    async fn insert_not_atomic<K, V>(&self, key: K, val: &V) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: Serialize + Sync + Send + ?Sized,
-    {
-        self.insert(key, val).await
     }
 
     #[inline]

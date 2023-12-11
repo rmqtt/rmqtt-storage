@@ -105,7 +105,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            storage_type: StorageType::Redis,
+            storage_type: StorageType::Sled,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 gc_at_hour: 13,
@@ -489,6 +489,7 @@ mod tests {
         ttl_001.insert("k2", &22).await.unwrap();
 
         assert_eq!(ttl_001.is_empty().await.unwrap(), false);
+        #[cfg(feature = "map_len")]
         assert_eq!(ttl_001.len().await.unwrap(), 2);
         let ttl_001_res = ttl_001.ttl().await.unwrap();
         println!("2 test_db_expire map ttl_001_res: {:?}", ttl_001_res);
@@ -511,6 +512,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         assert_eq!(db.map_contains_key("ttl_001").await.unwrap(), false);
+        #[cfg(feature = "map_len")]
         assert_eq!(ttl_001.len().await.unwrap(), 0);
         assert_eq!(ttl_001.is_empty().await.unwrap(), true);
         assert_eq!(
@@ -1127,8 +1129,10 @@ mod tests {
         m3.insert("k3", &3).await.unwrap();
 
         let mut iter = db.map_iter().await.unwrap();
+        let mut map_names = Vec::new();
         while let Some(m) = iter.next().await {
             let m = m.unwrap();
+            map_names.push(String::from_utf8(m.name().to_vec()).unwrap());
             let name = String::from_utf8(m.name().to_vec());
             println!("map name: {:?}", name);
             #[cfg(feature = "map_len")]
@@ -1136,6 +1140,9 @@ mod tests {
                 let len = m.len().await.unwrap();
                 assert!(len == 1 || len == 2 || len == 3);
             }
+        }
+        for name in map_names.iter() {
+            assert!(vec!["m1", "m2", "m3"].contains(&name.as_str()));
         }
     }
 

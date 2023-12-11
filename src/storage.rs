@@ -23,6 +23,18 @@ pub trait AsyncIterator {
     async fn next(&mut self) -> Option<Self::Item>;
 }
 
+pub trait SplitSubslice {
+    fn split_subslice(&self, subslice: &[u8]) -> Option<(&[u8], &[u8])>;
+}
+
+impl SplitSubslice for [u8] {
+    fn split_subslice(&self, subslice: &[u8]) -> Option<(&[u8], &[u8])> {
+        self.windows(subslice.len())
+            .position(|window| window == subslice)
+            .map(|index| self.split_at(index + subslice.len()))
+    }
+}
+
 #[async_trait]
 pub trait StorageDB: Send + Sync {
     type MapType: Map;
@@ -104,10 +116,6 @@ pub trait StorageDB: Send + Sync {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>>;
-
-    async fn active_task_count(&self) -> isize;
-
-    async fn waiting_task_count(&self) -> isize;
 }
 
 #[async_trait]
@@ -115,11 +123,6 @@ pub trait Map: Sync + Send {
     fn name(&self) -> &[u8];
 
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: serde::ser::Serialize + Sync + Send + ?Sized;
-
-    async fn insert_not_atomic<K, V>(&self, key: K, val: &V) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send + ?Sized;
@@ -225,7 +228,6 @@ pub trait List: Sync + Send {
     async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
     where
         F: Fn(&V) -> bool + Send + Sync + 'static,
-        //Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a + 'static;
 
     async fn all<V>(&self) -> Result<Vec<V>>
@@ -480,22 +482,6 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.list_iter().await,
         }
     }
-
-    #[inline]
-    pub async fn active_task_count(&self) -> isize {
-        match self {
-            DefaultStorageDB::Sled(db) => db.active_task_count().await,
-            DefaultStorageDB::Redis(db) => db.active_task_count().await,
-        }
-    }
-
-    #[inline]
-    pub async fn waiting_task_count(&self) -> isize {
-        match self {
-            DefaultStorageDB::Sled(db) => db.waiting_task_count().await,
-            DefaultStorageDB::Redis(db) => db.waiting_task_count().await,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -521,17 +507,6 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.insert(key, val).await,
             StorageMap::Redis(m) => m.insert(key, val).await,
-        }
-    }
-
-    async fn insert_not_atomic<K, V>(&self, key: K, val: &V) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: serde::ser::Serialize + Sync + Send + ?Sized,
-    {
-        match self {
-            StorageMap::Sled(m) => m.insert_not_atomic(key, val).await,
-            StorageMap::Redis(m) => m.insert_not_atomic(key, val).await,
         }
     }
 

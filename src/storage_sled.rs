@@ -13,8 +13,6 @@ use convert::Bytesize;
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use task_exec_queue::{Builder, SpawnExt, TaskExecQueue};
-use tokio::task::spawn_blocking;
 
 #[allow(unused_imports)]
 use sled::transaction::TransactionResult;
@@ -33,6 +31,7 @@ const SEPARATOR: &[u8] = b"@";
 const DEF_TREE: &[u8] = b"__default_tree@";
 const MAP_NAME_PREFIX: &[u8] = b"__map@";
 const MAP_KEY_SEPARATOR: &[u8] = b"@__item@";
+#[allow(dead_code)]
 const MAP_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
 const LIST_NAME_PREFIX: &[u8] = b"__list@";
 const LIST_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
@@ -109,30 +108,20 @@ fn _decrement(old: Option<&[u8]>) -> Option<Vec<u8>> {
 pub struct SledStorageDB {
     db: Arc<sled::Db>,
     def_tree: sled::Tree,
-    exec: TaskExecQueue,
+    // exec: TaskExecQueue,
 }
 
 impl SledStorageDB {
     #[inline]
     pub(crate) async fn new(cfg: SledConfig) -> Result<Self> {
         let sled_cfg = cfg.to_sled_config()?;
-        let (db, def_tree) = spawn_blocking(move || {
-            sled_cfg.open().map(|db| {
-                let def_tree = db.open_tree(DEF_TREE);
-                (Arc::new(db), def_tree)
-            })
-        })
-        .await??;
+        let (db, def_tree) = sled_cfg.open().map(|db| {
+            let def_tree = db.open_tree(DEF_TREE);
+            (Arc::new(db), def_tree)
+        })?;
         let def_tree = def_tree?;
 
-        let queue_max = 300_000;
-        let (exec, task_runner) = Builder::default().workers(200).queue_max(queue_max).build();
-
-        tokio::spawn(async move {
-            task_runner.await;
-        });
-
-        let db = Self { db, def_tree, exec };
+        let db = Self { db, def_tree };
 
         #[cfg(feature = "ttl")]
         let sled_db = db.clone();
@@ -253,14 +242,31 @@ impl SledStorageDB {
         [MAP_NAME_PREFIX, name.as_ref(), MAP_KEY_COUNT_SUFFIX].concat()
     }
 
+    #[cfg(feature = "map_len")]
     #[inline]
     fn map_count_key_to_name(key: &[u8]) -> &[u8] {
         key[MAP_NAME_PREFIX.len()..key.as_ref().len() - MAP_KEY_COUNT_SUFFIX.len()].as_ref()
     }
 
+    #[cfg(feature = "map_len")]
     #[inline]
     fn is_map_count_key(key: &[u8]) -> bool {
         key.starts_with(MAP_NAME_PREFIX) && key.ends_with(MAP_KEY_COUNT_SUFFIX)
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    fn map_item_key_to_name(key: &[u8]) -> Option<&[u8]> {
+        use super::storage::SplitSubslice;
+        if let Some((prefix, _)) = key.split_subslice(MAP_KEY_SEPARATOR) {
+            if prefix.starts_with(MAP_NAME_PREFIX) {
+                return Some(
+                    prefix[MAP_NAME_PREFIX.len()..(prefix.len() - MAP_KEY_SEPARATOR.len())]
+                        .as_ref(),
+                );
+            }
+        }
+        None
     }
 
     #[inline]
@@ -352,7 +358,7 @@ impl SledStorageDB {
 
     #[cfg(feature = "ttl")]
     #[inline]
-    fn _remove_expire_key<K>(db: &sled::Db, key: K) -> TransactionResult<()>
+    fn _remove_expire_key<K>(db: &sled::Db, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
@@ -504,31 +510,20 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let this = self.clone();
-        let name = name.as_ref().to_vec();
-        spawn_blocking(move || this._map_remove(name))
-            .spawn(&self.exec)
-            .result()
-            .await???;
+        self._map_remove(name)?;
         Ok(())
     }
 
     #[inline]
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        Ok(spawn_blocking(move || {
-            if this._is_expired(key.as_slice(), |k| {
-                Self::_map_contains_key(&this.def_tree, k)
-            })? {
+        let this = self;
+        Ok(
+            if this._is_expired(key.as_ref(), |k| Self::_map_contains_key(&this.def_tree, k))? {
                 Ok(false)
             } else {
                 Self::_map_contains_key(&this.def_tree, key)
-            }
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???)
+            }?,
+        )
     }
 
     #[inline]
@@ -545,31 +540,20 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let this = self.clone();
-        let name = name.as_ref().to_vec();
-        spawn_blocking(move || this._list_remove(name))
-            .spawn(&self.exec)
-            .result()
-            .await???;
+        self._list_remove(name)?;
         Ok(())
     }
 
     #[inline]
     async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        Ok(spawn_blocking(move || {
-            if this._is_expired(key.as_slice(), |k| {
-                Self::_list_contains_key(&this.def_tree, k)
-            })? {
-                Ok(false)
-            } else {
-                Self::_list_contains_key(&this.def_tree, key)
-            }
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???)
+        let this = self;
+        if this._is_expired(key.as_ref(), |k| {
+            Self::_list_contains_key(&this.def_tree, k)
+        })? {
+            Ok(false)
+        } else {
+            Self::_list_contains_key(&this.def_tree, key)
+        }
     }
 
     #[inline]
@@ -578,19 +562,13 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send,
     {
-        let db = self.db.clone();
-        let key = key.as_ref().to_vec();
+        let db = self.db.as_ref();
         let val = bincode::serialize(val)?;
-        spawn_blocking(move || {
-            db.insert(key.as_slice(), val.as_slice())?;
-            #[cfg(feature = "ttl")]
-            Self::_remove_expire_key(&db, key.as_slice())?;
-            Ok::<(), TransactionError<()>>(())
-        })
-        .spawn(&self.exec)
-        .result()
-        .await??
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+
+        db.insert(key.as_ref(), val.as_slice())?;
+        #[cfg(feature = "ttl")]
+        Self::_remove_expire_key(db, key.as_ref())?;
+
         Ok(())
     }
 
@@ -600,22 +578,16 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        match spawn_blocking(move || {
-            let res: Result<_> = if this._is_expired(key.as_slice(), |k| {
-                Self::_db_contains_key(this.db.as_ref(), k)
-            })? {
-                Ok(None)
-            } else {
-                Ok(this.db.get(key)?)
-            };
-            res
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???
-        {
+        let this = self;
+
+        let res = if this._is_expired(key.as_ref(), |k| {
+            Self::_db_contains_key(this.db.as_ref(), k)
+        })? {
+            None
+        } else {
+            this.db.get(key)?
+        };
+        match res {
             Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
             None => Ok(None),
         }
@@ -626,12 +598,7 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        spawn_blocking(move || this._remove(key))
-            .spawn(&self.exec)
-            .result()
-            .await???;
+        self._remove(key)?;
         Ok(())
     }
 
@@ -652,34 +619,23 @@ impl StorageDB for SledStorageDB {
         #[cfg(feature = "ttl")]
         let keys = key_vals.into_iter().map(|(k, _)| k).collect::<Vec<Key>>();
 
-        let this = self.clone();
-        spawn_blocking(move || {
-            #[cfg(feature = "ttl")]
-            {
-                let mut remove_expire_batch = Batch::default();
-                for k in keys {
-                    if this._is_expired(k.as_slice(), |k| {
-                        Self::_db_contains_key(this.db.as_ref(), k)
-                    })? {
-                        SledStorageDB::_batch_remove_expire_key(&mut remove_expire_batch, k);
-                    }
-                }
-                this.db.apply_batch(remove_expire_batch)?;
-            }
+        let this = self;
 
-            this.db.apply_batch(batch)?;
-            // this.db
-            //     .transaction(move |tx| {
-            //         tx.apply_batch(&batch)?;
-            //         tx.apply_batch(&remove_expire_batch)?;
-            //         Ok(())
-            //     })
-            //     .map_err(|e: TransactionError<sled::Error>| anyhow!(e))?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???;
+        #[cfg(feature = "ttl")]
+        {
+            let mut remove_expire_batch = Batch::default();
+            for k in keys {
+                if this._is_expired(k.as_slice(), |k| {
+                    Self::_db_contains_key(this.db.as_ref(), k)
+                })? {
+                    SledStorageDB::_batch_remove_expire_key(&mut remove_expire_batch, k);
+                }
+            }
+            this.db.apply_batch(remove_expire_batch)?;
+        }
+
+        this.db.apply_batch(batch)?;
+
         Ok(())
     }
 
@@ -689,34 +645,21 @@ impl StorageDB for SledStorageDB {
             return Ok(());
         }
 
-        let this = self.clone();
-        spawn_blocking(move || {
-            let mut batch = Batch::default();
+        let this = self;
+        let mut batch = Batch::default();
+        for k in keys.iter() {
+            batch.remove(k.as_slice());
+        }
+        this.db.apply_batch(batch)?;
+        #[cfg(feature = "ttl")]
+        {
+            let mut remove_expire_batch = Batch::default();
             for k in keys.iter() {
-                batch.remove(k.as_slice());
+                SledStorageDB::_batch_remove_expire_key(&mut remove_expire_batch, k);
             }
-            this.db.apply_batch(batch)?;
-            #[cfg(feature = "ttl")]
-            {
-                let mut remove_expire_batch = Batch::default();
-                for k in keys.iter() {
-                    SledStorageDB::_batch_remove_expire_key(&mut remove_expire_batch, k);
-                }
-                this.db.apply_batch(remove_expire_batch)?;
-            }
+            this.db.apply_batch(remove_expire_batch)?;
+        }
 
-            // this.db
-            //     .transaction(move |tx| {
-            //         tx.apply_batch(&batch)?;
-            //         tx.apply_batch(&remove_expire_batch)?;
-            //         Ok(())
-            //     })
-            //     .map_err(|e: TransactionError<sled::Error>| anyhow!(e))?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???;
         Ok(())
     }
 
@@ -725,27 +668,20 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        spawn_blocking(move || {
-            this.db.fetch_and_update(key, |old: Option<&[u8]>| {
-                let number = match old {
-                    Some(bytes) => {
-                        if let Ok(array) = bytes.try_into() {
-                            let number = isize::from_be_bytes(array);
-                            number + increment
-                        } else {
-                            increment
-                        }
+        self.db.fetch_and_update(key, |old: Option<&[u8]>| {
+            let number = match old {
+                Some(bytes) => {
+                    if let Ok(array) = bytes.try_into() {
+                        let number = isize::from_be_bytes(array);
+                        number + increment
+                    } else {
+                        increment
                     }
-                    None => increment,
-                };
-                Some(number.to_be_bytes().to_vec())
-            })
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???;
+                }
+                None => increment,
+            };
+            Some(number.to_be_bytes().to_vec())
+        })?;
         Ok(())
     }
 
@@ -754,27 +690,20 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        spawn_blocking(move || {
-            this.db.fetch_and_update(key, |old: Option<&[u8]>| {
-                let number = match old {
-                    Some(bytes) => {
-                        if let Ok(array) = bytes.try_into() {
-                            let number = isize::from_be_bytes(array);
-                            number - decrement
-                        } else {
-                            -decrement
-                        }
+        self.db.fetch_and_update(key, |old: Option<&[u8]>| {
+            let number = match old {
+                Some(bytes) => {
+                    if let Ok(array) = bytes.try_into() {
+                        let number = isize::from_be_bytes(array);
+                        number - decrement
+                    } else {
+                        -decrement
                     }
-                    None => -decrement,
-                };
-                Some(number.to_be_bytes().to_vec())
-            })
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???;
+                }
+                None => -decrement,
+            };
+            Some(number.to_be_bytes().to_vec())
+        })?;
         Ok(())
     }
 
@@ -783,23 +712,16 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        spawn_blocking(move || {
-            let res: Result<_> = if this._is_expired(key.as_slice(), |k| {
-                Self::_db_contains_key(this.db.as_ref(), k)
-            })? {
-                Ok(None)
-            } else if let Some(v) = this.db.get(key)? {
-                Ok(Some(isize::from_be_bytes(v.as_ref().try_into()?)))
-            } else {
-                Ok(None)
-            };
-            res
-        })
-        .spawn(&self.exec)
-        .result()
-        .await??
+        let this = self;
+        if this._is_expired(key.as_ref(), |k| {
+            Self::_db_contains_key(this.db.as_ref(), k)
+        })? {
+            Ok(None)
+        } else if let Some(v) = this.db.get(key)? {
+            Ok(Some(isize::from_be_bytes(v.as_ref().try_into()?)))
+        } else {
+            Ok(None)
+        }
     }
 
     #[inline]
@@ -807,43 +729,26 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let db = self.db.clone();
-        let key = key.as_ref().to_vec();
+        let db = self.db.as_ref();
         let val = val.to_be_bytes().to_vec();
-        spawn_blocking(move || {
-            db.insert(key.as_slice(), val.as_slice())?;
-            #[cfg(feature = "ttl")]
-            Self::_remove_expire_key(&db, key.as_slice())?;
-            Ok::<(), TransactionError<()>>(())
-            // db.transaction(move |tx| {
-            //     tx.insert(key.as_slice(), val.as_slice())?;
-            //     Self::_tx_remove_expire_key(tx, key.as_slice())?;
-            //     Ok(())
-            // })
-        })
-        .spawn(&self.exec)
-        .result()
-        .await??
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+
+        db.insert(key.as_ref(), val.as_slice())?;
+        #[cfg(feature = "ttl")]
+        Self::_remove_expire_key(db, key.as_ref())?;
+
         Ok(())
     }
 
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        let this = self.clone();
-        let key = key.as_ref().to_vec();
-        Ok(spawn_blocking(move || {
-            if this._is_expired(key.as_slice(), |k| {
-                Self::_db_contains_key(this.db.as_ref(), k)
-            })? {
-                Ok(false)
-            } else {
-                this._contains_key(key)
-            }
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???)
+        let this = self;
+        if this._is_expired(key.as_ref(), |k| {
+            Self::_db_contains_key(this.db.as_ref(), k)
+        })? {
+            Ok(false)
+        } else {
+            this._contains_key(key)
+        }
     }
 
     #[inline]
@@ -852,24 +757,17 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let db = self.clone();
         let expire_key = Self::_make_expire_key(key.as_ref());
-        let key = key.as_ref().to_vec();
-        let res = spawn_blocking(move || {
-            if db._contains_key(key)? {
-                let at_bytes = at.to_be_bytes();
-                db.db
-                    .insert(expire_key, at_bytes.as_slice())
-                    .map_err(|e| anyhow!(e))
-                    .map(|_| true)
-            } else {
-                Ok(false)
-            }
-        })
-        .spawn(&self.exec)
-        .result()
-        .await???;
-        Ok(res)
+
+        if self._contains_key(key)? {
+            let at_bytes = at.to_be_bytes();
+            self.db
+                .insert(expire_key, at_bytes.as_slice())
+                .map_err(|e| anyhow!(e))
+                .map(|_| true)
+        } else {
+            Ok(false)
+        }
     }
 
     #[inline]
@@ -888,28 +786,15 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let key = key.as_ref().to_vec();
-        let this = self.clone();
-        Ok(
-            spawn_blocking(move || this._ttl(key, |k| Self::_db_contains_key(this.db.as_ref(), k)))
-                .spawn(&self.exec)
-                .result()
-                .await???,
-        )
+        Ok(self._ttl(key, |k| Self::_db_contains_key(self.db.as_ref(), k))?)
     }
 
     #[inline]
     async fn map_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageMap>> + Send + 'a>> {
-        let this = self.clone();
-        let iter = spawn_blocking(move || {
-            let iter = Arc::new(RwLock::new(this.def_tree.scan_prefix(MAP_NAME_PREFIX)));
-            Box::new(AsyncMapIter { db: this, iter })
-        })
-        .spawn(&self.exec)
-        .result()
-        .await??;
+        let iter = Arc::new(RwLock::new(self.def_tree.scan_prefix(MAP_NAME_PREFIX)));
+        let iter = Box::new(AsyncMapIter::new(self.clone(), iter));
         Ok(iter)
     }
 
@@ -917,23 +802,12 @@ impl StorageDB for SledStorageDB {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>> {
-        let this = self.clone();
-        let iter = spawn_blocking(move || {
-            let iter = Arc::new(RwLock::new(this.def_tree.scan_prefix(LIST_NAME_PREFIX)));
-            Box::new(AsyncListIter { db: this, iter })
-        })
-        .spawn(&self.exec)
-        .result()
-        .await??;
+        let iter = Arc::new(RwLock::new(self.def_tree.scan_prefix(LIST_NAME_PREFIX)));
+        let iter = Box::new(AsyncListIter {
+            db: self.clone(),
+            iter,
+        });
         Ok(iter)
-    }
-
-    async fn active_task_count(&self) -> isize {
-        self.exec.active_count()
-    }
-
-    async fn waiting_task_count(&self) -> isize {
-        self.exec.waiting_count()
     }
 }
 
@@ -1234,82 +1108,32 @@ impl Map for SledStorageMap {
     {
         let val = bincode::serialize(val)?;
         let item_key = self.make_map_item_key(key.as_ref());
-        let this = self.clone();
-        spawn_blocking(move || {
-            #[cfg(feature = "map_len")]
-            {
-                let count_key = this.map_count_key_name.as_slice();
-                this.tree().transaction(move |tx| {
+        let this = self;
+
+        #[cfg(feature = "map_len")]
+        {
+            let count_key = this.map_count_key_name.as_slice();
+            this.tree()
+                .transaction(move |tx| {
                     if tx.insert(item_key.as_slice(), val.as_slice())?.is_none() {
                         Self::_tx_counter_inc(tx, count_key)?;
                     }
                     Ok(())
-                })?;
-            }
-            #[cfg(not(feature = "map_len"))]
-            this.tree().insert(item_key.as_slice(), val.as_slice())?;
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
+        #[cfg(not(feature = "map_len"))]
+        this.tree().insert(item_key.as_slice(), val.as_slice())?;
 
-            #[cfg(feature = "ttl")]
-            {
-                if this
-                    .db
-                    ._is_expired(this.name.as_slice(), |k| {
-                        SledStorageDB::_map_contains_key(this.tree(), k)
-                    })
-                    .map_err(|e| {
-                        TransactionError::Storage(sled::Error::Io(io::Error::new(
-                            ErrorKind::InvalidData,
-                            e,
-                        )))
-                    })?
-                {
-                    SledStorageDB::_remove_expire_key(this.db.db.as_ref(), this.name.as_slice())?;
-                }
+        #[cfg(feature = "ttl")]
+        {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(this.tree(), k)
+            })? {
+                SledStorageDB::_remove_expire_key(this.db.db.as_ref(), this.name.as_slice())?;
             }
-            Ok::<(), TransactionError<()>>(())
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
-        Ok(())
-    }
+        }
 
-    async fn insert_not_atomic<K, V>(&self, key: K, val: &V) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: Serialize + Sync + Send + ?Sized,
-    {
-        let val = bincode::serialize(val)?;
-        let item_key = self.make_map_item_key(key.as_ref());
-        let this = self.clone();
-        spawn_blocking(move || {
-            #[cfg(feature = "map_len")]
-            if this
-                .tree()
-                .insert(item_key.as_slice(), val.as_slice())?
-                .is_none()
-            {
-                Self::_counter_add(this.tree(), this.map_count_key_name.as_slice(), 1)?;
-            }
-            #[cfg(not(feature = "map_len"))]
-            this.tree().insert(item_key.as_slice(), val.as_slice())?;
-
-            #[cfg(feature = "ttl")]
-            {
-                if this.db._is_expired(this.name.as_slice(), |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })? {
-                    SledStorageDB::_remove_expire_key(this.db.db.as_ref(), this.name.as_slice())
-                        .map_err(|e| anyhow!(format!("{:?}", e)))?;
-                }
-            }
-            Ok(())
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
-        .map_err(|e: anyhow::Error| anyhow!(format!("{:?}", e)))?;
         Ok(())
     }
 
@@ -1319,21 +1143,17 @@ impl Map for SledStorageMap {
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        let this = self.clone();
+        let this = self;
         let item_key = self.make_map_item_key(key.as_ref());
-        match spawn_blocking(move || {
-            if !this.db._is_expired(this.name.as_slice(), |k| {
-                SledStorageDB::_map_contains_key(this.tree(), k)
-            })? {
-                this.tree().get(item_key).map_err(|e| anyhow!(e))
-            } else {
-                Ok(None)
-            }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???
-        {
+        let res = if !this.db._is_expired(this.name.as_slice(), |k| {
+            SledStorageDB::_map_contains_key(this.tree(), k)
+        })? {
+            this.tree().get(item_key).map_err(|e| anyhow!(e))?
+        } else {
+            None
+        };
+
+        match res {
             Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
             None => Ok(None),
         }
@@ -1344,49 +1164,41 @@ impl Map for SledStorageMap {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let tree = self.tree().clone();
+        let tree = self.tree();
         let key = self.make_map_item_key(key.as_ref());
         #[cfg(feature = "map_len")]
         let count_key = self.map_count_key_name.to_vec();
-        spawn_blocking(move || {
-            #[cfg(feature = "map_len")]
-            {
-                tree.transaction(move |tx| {
-                    if tx.remove(key.as_slice())?.is_some() {
-                        Self::_tx_counter_dec(tx, count_key.as_slice())?;
-                    }
-                    Ok(())
-                })
-            }
 
-            #[cfg(not(feature = "map_len"))]
-            {
-                tree.remove(key.as_slice())?;
-                Ok::<_, anyhow::Error>(())
-            }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        #[cfg(feature = "map_len")]
+        {
+            tree.transaction(move |tx| {
+                if tx.remove(key.as_slice())?.is_some() {
+                    Self::_tx_counter_dec(tx, count_key.as_slice())?;
+                }
+                Ok(())
+            })
+            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
+
+        #[cfg(not(feature = "map_len"))]
+        {
+            tree.remove(key.as_slice())?;
+        }
+
         Ok(())
     }
 
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        let tree = self.tree().clone();
         let key = self.make_map_item_key(key.as_ref());
-        Ok(spawn_blocking(move || tree.contains_key(key))
-            .spawn(&self.db.exec)
-            .result()
-            .await???)
+        Ok(self.tree().contains_key(key)?)
     }
 
     #[cfg(feature = "map_len")]
     #[inline]
     async fn len(&self) -> Result<usize> {
-        let this = self.clone();
-        let len = spawn_blocking(move || {
+        let this = self;
+        let len = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_map_contains_key(this.tree(), k)
             })? {
@@ -1394,37 +1206,29 @@ impl Map for SledStorageMap {
             } else {
                 this._len_get()
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
+
         Ok(len as usize)
     }
 
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
-        let this = self.clone();
-        spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_map_contains_key(this.tree(), k)
             })? {
-                Ok(true)
+                true
             } else {
-                Ok(this._is_empty())
+                this._is_empty()
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
+        };
+        Ok(res)
     }
 
     #[inline]
     async fn clear(&self) -> Result<()> {
-        let this = self.clone();
-        spawn_blocking(move || this._clear())
-            .spawn(&self.db.exec)
-            .result()
-            .await???;
+        self._clear()?;
         Ok(())
     }
 
@@ -1435,20 +1239,11 @@ impl Map for SledStorageMap {
         V: DeserializeOwned + Sync + Send,
     {
         let key = self.make_map_item_key(key.as_ref());
-        let this = self.clone();
-        let removed = spawn_blocking(move || {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })
-                .map_err(|e| {
-                    TransactionError::Storage(sled::Error::Io(io::Error::new(
-                        ErrorKind::InvalidData,
-                        e,
-                    )))
-                })?
-            {
+        let this = self;
+        let removed = {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
                 #[cfg(feature = "map_len")]
@@ -1469,10 +1264,7 @@ impl Map for SledStorageMap {
                     Ok::<_, TransactionError<()>>(removed)
                 }
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
+        }
         .map_err(|e| anyhow!(format!("{:?}", e)))?;
 
         if let Some(removed) = removed {
@@ -1487,14 +1279,14 @@ impl Map for SledStorageMap {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let tree = self.tree().clone();
+        let tree = self.tree();
         let prefix = [self.map_item_prefix_name.as_slice(), prefix.as_ref()]
             .concat()
             .to_vec();
 
         #[cfg(feature = "map_len")]
         let map_count_key_name = self.map_count_key_name.to_vec();
-        spawn_blocking(move || {
+        {
             let mut removeds = Batch::default();
             #[cfg(feature = "map_len")]
             let mut c = 0;
@@ -1531,10 +1323,7 @@ impl Map for SledStorageMap {
                 tree.apply_batch(removeds)?;
                 Ok::<(), ConflictableTransactionError<sled::Error>>(())
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
         Ok(())
     }
 
@@ -1564,8 +1353,8 @@ impl Map for SledStorageMap {
     where
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let this = self.clone();
-        let res = spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_map_contains_key(this.tree(), k)
             })? {
@@ -1581,18 +1370,13 @@ impl Map for SledStorageMap {
                         .scan_prefix(this.map_item_prefix_name.as_slice()),
                 ));
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
-                    exec: this.db.exec.clone(),
                     prefix_len: tem_prefix_name,
                     iter,
                     _m: std::marker::PhantomData,
                 });
                 Ok::<_, anyhow::Error>(iter)
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await
-        .map_err(|e| anyhow!(e.to_string()))???;
+        }?;
         Ok(res)
     }
 
@@ -1600,8 +1384,8 @@ impl Map for SledStorageMap {
     async fn key_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
-        let this = self.clone();
-        let res = spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_map_contains_key(this.tree(), k)
             })? {
@@ -1617,17 +1401,12 @@ impl Map for SledStorageMap {
                 ));
                 let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
                     Box::new(AsyncKeyIter {
-                        exec: this.db.exec.clone(),
                         prefix_len: this.map_item_prefix_name.len(),
                         iter,
                     });
                 Ok::<_, anyhow::Error>(iter)
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await
-        .map_err(|e| anyhow!(e.to_string()))???;
+        }?;
         Ok(res)
     }
 
@@ -1640,9 +1419,8 @@ impl Map for SledStorageMap {
         P: AsRef<[u8]> + Send,
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let this = self.clone();
-        let prefix = prefix.as_ref().to_vec();
-        let res = spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_map_contains_key(this.tree(), k)
             })? {
@@ -1656,18 +1434,13 @@ impl Map for SledStorageMap {
                     [this.map_item_prefix_name.as_slice(), prefix.as_ref()].concat(),
                 )));
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
-                    exec: this.db.exec.clone(),
                     prefix_len: this.map_item_prefix_name.len(),
                     iter,
                     _m: std::marker::PhantomData,
                 });
                 Ok::<_, anyhow::Error>(iter)
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await
-        .map_err(|e| anyhow!(e.to_string()))???;
+        }?;
         Ok(res)
     }
 
@@ -1678,13 +1451,7 @@ impl Map for SledStorageMap {
         Out: Future<Output = bool> + Send + 'a,
         V: DeserializeOwned + Sync + Send + 'a,
     {
-        let this = self.clone();
-        spawn_blocking(move || {
-            tokio::runtime::Handle::current().block_on(async move { this._retain(f).await })
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        self._retain(f).await?;
         Ok(())
     }
 
@@ -1694,24 +1461,15 @@ impl Map for SledStorageMap {
         F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
         Out: Future<Output = bool> + Send + 'a,
     {
-        let this = self.clone();
-        spawn_blocking(move || {
-            tokio::runtime::Handle::current()
-                .block_on(async move { this._retain_with_key(f).await })
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        self._retain_with_key(f).await?;
         Ok(())
     }
 
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
-        let this = self.clone();
-
+        let this = self;
         let expire_key = SledStorageDB::_make_expire_key(self.name.as_slice());
-        //let key = self.name.clone();
-        let res = spawn_blocking(move || {
+        let res = {
             if SledStorageDB::_map_contains_key(this.tree(), this.name.as_slice())? {
                 let at_bytes = at.to_be_bytes();
                 this.db
@@ -1722,10 +1480,7 @@ impl Map for SledStorageMap {
             } else {
                 Ok(false)
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
         Ok(res)
     }
 
@@ -1737,15 +1492,10 @@ impl Map for SledStorageMap {
 
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
-        let this = self.clone();
-        Ok(spawn_blocking(move || {
-            this.db._ttl(this.name(), |k| {
-                SledStorageDB::_map_contains_key(this.tree(), k)
-            })
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???)
+        let res = self.db._ttl(self.name(), |k| {
+            SledStorageDB::_map_contains_key(self.tree(), k)
+        })?;
+        Ok(res)
     }
 }
 
@@ -1914,45 +1664,30 @@ impl List for SledStorageList {
         V: serde::ser::Serialize + Sync + Send,
     {
         let data = bincode::serialize(val)?;
-        let tree = self.tree().clone();
-        let this = self.clone();
-        spawn_blocking(move || {
-            #[cfg(feature = "ttl")]
-            let this1 = this.clone();
-            tree.transaction(move |tx| {
-                let list_count_key = this.make_list_count_key();
-                let (start, mut end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
-                end += 1;
-                Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
+        let this = self;
 
-                let list_content_key = this.make_list_content_key(end);
-                Self::tx_list_content_set(tx, list_content_key.as_slice(), &data)?;
-                Ok(())
-            })?;
+        this.tree().transaction(move |tx| {
+            let list_count_key = this.make_list_count_key();
+            let (start, mut end) = Self::tx_list_count_get::<
+                _,
+                ConflictableTransactionError<sled::Error>,
+            >(tx, list_count_key.as_slice())?;
+            end += 1;
+            Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
 
-            #[cfg(feature = "ttl")]
-            {
-                if this1
-                    .db
-                    ._is_expired(this1.name.as_slice(), |k| {
-                        SledStorageDB::_list_contains_key(this1.tree(), k)
-                    })
-                    .map_err(|e| {
-                        TransactionError::Storage(sled::Error::Io(io::Error::new(
-                            ErrorKind::InvalidData,
-                            e,
-                        )))
-                    })?
-                {
-                    SledStorageDB::_remove_expire_key(this1.db.db.as_ref(), this1.name.as_slice())?;
-                }
+            let list_content_key = this.make_list_content_key(end);
+            Self::tx_list_content_set(tx, list_content_key.as_slice(), &data)?;
+            Ok(())
+        })?;
+
+        #[cfg(feature = "ttl")]
+        {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
+                SledStorageDB::_remove_expire_key(this.db.db.as_ref(), this.name.as_slice())?;
             }
-            Ok::<(), TransactionError<()>>(())
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
 
         Ok(())
     }
@@ -1970,54 +1705,37 @@ impl List for SledStorageList {
             .into_iter()
             .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
             .collect::<Result<Vec<_>>>()?;
-        let tree = self.tree().clone();
-        let this = self.clone();
+        let tree = self.tree();
+        let this = self;
 
-        spawn_blocking(move || {
-            #[cfg(feature = "ttl")]
-            let this1 = this.clone();
-            tree.transaction(move |tx| {
-                let list_count_key = this.make_list_count_key();
-                let (start, mut end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
+        tree.transaction(move |tx| {
+            let list_count_key = this.make_list_count_key();
+            let (start, mut end) = Self::tx_list_count_get::<
+                _,
+                ConflictableTransactionError<sled::Error>,
+            >(tx, list_count_key.as_slice())?;
 
-                let mut list_content_keys =
-                    this.make_list_content_keys(end + 1, end + vals.len() + 1);
-                //assert_eq!(vals.len(), list_content_keys.len());
-                end += vals.len();
-                Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
+            let mut list_content_keys = this.make_list_content_keys(end + 1, end + vals.len() + 1);
+            //assert_eq!(vals.len(), list_content_keys.len());
+            end += vals.len();
+            Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
 
-                let list_contents = vals
-                    .iter()
-                    .map(|val| (list_content_keys.remove(0), val))
-                    .collect::<Vec<_>>();
-                Self::tx_list_content_batch_set(tx, list_contents)?;
-                Ok(())
-            })?;
+            let list_contents = vals
+                .iter()
+                .map(|val| (list_content_keys.remove(0), val))
+                .collect::<Vec<_>>();
+            Self::tx_list_content_batch_set(tx, list_contents)?;
+            Ok(())
+        })?;
 
-            #[cfg(feature = "ttl")]
-            {
-                if this1
-                    .db
-                    ._is_expired(this1.name.as_slice(), |k| {
-                        SledStorageDB::_list_contains_key(this1.tree(), k)
-                    })
-                    .map_err(|e| {
-                        TransactionError::Storage(sled::Error::Io(io::Error::new(
-                            ErrorKind::InvalidData,
-                            e,
-                        )))
-                    })?
-                {
-                    SledStorageDB::_remove_expire_key(this1.db.db.as_ref(), this1.name.as_slice())?;
-                }
+        #[cfg(feature = "ttl")]
+        {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
+                SledStorageDB::_remove_expire_key(this.db.db.as_ref(), this.name.as_slice())?;
             }
-            Ok::<(), TransactionError<()>>(())
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
-
+        }
         Ok(())
     }
 
@@ -2033,12 +1751,10 @@ impl List for SledStorageList {
         V: DeserializeOwned,
     {
         let data = bincode::serialize(val)?;
-        let tree = self.tree().clone();
-        let this = self.clone();
+        let tree = self.tree();
+        let this = self;
 
-        let removed = spawn_blocking(move || {
-            #[cfg(feature = "ttl")]
-            let this1 = this.clone();
+        let removed = {
             let res = tree.transaction(move |tx| {
                 let list_count_key = this.make_list_count_key();
                 let (mut start, mut end) = Self::tx_list_count_get::<
@@ -2074,27 +1790,15 @@ impl List for SledStorageList {
 
             #[cfg(feature = "ttl")]
             {
-                if this1
-                    .db
-                    ._is_expired(this1.name.as_slice(), |k| {
-                        SledStorageDB::_list_contains_key(this1.tree(), k)
-                    })
-                    .map_err(|e| {
-                        TransactionError::Storage(sled::Error::Io(io::Error::new(
-                            ErrorKind::InvalidData,
-                            e,
-                        )))
-                    })?
-                {
-                    SledStorageDB::_remove_expire_key(this1.db.db.as_ref(), this1.name.as_slice())?;
+                if this.db._is_expired(this.name.as_slice(), |k| {
+                    SledStorageDB::_list_contains_key(this.tree(), k)
+                })? {
+                    SledStorageDB::_remove_expire_key(this.db.db.as_ref(), this.name.as_slice())?;
                 }
             }
 
             Ok::<_, TransactionError<()>>(res)
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
+        }
         .map_err(|e| anyhow!(format!("{:?}", e)))??;
 
         let removed = if let Some(removed) = removed {
@@ -2113,23 +1817,14 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        let this = self.clone();
-        let removed = spawn_blocking(move || {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })
-                .map_err(|e| {
-                    TransactionError::Storage(sled::Error::Io(io::Error::new(
-                        ErrorKind::InvalidData,
-                        e,
-                    )))
-                })?
-            {
+        let this = self;
+        let removed = {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
-                let removed = this.tree().clone().transaction(move |tx| {
+                let removed = this.tree().transaction(move |tx| {
                     let list_count_key = this.make_list_count_key();
                     let (start, end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
 
@@ -2145,10 +1840,7 @@ impl List for SledStorageList {
                 });
                 removed
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
 
         let removed = if let Some(v) = removed {
             Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
@@ -2165,23 +1857,14 @@ impl List for SledStorageList {
         F: Fn(&V) -> bool + Send + Sync + 'static,
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let this = self.clone();
-        let removed = spawn_blocking(move || {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })
-                .map_err(|e| {
-                    TransactionError::Storage(sled::Error::Io(io::Error::new(
-                        ErrorKind::InvalidData,
-                        e,
-                    )))
-                })?
-            {
+        let this = self;
+        let removed = {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
-                let removed = this.tree().clone().transaction(move |tx| {
+                let removed = this.tree().transaction(move |tx| {
                     let list_count_key = this.make_list_count_key();
                     let (start, end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
 
@@ -2191,7 +1874,7 @@ impl List for SledStorageList {
                         let saved_val = tx.get(removed_content_key.as_slice())?;
                         if let Some(v) = saved_val {
                             let val = bincode::deserialize::<V>(v.as_ref()).map_err(|e| {
-                                ConflictableTransactionError::Storage(sled::Error::Io(
+                                ConflictableTransactionError::<()>::Storage(sled::Error::Io(
                                     io::Error::new(ErrorKind::InvalidData, e),
                                 ))
                             })?;
@@ -2211,12 +1894,8 @@ impl List for SledStorageList {
                 });
                 removed
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await
-        .map_err(|e| anyhow!(e.to_string()))??
-        .map_err(|e: TransactionError<sled::Error>| anyhow!(e))?;
+        }
+        .map_err(|e| anyhow!(format!("{:?}", e)))?;
         Ok(removed)
     }
 
@@ -2225,8 +1904,8 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        let this = self.clone();
-        let res = spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_list_contains_key(this.tree(), k)
             })? {
@@ -2240,10 +1919,7 @@ impl List for SledStorageList {
                     .map(|item| item.map_err(anyhow::Error::new))
                     .collect::<Result<Vec<_>>>()
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
 
         res.iter()
             .map(|v| bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
@@ -2255,24 +1931,14 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        let tree = self.tree().clone();
-        let this = self.clone();
-        let res = spawn_blocking(move || {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })
-                .map_err(|e| {
-                    TransactionError::Storage(sled::Error::Io(io::Error::new(
-                        ErrorKind::InvalidData,
-                        e,
-                    )))
-                })?
-            {
+        let this = self;
+        let res = {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
-                tree.transaction(move |tx| {
+                this.tree().transaction(move |tx| {
                     let list_count_key = this.make_list_count_key();
                     let (start, end) = Self::tx_list_count_get::<
                         _,
@@ -2290,10 +1956,7 @@ impl List for SledStorageList {
                     }
                 })
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
 
         Ok(if let Some(res) = res {
             Some(bincode::deserialize::<V>(res.as_ref()).map_err(|e| anyhow!(e))?)
@@ -2304,12 +1967,12 @@ impl List for SledStorageList {
 
     #[inline]
     async fn len(&self) -> Result<usize> {
-        let this = self.clone();
-        spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_list_contains_key(this.tree(), k)
             })? {
-                Ok(0)
+                Ok::<usize, anyhow::Error>(0)
             } else {
                 let list_count_key = this.make_list_count_key();
                 if let Some(v) = this.tree().get(list_count_key.as_slice())? {
@@ -2319,16 +1982,14 @@ impl List for SledStorageList {
                     Ok(0)
                 }
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await??
+        }?;
+        Ok(res)
     }
 
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
-        let this = self.clone();
-        Ok(spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_list_contains_key(this.tree(), k)
             })? {
@@ -2336,19 +1997,13 @@ impl List for SledStorageList {
             } else {
                 this._is_empty()
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???)
+        }?;
+        Ok(res)
     }
 
     #[inline]
     async fn clear(&self) -> Result<()> {
-        let this = self.clone();
-        spawn_blocking(move || this._clear())
-            .spawn(&self.db.exec)
-            .result()
-            .await???;
+        self._clear()?;
         Ok(())
     }
 
@@ -2359,8 +2014,8 @@ impl List for SledStorageList {
     where
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
-        let this = self.clone();
-        let res = spawn_blocking(move || {
+        let this = self;
+        let res = {
             if this.db._is_expired(this.name.as_slice(), |k| {
                 SledStorageDB::_list_contains_key(this.tree(), k)
             })? {
@@ -2375,27 +2030,20 @@ impl List for SledStorageList {
                 let iter = Arc::new(RwLock::new(this.tree().scan_prefix(list_content_prefix)));
                 let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
                     Box::new(AsyncListValIter {
-                        exec: this.db.exec.clone(),
                         iter,
                         _m: std::marker::PhantomData,
                     });
                 Ok::<_, anyhow::Error>(iter)
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await
-        .map_err(|e| anyhow!(e.to_string()))???;
+        }?;
         Ok(res)
     }
 
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
-        let this = self.clone();
-
+        let this = self;
         let expire_key = SledStorageDB::_make_expire_key(self.name.as_slice());
-        //let key = self.name.clone();
-        let res = spawn_blocking(move || {
+        let res = {
             if SledStorageDB::_list_contains_key(this.tree(), this.name.as_slice())? {
                 let at_bytes = at.to_be_bytes();
                 this.db
@@ -2406,10 +2054,7 @@ impl List for SledStorageList {
             } else {
                 Ok(false)
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await???;
+        }?;
         Ok(res)
     }
 
@@ -2421,20 +2066,13 @@ impl List for SledStorageList {
 
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
-        let this = self.clone();
-        Ok(spawn_blocking(move || {
-            this.db._ttl(this.name(), |k| {
-                SledStorageDB::_list_contains_key(this.tree(), k)
-            })
+        self.db._ttl(self.name(), |k| {
+            SledStorageDB::_list_contains_key(self.tree(), k)
         })
-        .spawn(&self.db.exec)
-        .result()
-        .await???)
     }
 }
 
 pub struct AsyncIter<V> {
-    exec: TaskExecQueue,
     prefix_len: usize,
     iter: Arc<RwLock<sled::Iter>>,
     _m: std::marker::PhantomData<V>,
@@ -2454,33 +2092,22 @@ where
     type Item = IterItem<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let iter = self.iter.clone();
-        let prefix_len = self.prefix_len;
-        let item = spawn_blocking(move || match iter.write().next() {
+        let item = match self.iter.write().next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, v))) => {
-                let name = k.as_ref()[prefix_len..].to_vec();
+                let name = k.as_ref()[self.prefix_len..].to_vec();
                 match bincode::deserialize::<V>(v.as_ref()) {
                     Ok(v) => Some(Ok((name, v))),
                     Err(e) => Some(Err(anyhow::Error::new(e))),
                 }
             }
-        })
-        .spawn(&self.exec)
-        .result()
-        .await;
-
-        match item {
-            Err(e) => Some(Err(anyhow!(e.to_string()))),
-            Ok(Err(e)) => Some(Err(anyhow!(e))),
-            Ok(Ok(item)) => item,
-        }
+        };
+        item
     }
 }
 
 pub struct AsyncKeyIter {
-    exec: TaskExecQueue,
     prefix_len: usize,
     iter: Arc<RwLock<sled::Iter>>,
 }
@@ -2496,31 +2123,18 @@ impl AsyncIterator for AsyncKeyIter {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let iter = self.iter.clone();
-        let prefix_len = self.prefix_len;
-        let item = spawn_blocking(move || {
-            return match iter.write().next() {
-                None => None,
-                Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
-                Some(Ok((k, _))) => {
-                    let name = k.as_ref()[prefix_len..].to_vec();
-                    Some(Ok(name))
-                }
-            };
-        })
-        .spawn(&self.exec)
-        .result()
-        .await;
-        match item {
-            Err(e) => Some(Err(anyhow!(e.to_string()))),
-            Ok(Err(e)) => Some(Err(anyhow!(e))),
-            Ok(Ok(item)) => item,
-        }
+        return match self.iter.write().next() {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok((k, _))) => {
+                let name = k.as_ref()[self.prefix_len..].to_vec();
+                Some(Ok(name))
+            }
+        };
     }
 }
 
 pub struct AsyncListValIter<V> {
-    exec: TaskExecQueue,
     iter: Arc<RwLock<sled::Iter>>,
     _m: std::marker::PhantomData<V>,
 }
@@ -2539,21 +2153,12 @@ where
     type Item = Result<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let iter = self.iter.clone();
-        let item = spawn_blocking(move || match iter.write().next() {
+        match self.iter.write().next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((_k, v))) => {
                 Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
             }
-        })
-        .spawn(&self.exec)
-        .result()
-        .await;
-        match item {
-            Err(e) => Some(Err(anyhow!(e.to_string()))),
-            Ok(Err(e)) => Some(Err(anyhow!(e))),
-            Ok(Ok(item)) => item,
         }
     }
 }
@@ -2580,9 +2185,23 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct AsyncMapIter {
     db: SledStorageDB,
     iter: Arc<RwLock<sled::Iter>>,
+    #[cfg(not(feature = "map_len"))]
+    names: Arc<dashmap::DashSet<sled::IVec>>,
+}
+
+impl AsyncMapIter {
+    fn new(db: SledStorageDB, iter: Arc<RwLock<sled::Iter>>) -> Self {
+        Self {
+            db,
+            iter,
+            #[cfg(not(feature = "map_len"))]
+            names: Arc::new(dashmap::DashSet::new()),
+        }
+    }
 }
 
 impl Debug for AsyncMapIter {
@@ -2596,28 +2215,34 @@ impl AsyncIterator for AsyncMapIter {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let iter = self.iter.clone();
-        let db = self.db.clone();
-        let item = spawn_blocking(move || loop {
-            match iter.write().next() {
+        let this = self;
+        loop {
+            match this.iter.write().next() {
                 None => return None,
                 Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
-                    if !SledStorageDB::is_map_count_key(k.as_ref()) {
+                    #[cfg(feature = "map_len")]
+                    {
+                        if !SledStorageDB::is_map_count_key(k.as_ref()) {
+                            continue;
+                        }
+                        let name = SledStorageDB::map_count_key_to_name(k.as_ref());
+                        return Some(Ok(StorageMap::Sled(this.db.map(name))));
+                    }
+
+                    #[cfg(not(feature = "map_len"))]
+                    if let Some(name) = SledStorageDB::map_item_key_to_name(k.as_ref()) {
+                        if this.names.contains(name) {
+                            continue;
+                        } else {
+                            this.names.insert(name.into());
+                            return Some(Ok(StorageMap::Sled(this.db.map(name))));
+                        }
+                    } else {
                         continue;
                     }
-                    let name = SledStorageDB::map_count_key_to_name(k.as_ref());
-                    return Some(Ok(StorageMap::Sled(db.map(name))));
                 }
             }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await;
-        match item {
-            Err(e) => Some(Err(anyhow!(e.to_string()))),
-            Ok(Err(e)) => Some(Err(anyhow!(e))),
-            Ok(Ok(item)) => item,
         }
     }
 }
@@ -2638,28 +2263,18 @@ impl AsyncIterator for AsyncListIter {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let iter = self.iter.clone();
-        let db = self.db.clone();
-        let item = spawn_blocking(move || loop {
-            match iter.write().next() {
-                None => return None,
-                Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+        loop {
+            return match self.iter.write().next() {
+                None => None,
+                Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
                     if !SledStorageDB::is_list_count_key(k.as_ref()) {
                         continue;
                     }
                     let name = SledStorageDB::list_count_key_to_name(k.as_ref());
-                    return Some(Ok(StorageList::Sled(db.list(name))));
+                    Some(Ok(StorageList::Sled(self.db.list(name))))
                 }
-            }
-        })
-        .spawn(&self.db.exec)
-        .result()
-        .await;
-        match item {
-            Err(e) => Some(Err(anyhow!(e.to_string()))),
-            Ok(Err(e)) => Some(Err(anyhow!(e))),
-            Ok(Ok(item)) => item,
+            };
         }
     }
 }
