@@ -104,12 +104,15 @@ mod tests {
     use std::time::Duration;
 
     fn get_cfg(name: &str) -> Config {
+        std::env::set_var("RUST_LOG", "rmqtt_storage=info");
+        env_logger::init();
+
         let cfg = Config {
             storage_type: StorageType::Sled,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
-                gc_at_hour: 13,
-                gc_at_minute: 38,
+                gc_at_hour: 0,
+                gc_at_minute: 1,
                 ..Default::default()
             },
             redis: RedisConfig {

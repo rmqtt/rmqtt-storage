@@ -24,7 +24,6 @@ sled = "0.34"
 redis = { version = "0.24", features = [ "tokio-comp" ] }
 
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 async-trait = "0.1"
@@ -33,13 +32,11 @@ log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dashmap = "5.5"
 ahash = "0.8"
-parking_lot = "0.12"
 convert = { package = "box-convert", version = "0.1", features = ["bytesize"] }
-#task-exec-queue = "0.9"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
-
+tokio = { version = "1", features = ["sync", "time", "macros", "rt","rt-multi-thread"] }
+env_logger = "0.10.1"
 
 
 
