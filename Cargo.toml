@@ -15,7 +15,7 @@ exclude = ["examples", ".gitignore", ".cargo/config"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = ["ttl", "map_len"]
+default = []
 ttl = []
 map_len = []
 
@@ -35,7 +35,7 @@ dashmap = "5.5"
 ahash = "0.8"
 parking_lot = "0.12"
 convert = { package = "box-convert", version = "0.1", features = ["bytesize"] }
-task-exec-queue = "0.9"
+#task-exec-queue = "0.9"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
