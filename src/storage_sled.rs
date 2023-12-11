@@ -10,7 +10,6 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::Timelike;
 use convert::Bytesize;
-use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -108,7 +107,6 @@ fn _decrement(old: Option<&[u8]>) -> Option<Vec<u8>> {
 pub struct SledStorageDB {
     db: Arc<sled::Db>,
     def_tree: sled::Tree,
-    // exec: TaskExecQueue,
 }
 
 impl SledStorageDB {
@@ -782,8 +780,8 @@ impl StorageDB for SledStorageDB {
     async fn map_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageMap>> + Send + 'a>> {
-        let iter = Arc::new(RwLock::new(self.def_tree.scan_prefix(MAP_NAME_PREFIX)));
-        let iter = Box::new(AsyncMapIter::new(self.clone(), iter));
+        let iter = self.def_tree.scan_prefix(MAP_NAME_PREFIX);
+        let iter = Box::new(AsyncMapIter::new(self, iter));
         Ok(iter)
     }
 
@@ -791,11 +789,8 @@ impl StorageDB for SledStorageDB {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>> {
-        let iter = Arc::new(RwLock::new(self.def_tree.scan_prefix(LIST_NAME_PREFIX)));
-        let iter = Box::new(AsyncListIter {
-            db: self.clone(),
-            iter,
-        });
+        let iter = self.def_tree.scan_prefix(LIST_NAME_PREFIX);
+        let iter = Box::new(AsyncListIter { db: self, iter });
         Ok(iter)
     }
 }
@@ -1335,10 +1330,9 @@ impl Map for SledStorageMap {
                 Ok::<_, anyhow::Error>(iter)
             } else {
                 let tem_prefix_name = this.map_item_prefix_name.len();
-                let iter = Arc::new(RwLock::new(
-                    this.tree()
-                        .scan_prefix(this.map_item_prefix_name.as_slice()),
-                ));
+                let iter = this
+                    .tree()
+                    .scan_prefix(this.map_item_prefix_name.as_slice());
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
                     prefix_len: tem_prefix_name,
                     iter,
@@ -1365,10 +1359,9 @@ impl Map for SledStorageMap {
                     });
                 Ok::<_, anyhow::Error>(iter)
             } else {
-                let iter = Arc::new(RwLock::new(
-                    this.tree()
-                        .scan_prefix(this.map_item_prefix_name.as_slice()),
-                ));
+                let iter = this
+                    .tree()
+                    .scan_prefix(this.map_item_prefix_name.as_slice());
                 let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
                     Box::new(AsyncKeyIter {
                         prefix_len: this.map_item_prefix_name.len(),
@@ -1400,9 +1393,9 @@ impl Map for SledStorageMap {
                     });
                 Ok::<_, anyhow::Error>(iter)
             } else {
-                let iter = Arc::new(RwLock::new(this.tree().scan_prefix(
-                    [this.map_item_prefix_name.as_slice(), prefix.as_ref()].concat(),
-                )));
+                let iter = this
+                    .tree()
+                    .scan_prefix([this.map_item_prefix_name.as_slice(), prefix.as_ref()].concat());
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
                     prefix_len: this.map_item_prefix_name.len(),
                     iter,
@@ -1997,7 +1990,7 @@ impl List for SledStorageList {
             } else {
                 let list_content_prefix =
                     Self::make_list_content_prefix(this.prefix_name.as_slice(), None);
-                let iter = Arc::new(RwLock::new(this.tree().scan_prefix(list_content_prefix)));
+                let iter = this.tree().scan_prefix(list_content_prefix);
                 let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
                     Box::new(AsyncListValIter {
                         iter,
@@ -2044,7 +2037,7 @@ impl List for SledStorageList {
 
 pub struct AsyncIter<V> {
     prefix_len: usize,
-    iter: Arc<RwLock<sled::Iter>>,
+    iter: sled::Iter,
     _m: std::marker::PhantomData<V>,
 }
 
@@ -2062,7 +2055,7 @@ where
     type Item = IterItem<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let item = match self.iter.write().next() {
+        let item = match self.iter.next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, v))) => {
@@ -2079,7 +2072,7 @@ where
 
 pub struct AsyncKeyIter {
     prefix_len: usize,
-    iter: Arc<RwLock<sled::Iter>>,
+    iter: sled::Iter,
 }
 
 impl Debug for AsyncKeyIter {
@@ -2093,7 +2086,7 @@ impl AsyncIterator for AsyncKeyIter {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        return match self.iter.write().next() {
+        return match self.iter.next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, _))) => {
@@ -2105,7 +2098,7 @@ impl AsyncIterator for AsyncKeyIter {
 }
 
 pub struct AsyncListValIter<V> {
-    iter: Arc<RwLock<sled::Iter>>,
+    iter: sled::Iter,
     _m: std::marker::PhantomData<V>,
 }
 
@@ -2123,7 +2116,7 @@ where
     type Item = Result<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.write().next() {
+        match self.iter.next() {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((_k, v))) => {
@@ -2155,16 +2148,15 @@ where
     }
 }
 
-#[derive(Clone)]
-pub struct AsyncMapIter {
-    db: SledStorageDB,
-    iter: Arc<RwLock<sled::Iter>>,
+pub struct AsyncMapIter<'a> {
+    db: &'a SledStorageDB,
+    iter: sled::Iter,
     #[cfg(not(feature = "map_len"))]
     names: Arc<dashmap::DashSet<sled::IVec>>,
 }
 
-impl AsyncMapIter {
-    fn new(db: SledStorageDB, iter: Arc<RwLock<sled::Iter>>) -> Self {
+impl<'a> AsyncMapIter<'a> {
+    fn new(db: &'a SledStorageDB, iter: sled::Iter) -> Self {
         Self {
             db,
             iter,
@@ -2174,20 +2166,20 @@ impl AsyncMapIter {
     }
 }
 
-impl Debug for AsyncMapIter {
+impl<'a> Debug for AsyncMapIter<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncMapIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl AsyncIterator for AsyncMapIter {
+impl<'a> AsyncIterator for AsyncMapIter<'a> {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
         let this = self;
         loop {
-            match this.iter.write().next() {
+            match this.iter.next() {
                 None => return None,
                 Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
@@ -2217,24 +2209,24 @@ impl AsyncIterator for AsyncMapIter {
     }
 }
 
-pub struct AsyncListIter {
-    db: SledStorageDB,
-    iter: Arc<RwLock<sled::Iter>>,
+pub struct AsyncListIter<'a> {
+    db: &'a SledStorageDB,
+    iter: sled::Iter,
 }
 
-impl Debug for AsyncListIter {
+impl<'a> Debug for AsyncListIter<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncListIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl AsyncIterator for AsyncListIter {
+impl<'a> AsyncIterator for AsyncListIter<'a> {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
         loop {
-            return match self.iter.write().next() {
+            return match self.iter.next() {
                 None => None,
                 Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
