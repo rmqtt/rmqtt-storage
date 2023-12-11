@@ -377,17 +377,6 @@ impl SledStorageDB {
         b.remove(expire_key);
     }
 
-    #[cfg(feature = "ttl")]
-    #[inline]
-    fn _tx_remove_expire_key<K>(tx: &TransactionalTree, key: K) -> ConflictableTransactionResult<()>
-    where
-        K: AsRef<[u8]>,
-    {
-        let expire_key = Self::_make_expire_key(key);
-        tx.remove(expire_key)?;
-        Ok(())
-    }
-
     #[inline]
     fn _is_expired<K, F>(&self, _key: K, _contains_key_f: F) -> Result<bool>
     where
@@ -871,25 +860,6 @@ impl SledStorageMap {
             None => 1,
         };
         tx.insert(key.as_ref(), val.to_be_bytes().as_slice())?;
-        Ok(())
-    }
-
-    #[inline]
-    fn _counter_add<K: AsRef<[u8]>>(tree: &Tree, key: K, increment: isize) -> Result<()> {
-        tree.fetch_and_update(key, |old: Option<&[u8]>| {
-            let number = match old {
-                Some(bytes) => {
-                    if let Ok(array) = bytes.try_into() {
-                        let number = isize::from_be_bytes(array);
-                        number + increment
-                    } else {
-                        increment
-                    }
-                }
-                None => increment,
-            };
-            Some(number.to_be_bytes().to_vec())
-        })?;
         Ok(())
     }
 
