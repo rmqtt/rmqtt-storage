@@ -105,7 +105,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            storage_type: StorageType::Sled,
+            storage_type: StorageType::Redis,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 gc_at_hour: 0,
@@ -1311,5 +1311,21 @@ mod tests {
         );
         assert_eq!(l11.len().await.unwrap(), 0);
         assert_eq!(l11.all::<i32>().await.unwrap(), vec![]);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_session_iter() {
+        let cfg = get_cfg("session");
+        let mut db = init_db(&cfg).await.unwrap();
+        let now = std::time::Instant::now();
+        let mut iter = db.map_iter().await.unwrap();
+        let mut count = 0;
+        while let Some(m) = iter.next().await {
+            let _m = m.unwrap();
+            //println!("map name: {:?}", String::from_utf8_lossy(m.name()));
+            count += 1;
+        }
+        println!("count: {}, cost time: {:?}", count, now.elapsed());
     }
 }
