@@ -104,9 +104,6 @@ mod tests {
     use std::time::Duration;
 
     fn get_cfg(name: &str) -> Config {
-        std::env::set_var("RUST_LOG", "rmqtt_storage=info");
-        env_logger::init();
-
         let cfg = Config {
             storage_type: StorageType::Sled,
             sled: SledConfig {
