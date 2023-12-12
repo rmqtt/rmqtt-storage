@@ -43,8 +43,20 @@ impl RedisStorageDB {
     #[inline]
     pub(crate) async fn new(cfg: RedisConfig) -> Result<Self> {
         let prefix = [cfg.prefix.as_bytes(), SEPARATOR].concat();
-        let client = redis::Client::open(cfg.url.as_str())?;
-        let async_conn = client.get_multiplexed_tokio_connection().await?;
+        let client = match redis::Client::open(cfg.url.as_str()) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("open redis error, config is {:?}, {:?}", cfg, e);
+                return Err(anyhow!(e));
+            }
+        };
+        let async_conn = match client.get_multiplexed_tokio_connection().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                log::error!("get redis connection error, config is {:?}, {:?}", cfg, e);
+                return Err(anyhow!(e));
+            }
+        };
         Ok(Self { prefix, async_conn })
     }
 
