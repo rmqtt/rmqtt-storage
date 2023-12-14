@@ -18,7 +18,7 @@ pub use storage::{DefaultStorageDB, List, Map, StorageDB, StorageList, StorageMa
 pub type Result<T> = anyhow::Result<T>;
 
 pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
-    match cfg.storage_type {
+    match cfg.typ {
         StorageType::Sled => {
             let db = SledStorageDB::new(cfg.sled.clone()).await?;
             Ok(DefaultStorageDB::Sled(db))
@@ -32,7 +32,8 @@ pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "Config::storage_type_default")]
-    pub storage_type: StorageType,
+    #[serde(alias = "type")]
+    pub typ: StorageType,
     #[serde(default)]
     pub sled: SledConfig,
     #[serde(default)]
@@ -42,7 +43,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            storage_type: Config::storage_type_default(),
+            typ: Config::storage_type_default(),
             sled: SledConfig::default(),
             redis: RedisConfig::default(),
         }
@@ -105,7 +106,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            storage_type: StorageType::Redis,
+            typ: StorageType::Sled,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 gc_at_hour: 0,
