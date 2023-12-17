@@ -5,15 +5,15 @@ use anyhow::Error;
 use serde::de;
 
 use storage_redis::RedisStorageDB;
-use storage_sled::SledConfig;
 use storage_sled::SledStorageDB;
 
 mod storage;
 mod storage_redis;
 mod storage_sled;
 
-use crate::storage_redis::RedisConfig;
 pub use storage::{DefaultStorageDB, List, Map, StorageDB, StorageList, StorageMap};
+pub use storage_redis::RedisConfig;
+pub use storage_sled::SledConfig;
 
 pub type Result<T> = anyhow::Result<T>;
 
