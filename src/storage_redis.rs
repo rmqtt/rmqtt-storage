@@ -1,8 +1,9 @@
 use std::future::Future;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -17,6 +18,8 @@ const SEPARATOR: &[u8] = b"@";
 const KEY_PREFIX: &[u8] = b"__rmqtt@";
 const MAP_NAME_PREFIX: &[u8] = b"__rmqtt_map@";
 const LIST_NAME_PREFIX: &[u8] = b"__rmqtt_list@";
+
+type RedisConnection = ConnectionManager;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
@@ -36,7 +39,8 @@ impl Default for RedisConfig {
 #[derive(Clone)]
 pub struct RedisStorageDB {
     prefix: Key,
-    async_conn: MultiplexedConnection,
+    // async_conn: MultiplexedConnection,
+    async_conn: RedisConnection,
 }
 
 impl RedisStorageDB {
@@ -50,7 +54,16 @@ impl RedisStorageDB {
                 return Err(anyhow!(e));
             }
         };
-        let async_conn = match client.get_multiplexed_tokio_connection().await {
+        let async_conn = match client
+            .get_tokio_connection_manager_with_backoff_and_timeouts(
+                2,
+                100,
+                5,
+                Duration::from_secs(5),
+                Duration::from_secs(8),
+            )
+            .await
+        {
             Ok(conn) => conn,
             Err(e) => {
                 log::error!("get redis connection error, config is {:?}, {:?}", cfg, e);
@@ -61,12 +74,12 @@ impl RedisStorageDB {
     }
 
     #[inline]
-    fn async_conn(&self) -> MultiplexedConnection {
+    fn async_conn(&self) -> RedisConnection {
         self.async_conn.clone()
     }
 
     #[inline]
-    fn async_conn_mut(&mut self) -> &mut MultiplexedConnection {
+    fn async_conn_mut(&mut self) -> &mut RedisConnection {
         &mut self.async_conn
     }
 
@@ -386,12 +399,12 @@ impl RedisStorageMap {
     }
 
     #[inline]
-    fn async_conn(&self) -> MultiplexedConnection {
+    fn async_conn(&self) -> RedisConnection {
         self.db.async_conn()
     }
 
     #[inline]
-    fn async_conn_mut(&mut self) -> &mut MultiplexedConnection {
+    fn async_conn_mut(&mut self) -> &mut RedisConnection {
         self.db.async_conn_mut()
     }
 
@@ -757,7 +770,7 @@ impl RedisStorageList {
     }
 
     #[inline]
-    pub(crate) fn async_conn(&self) -> MultiplexedConnection {
+    pub(crate) fn async_conn(&self) -> RedisConnection {
         self.db.async_conn()
     }
 }
@@ -978,7 +991,7 @@ impl List for RedisStorageList {
 
 pub struct AsyncListValIter<'a, V> {
     name: &'a [u8],
-    conn: MultiplexedConnection,
+    conn: RedisConnection,
     start: isize,
     limit: isize,
     catch_vals: Vec<Vec<u8>>,
@@ -986,7 +999,7 @@ pub struct AsyncListValIter<'a, V> {
 }
 
 impl<'a, V> AsyncListValIter<'a, V> {
-    fn new(name: &'a [u8], conn: MultiplexedConnection) -> Self {
+    fn new(name: &'a [u8], conn: RedisConnection) -> Self {
         let start = 0;
         let limit = 20;
         Self {
