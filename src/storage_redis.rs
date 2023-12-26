@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -39,7 +38,6 @@ impl Default for RedisConfig {
 #[derive(Clone)]
 pub struct RedisStorageDB {
     prefix: Key,
-    // async_conn: MultiplexedConnection,
     async_conn: RedisConnection,
 }
 
@@ -55,12 +53,11 @@ impl RedisStorageDB {
             }
         };
         let async_conn = match client
-            .get_tokio_connection_manager_with_backoff_and_timeouts(
+            .get_connection_manager_with_backoff(
+                2, 100,
                 2,
-                100,
-                5,
-                Duration::from_secs(5),
-                Duration::from_secs(8),
+                // Duration::from_secs(5),
+                // Duration::from_secs(8),
             )
             .await
         {
@@ -319,7 +316,6 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        // let full_name = self.get_full_name(key.as_ref()).await?;
         let full_name = self.make_full_key(key.as_ref());
         let res = self
             .async_conn()
@@ -334,7 +330,6 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        // let full_name = self.get_full_name(key.as_ref()).await?;
         let full_name = self.make_full_key(key.as_ref());
         let res = self.async_conn().pexpire::<_, bool>(full_name, dur).await?;
         Ok(res)
