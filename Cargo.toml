@@ -21,8 +21,7 @@ map_len = []
 
 [dependencies]
 sled = "0.34"
-#redis = { version = "0.24", features = [ "tokio-comp" ] }
-redis = { git = "https://github.com/tryor/redis-rs.git", features = [ "tokio-comp", "connection-manager" ]}
+redis = { version = "0.24", features = [ "tokio-comp", "connection-manager" ] }
 
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
