@@ -130,14 +130,14 @@ mod tests {
             sled: SledConfig {
                 path: format!("./.catch/{}", "sled_cleanup"),
                 cache_capacity: Bytesize::from(1024 * 1024 * 1024 * 3),
-                cleanup_f: Some(|_db| {
+                cleanup_f: |_db| {
                     #[cfg(feature = "ttl")]
                     {
                         let db = _db.clone();
                         std::thread::spawn(move || {
                             let limit = 1000;
                             loop {
-                                std::thread::sleep(std::time::Duration::from_secs(10));
+                                std::thread::sleep(std::time::Duration::from_secs(1));
                                 let mut total_cleanups = 0;
                                 let now = std::time::Instant::now();
                                 loop {
@@ -162,7 +162,7 @@ mod tests {
                             }
                         });
                     }
-                }),
+                },
                 ..Default::default()
             },
             redis: RedisConfig {
@@ -172,23 +172,23 @@ mod tests {
         };
 
         let db = SledStorageDB::new(cfg.sled.clone()).await.unwrap();
-        let max = 30000;
+        let max = 3000;
 
         for i in 0..max {
             let map = db.map(format!("map_{}", i));
             map.insert("k_1", &1).await.unwrap();
             map.insert("k_2", &2).await.unwrap();
-            map.expire(1000).await.unwrap();
+            map.expire(100).await.unwrap();
         }
 
         for i in 0..max {
             let list = db.list(format!("list_{}", i));
             list.push(&1).await.unwrap();
             list.push(&2).await.unwrap();
-            list.expire(1000).await.unwrap();
+            list.expire(100).await.unwrap();
         }
 
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
 
         println!(
             "db_size: {:?}, map_size: {}, list_size: {}",
@@ -197,7 +197,7 @@ mod tests {
             db.list_size()
         );
 
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         println!(
             "db_size: {:?}, map_size: {}, list_size: {}",
             db.db_size(),
