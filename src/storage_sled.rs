@@ -73,12 +73,15 @@ fn def_cleanup(_db: &SledStorageDB) {
                     if count < limit {
                         break;
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                log::debug!(
-                    "total cleanups: {}, cost time: {:?}",
-                    total_cleanups,
-                    now.elapsed()
-                );
+                if now.elapsed().as_secs() > 3 {
+                    log::info!(
+                        "total cleanups: {}, cost time: {:?}",
+                        total_cleanups,
+                        now.elapsed()
+                    );
+                }
             }
         });
     }
@@ -88,8 +91,8 @@ fn def_cleanup(_db: &SledStorageDB) {
 pub struct SledConfig {
     pub path: String,
     pub cache_capacity: Bytesize,
-    #[serde(default, skip)]
-    pub cleanup_f: Option<CleanupFun>,
+    #[serde(skip, default = "SledConfig::cleanup_f_default")]
+    pub cleanup_f: CleanupFun,
 }
 
 impl Default for SledConfig {
@@ -97,7 +100,7 @@ impl Default for SledConfig {
         SledConfig {
             path: String::default(),
             cache_capacity: Bytesize::from(1024 * 1024 * 1024),
-            cleanup_f: Some(def_cleanup),
+            cleanup_f: def_cleanup,
         }
     }
 }
@@ -113,6 +116,11 @@ impl SledConfig {
             .cache_capacity(self.cache_capacity.as_u64())
             .mode(sled::Mode::HighThroughput);
         Ok(sled_cfg)
+    }
+
+    #[inline]
+    fn cleanup_f_default() -> CleanupFun {
+        def_cleanup
     }
 }
 
@@ -173,11 +181,7 @@ impl SledStorageDB {
             list_tree,
         };
 
-        if let Some(cleanup_f) = cfg.cleanup_f {
-            cleanup_f(&db);
-        } else {
-            log::warn!("CleanupFun is None");
-        }
+        (cfg.cleanup_f)(&db);
 
         Ok(db)
     }
