@@ -1,5 +1,4 @@
 use core::fmt;
-use std::future::Future;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -116,6 +115,8 @@ pub trait StorageDB: Send + Sync {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>>;
+
+    async fn info(&self) -> Result<serde_json::Value>;
 }
 
 #[async_trait]
@@ -178,17 +179,6 @@ pub trait Map: Sync + Send {
         P: AsRef<[u8]> + Send,
         V: DeserializeOwned + Sync + Send + 'a + 'static;
 
-    async fn retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-        V: DeserializeOwned + Sync + Send + 'a;
-
-    async fn retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a;
-
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, dur: TimestampMillis) -> Result<bool>;
 
@@ -224,11 +214,6 @@ pub trait List: Sync + Send {
     async fn pop<V>(&self) -> Result<Option<V>>
     where
         V: DeserializeOwned + Sync + Send;
-
-    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
-    where
-        F: Fn(&V) -> bool + Send + Sync + 'static,
-        V: DeserializeOwned + Sync + Send + 'a + 'static;
 
     async fn all<V>(&self) -> Result<Vec<V>>
     where
@@ -482,6 +467,14 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.list_iter().await,
         }
     }
+
+    #[inline]
+    pub async fn info(&self) -> Result<serde_json::Value> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.info().await,
+            DefaultStorageDB::Redis(db) => db.info().await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -633,29 +626,6 @@ impl Map for StorageMap {
         }
     }
 
-    async fn retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-        V: DeserializeOwned + Sync + Send + 'a,
-    {
-        match self {
-            StorageMap::Sled(m) => m.retain(f).await,
-            StorageMap::Redis(m) => m.retain(f).await,
-        }
-    }
-
-    async fn retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-    {
-        match self {
-            StorageMap::Sled(m) => m.retain_with_key(f).await,
-            StorageMap::Redis(m) => m.retain_with_key(f).await,
-        }
-    }
-
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, dur: TimestampMillis) -> Result<bool> {
         match self {
@@ -751,17 +721,6 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.pop().await,
             StorageList::Redis(list) => list.pop().await,
-        }
-    }
-
-    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
-    where
-        F: Fn(&V) -> bool + Send + Sync + 'static,
-        V: DeserializeOwned + Sync + Send + 'a + 'static,
-    {
-        match self {
-            StorageList::Sled(list) => list.pop_f(f).await,
-            StorageList::Redis(list) => list.pop_f(f).await,
         }
     }
 

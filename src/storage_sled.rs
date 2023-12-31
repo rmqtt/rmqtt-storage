@@ -1,8 +1,8 @@
 use core::fmt;
 use std::fmt::Debug;
-use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use convert::Bytesize;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
 
 #[allow(unused_imports)]
 use sled::transaction::TransactionResult;
@@ -17,7 +18,11 @@ use sled::transaction::{
     ConflictableTransactionError, ConflictableTransactionResult, TransactionError,
     TransactionalTree,
 };
-use sled::{Batch, Db, Tree};
+use sled::{Batch, Db, IVec, Tree};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::task::spawn_blocking;
 
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 #[allow(unused_imports)]
@@ -46,6 +51,107 @@ enum KeyType {
     DB,
     Map,
     List,
+}
+
+enum Command {
+    DBInsert(Arc<Db>, Key, Vec<u8>, oneshot::Sender<Result<()>>),
+    DBGet(SledStorageDB, IVec, oneshot::Sender<Result<Option<IVec>>>),
+    DBRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
+    DBMapRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
+    DBMapContainsKey(SledStorageDB, IVec, oneshot::Sender<Result<bool>>),
+    DBListRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
+    DBListContainsKey(SledStorageDB, IVec, oneshot::Sender<Result<bool>>),
+    DBBatchInsert(SledStorageDB, Vec<(Key, IVec)>, oneshot::Sender<Result<()>>),
+    DBBatchRemove(SledStorageDB, Vec<Key>, oneshot::Sender<Result<()>>),
+    DBCounterIncr(SledStorageDB, IVec, isize, oneshot::Sender<Result<()>>),
+    DBCounterDecr(SledStorageDB, IVec, isize, oneshot::Sender<Result<()>>),
+    DBCounterGet(SledStorageDB, IVec, oneshot::Sender<Result<Option<isize>>>),
+    DBCounterSet(SledStorageDB, IVec, isize, oneshot::Sender<Result<()>>),
+    DBContainsKey(SledStorageDB, IVec, oneshot::Sender<Result<bool>>),
+    #[cfg(feature = "ttl")]
+    DBExpireAt(
+        SledStorageDB,
+        IVec,
+        TimestampMillis,
+        oneshot::Sender<Result<bool>>,
+    ),
+    #[cfg(feature = "ttl")]
+    DBTtl(
+        SledStorageDB,
+        IVec,
+        oneshot::Sender<Result<Option<TimestampMillis>>>,
+    ),
+    DBMapPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
+    DBListPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
+
+    MapInsert(SledStorageMap, IVec, IVec, oneshot::Sender<Result<()>>),
+    MapGet(SledStorageMap, IVec, oneshot::Sender<Result<Option<IVec>>>),
+    MapRemove(SledStorageMap, IVec, oneshot::Sender<Result<()>>),
+    MapContainsKey(SledStorageMap, IVec, oneshot::Sender<Result<bool>>),
+    #[cfg(feature = "map_len")]
+    MapLen(SledStorageMap, oneshot::Sender<Result<usize>>),
+    MapIsEmpty(SledStorageMap, oneshot::Sender<Result<bool>>),
+    MapClear(SledStorageMap, oneshot::Sender<Result<()>>),
+    MapRemoveAndFetch(SledStorageMap, IVec, oneshot::Sender<Result<Option<IVec>>>),
+    MapRemoveWithPrefix(SledStorageMap, IVec, oneshot::Sender<Result<()>>),
+    MapBatchInsert(
+        SledStorageMap,
+        Vec<(IVec, IVec)>,
+        oneshot::Sender<Result<()>>,
+    ),
+    MapBatchRemove(SledStorageMap, Vec<IVec>, oneshot::Sender<Result<()>>),
+    #[cfg(feature = "ttl")]
+    MapExpireAt(
+        SledStorageMap,
+        TimestampMillis,
+        oneshot::Sender<Result<bool>>,
+    ),
+    #[cfg(feature = "ttl")]
+    MapTTL(
+        SledStorageMap,
+        oneshot::Sender<Result<Option<TimestampMillis>>>,
+    ),
+    MapIsExpired(SledStorageMap, oneshot::Sender<Result<bool>>),
+    MapPrefixIter(SledStorageMap, Option<IVec>, oneshot::Sender<sled::Iter>),
+
+    ListPush(SledStorageList, IVec, oneshot::Sender<Result<()>>),
+    ListPushs(SledStorageList, Vec<IVec>, oneshot::Sender<Result<()>>),
+    ListPushLimit(
+        SledStorageList,
+        IVec,
+        usize,
+        bool,
+        oneshot::Sender<Result<Option<IVec>>>,
+    ),
+    ListPop(SledStorageList, oneshot::Sender<Result<Option<IVec>>>),
+    ListAll(SledStorageList, oneshot::Sender<Result<Vec<IVec>>>),
+    ListGetIndex(
+        SledStorageList,
+        usize,
+        oneshot::Sender<Result<Option<IVec>>>,
+    ),
+    ListLen(SledStorageList, oneshot::Sender<Result<usize>>),
+    ListIsEmpty(SledStorageList, oneshot::Sender<Result<bool>>),
+    ListClear(SledStorageList, oneshot::Sender<Result<()>>),
+    #[cfg(feature = "ttl")]
+    ListExpireAt(
+        SledStorageList,
+        TimestampMillis,
+        oneshot::Sender<Result<bool>>,
+    ),
+    #[cfg(feature = "ttl")]
+    ListTTL(
+        SledStorageList,
+        oneshot::Sender<Result<Option<TimestampMillis>>>,
+    ),
+    ListIsExpired(SledStorageList, oneshot::Sender<Result<bool>>),
+    ListPrefixIter(SledStorageList, oneshot::Sender<sled::Iter>),
+
+    #[allow(clippy::type_complexity)]
+    IterNext(
+        sled::Iter,
+        oneshot::Sender<(sled::Iter, Option<sled::Result<(IVec, IVec)>>)>,
+    ),
 }
 
 pub type CleanupFun = fn(&SledStorageDB);
@@ -161,6 +267,8 @@ pub struct SledStorageDB {
     db: Arc<sled::Db>,
     map_tree: sled::Tree,
     list_tree: sled::Tree,
+    cmd_tx: mpsc::Sender<Command>,
+    active_count: Arc<AtomicIsize>, //Active Command Count
 }
 
 impl SledStorageDB {
@@ -174,11 +282,178 @@ impl SledStorageDB {
         })?;
         let map_tree = map_tree?;
         let list_tree = list_tree?;
+        let active_count = Arc::new(AtomicIsize::new(0));
+        let active_count1 = active_count.clone();
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<Command>(300_000);
+        spawn_blocking(move || {
+            Handle::current().block_on(async move {
+                while let Some(cmd) = cmd_rx.recv().await {
+                    let err = anyhow::Error::msg("send result fail");
+                    let snd_res = match cmd {
+                        Command::DBInsert(db, key, val, res_tx) => res_tx
+                            .send(SledStorageDB::_insert(
+                                db.as_ref(),
+                                key.as_slice(),
+                                val.as_slice(),
+                            ))
+                            .map_err(|_| err),
+                        Command::DBGet(db, key, res_tx) => {
+                            res_tx.send(db._get(key.as_ref())).map_err(|_| err)
+                        }
+                        Command::DBRemove(db, key, res_tx) => {
+                            res_tx.send(db._db_remove(key.as_ref())).map_err(|_| err)
+                        }
+                        Command::DBMapRemove(db, name, res_tx) => {
+                            res_tx.send(db._map_remove(name.as_ref())).map_err(|_| err)
+                        }
+                        Command::DBMapContainsKey(db, key, res_tx) => res_tx
+                            .send(db._self_map_contains_key(key.as_ref()))
+                            .map_err(|_| err),
+                        Command::DBListRemove(db, name, res_tx) => {
+                            res_tx.send(db._list_remove(name.as_ref())).map_err(|_| err)
+                        }
+                        Command::DBListContainsKey(db, key, res_tx) => res_tx
+                            .send(db._self_list_contains_key(key.as_ref()))
+                            .map_err(|_| err),
+                        Command::DBBatchInsert(db, key_vals, res_tx) => {
+                            res_tx.send(db._batch_insert(key_vals)).map_err(|_| err)
+                        }
+                        Command::DBBatchRemove(db, keys, res_tx) => {
+                            res_tx.send(db._batch_remove(keys)).map_err(|_| err)
+                        }
+                        Command::DBCounterIncr(db, key, increment, res_tx) => res_tx
+                            .send(db._counter_incr(key.as_ref(), increment))
+                            .map_err(|_| err),
+                        Command::DBCounterDecr(db, key, increment, res_tx) => res_tx
+                            .send(db._counter_decr(key.as_ref(), increment))
+                            .map_err(|_| err),
+                        Command::DBCounterGet(db, key, res_tx) => {
+                            res_tx.send(db._counter_get(key.as_ref())).map_err(|_| err)
+                        }
+                        Command::DBCounterSet(db, key, val, res_tx) => res_tx
+                            .send(db._counter_set(key.as_ref(), val))
+                            .map_err(|_| err),
+                        Command::DBContainsKey(db, key, res_tx) => res_tx
+                            .send(db._self_contains_key(key.as_ref()))
+                            .map_err(|_| err),
+                        #[cfg(feature = "ttl")]
+                        Command::DBExpireAt(db, key, at, res_tx) => res_tx
+                            .send(db._expire_at(key.as_ref(), at))
+                            .map_err(|_| err),
+                        #[cfg(feature = "ttl")]
+                        Command::DBTtl(db, key, res_tx) => {
+                            res_tx.send(db._self_ttl(key.as_ref())).map_err(|_| err)
+                        }
+                        Command::DBMapPrefixIter(db, res_tx) => {
+                            res_tx.send(db._map_scan_prefix()).map_err(|_| err)
+                        }
+                        Command::DBListPrefixIter(db, res_tx) => {
+                            res_tx.send(db._list_scan_prefix()).map_err(|_| err)
+                        }
+
+                        Command::MapInsert(map, key, val, res_tx) => {
+                            res_tx.send(map._insert(key, val)).map_err(|_| err)
+                        }
+                        Command::MapGet(map, key, res_tx) => {
+                            res_tx.send(map._get(key)).map_err(|_| err)
+                        }
+                        Command::MapRemove(map, key, res_tx) => {
+                            res_tx.send(map._remove(key)).map_err(|_| err)
+                        }
+                        Command::MapContainsKey(map, key, res_tx) => {
+                            res_tx.send(map._contains_key(key)).map_err(|_| err)
+                        }
+                        #[cfg(feature = "map_len")]
+                        Command::MapLen(map, res_tx) => res_tx.send(map._len()).map_err(|_| err),
+                        Command::MapIsEmpty(map, res_tx) => {
+                            res_tx.send(map._is_empty()).map_err(|_| err)
+                        }
+                        Command::MapClear(map, res_tx) => {
+                            res_tx.send(map._clear()).map_err(|_| err)
+                        }
+                        Command::MapRemoveAndFetch(map, key, res_tx) => {
+                            res_tx.send(map._remove_and_fetch(key)).map_err(|_| err)
+                        }
+                        Command::MapRemoveWithPrefix(map, key, res_tx) => {
+                            res_tx.send(map._remove_with_prefix(key)).map_err(|_| err)
+                        }
+                        Command::MapBatchInsert(map, key_vals, res_tx) => {
+                            res_tx.send(map._batch_insert(key_vals)).map_err(|_| err)
+                        }
+                        Command::MapBatchRemove(map, keys, res_tx) => {
+                            res_tx.send(map._batch_remove(keys)).map_err(|_| err)
+                        }
+                        #[cfg(feature = "ttl")]
+                        Command::MapExpireAt(map, at, res_tx) => {
+                            res_tx.send(map._expire_at(at)).map_err(|_| err)
+                        }
+                        #[cfg(feature = "ttl")]
+                        Command::MapTTL(map, res_tx) => res_tx.send(map._ttl()).map_err(|_| err),
+                        Command::MapIsExpired(map, res_tx) => {
+                            res_tx.send(map._is_expired()).map_err(|_| err)
+                        }
+                        Command::MapPrefixIter(map, prefix, res_tx) => {
+                            res_tx.send(map._prefix_iter(prefix)).map_err(|_| err)
+                        }
+
+                        Command::ListPush(list, val, res_tx) => {
+                            res_tx.send(list._push(val)).map_err(|_| err)
+                        }
+                        Command::ListPushs(list, vals, res_tx) => {
+                            res_tx.send(list._pushs(vals)).map_err(|_| err)
+                        }
+                        Command::ListPushLimit(list, data, limit, pop_front_if_limited, res_tx) => {
+                            res_tx
+                                .send(list._push_limit(data, limit, pop_front_if_limited))
+                                .map_err(|_| err)
+                        }
+                        Command::ListPop(list, res_tx) => res_tx.send(list._pop()).map_err(|_| err),
+                        Command::ListAll(list, res_tx) => res_tx.send(list._all()).map_err(|_| err),
+                        Command::ListGetIndex(list, idx, res_tx) => {
+                            res_tx.send(list._get_index(idx)).map_err(|_| err)
+                        }
+                        Command::ListLen(list, res_tx) => res_tx.send(list._len()).map_err(|_| err),
+                        Command::ListIsEmpty(list, res_tx) => {
+                            res_tx.send(list._is_empty()).map_err(|_| err)
+                        }
+                        Command::ListClear(list, res_tx) => {
+                            res_tx.send(list._clear()).map_err(|_| err)
+                        }
+                        #[cfg(feature = "ttl")]
+                        Command::ListExpireAt(list, at, res_tx) => {
+                            res_tx.send(list._expire_at(at)).map_err(|_| err)
+                        }
+                        #[cfg(feature = "ttl")]
+                        Command::ListTTL(list, res_tx) => res_tx.send(list._ttl()).map_err(|_| err),
+                        Command::ListIsExpired(list, res_tx) => {
+                            res_tx.send(list._is_expired()).map_err(|_| err)
+                        }
+                        Command::ListPrefixIter(list, res_tx) => {
+                            res_tx.send(list._prefix_iter()).map_err(|_| err)
+                        }
+
+                        Command::IterNext(mut iter, res_tx) => {
+                            let item = iter.next();
+                            res_tx.send((iter, item)).map_err(|_| err)
+                        }
+                    };
+
+                    if let Err(e) = snd_res {
+                        log::error!("{:?}", e);
+                    }
+
+                    active_count1.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+        });
 
         let db = Self {
             db,
             map_tree,
             list_tree,
+            cmd_tx,
+            active_count,
         };
 
         (cfg.cleanup_f)(&db);
@@ -447,6 +722,13 @@ impl SledStorageDB {
         b.remove(expire_key);
     }
 
+    // #[inline]
+    // fn _list_is_expired(&self, name: &[u8]) -> Result<bool> {
+    //     self._is_expired(name, EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
+    //         SledStorageDB::_list_contains_key(&self.list_tree, k)
+    //     })
+    // }
+
     #[inline]
     fn _is_expired<K, F>(&self, _key: K, _suffix: &[u8], _contains_key_f: F) -> Result<bool>
     where
@@ -569,74 +851,62 @@ impl SledStorageDB {
         };
         Ok(ttl_millis)
     }
-}
-
-#[async_trait]
-impl StorageDB for SledStorageDB {
-    type MapType = SledStorageMap;
-    type ListType = SledStorageList;
 
     #[inline]
-    fn map<K: AsRef<[u8]>>(&self, name: K) -> Self::MapType {
-        let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_ref());
-        let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_ref());
-        #[cfg(feature = "map_len")]
-        let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_ref());
-        SledStorageMap {
-            name: name.as_ref().to_vec(),
-            map_prefix_name,
-            map_item_prefix_name,
-            #[cfg(feature = "map_len")]
-            map_count_key_name,
-            db: self.clone(),
-        }
-    }
-
-    #[inline]
-    async fn map_remove<K>(&self, name: K) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
-        self._map_remove(name)?;
+    fn _insert(db: &Db, key: &[u8], val: &[u8]) -> Result<()> {
+        db.insert(key, val)?;
+        #[cfg(feature = "ttl")]
+        Self::_remove_expire_key(db, key, EXPIRE_AT_KEY_SUFFIX_DB)?;
         Ok(())
     }
 
     #[inline]
-    async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+    fn _get(&self, key: &[u8]) -> Result<Option<IVec>> {
         let this = self;
-        Ok(
-            if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                Self::_map_contains_key(&this.map_tree, k)
-            })? {
-                Ok(false)
-            } else {
-                Self::_map_contains_key(&this.map_tree, key)
-            }?,
-        )
+        let res = if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB, |k| {
+            Self::_db_contains_key(this.db.as_ref(), k)
+        })? {
+            None
+        } else {
+            this.db.get(key)?
+        };
+        Ok(res)
     }
 
+    // #[inline]
+    // async fn map_remove<K>(&self, name: K) -> Result<()>
+    //     where
+    //         K: AsRef<[u8]> + Sync + Send,
+    // {
+    //     self._map_remove(name)?;
+    //     Ok(())
+    // }
+
     #[inline]
-    fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
-        SledStorageList {
-            name: name.as_ref().to_vec(),
-            prefix_name: SledStorageDB::make_list_prefix(name),
-            db: self.clone(),
+    fn _self_map_contains_key(&self, key: &[u8]) -> Result<bool> {
+        let this = self;
+        if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
+            Self::_map_contains_key(&this.map_tree, k)
+        })? {
+            Ok(false)
+        } else {
+            Self::_map_contains_key(&this.map_tree, key)
         }
     }
 
-    #[inline]
-    async fn list_remove<K>(&self, name: K) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
-        self._list_remove(name)?;
-        Ok(())
-    }
+    // #[inline]
+    // fn list_remove<K>(&self, name: K) -> Result<()>
+    //     where
+    //         K: AsRef<[u8]> + Sync + Send,
+    // {
+    //     self._list_remove(name)?;
+    //     Ok(())
+    // }
 
     #[inline]
-    async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+    fn _self_list_contains_key(&self, key: &[u8]) -> Result<bool> {
         let this = self;
-        if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
+        if this._is_expired(key, EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
             Self::_list_contains_key(&this.list_tree, k)
         })? {
             Ok(false)
@@ -646,63 +916,14 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: serde::ser::Serialize + Sync + Send,
-    {
-        let db = self.db.as_ref();
-        let val = bincode::serialize(val)?;
-
-        db.insert(key.as_ref(), val.as_slice())?;
-        #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(db, key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB)?;
-
-        Ok(())
-    }
-
-    #[inline]
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: DeserializeOwned + Sync + Send,
-    {
-        let this = self;
-
-        let res = if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-            Self::_db_contains_key(this.db.as_ref(), k)
-        })? {
-            None
-        } else {
-            this.db.get(key)?
-        };
-        match res {
-            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
-            None => Ok(None),
-        }
-    }
-
-    #[inline]
-    async fn remove<K>(&self, key: K) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
-        self._db_remove(key)?;
-        Ok(())
-    }
-
-    #[inline]
-    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
-    where
-        V: Serialize + Sync + Send,
-    {
+    fn _batch_insert(&self, key_vals: Vec<(Key, IVec)>) -> Result<()> {
         if key_vals.is_empty() {
             return Ok(());
         }
 
         let mut batch = Batch::default();
         for (k, v) in key_vals.iter() {
-            batch.insert(k.as_slice(), bincode::serialize(v)?);
+            batch.insert(k.as_slice(), v.as_ref());
         }
 
         #[cfg(feature = "ttl")]
@@ -733,7 +954,7 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+    fn _batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -761,10 +982,7 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
+    fn _counter_incr(&self, key: &[u8], increment: isize) -> Result<()> {
         self.db.fetch_and_update(key, |old: Option<&[u8]>| {
             let number = match old {
                 Some(bytes) => {
@@ -783,10 +1001,7 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
+    fn _counter_decr(&self, key: &[u8], decrement: isize) -> Result<()> {
         self.db.fetch_and_update(key, |old: Option<&[u8]>| {
             let number = match old {
                 Some(bytes) => {
@@ -805,12 +1020,9 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
+    fn _counter_get(&self, key: &[u8]) -> Result<Option<isize>> {
         let this = self;
-        if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB, |k| {
+        if this._is_expired(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
             Self::_db_contains_key(this.db.as_ref(), k)
         })? {
             Ok(None)
@@ -822,24 +1034,21 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
+    fn _counter_set(&self, key: &[u8], val: isize) -> Result<()> {
         let db = self.db.as_ref();
         let val = val.to_be_bytes().to_vec();
 
-        db.insert(key.as_ref(), val.as_slice())?;
+        db.insert(key, val.as_slice())?;
         #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(db, key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB)?;
+        Self::_remove_expire_key(db, key, EXPIRE_AT_KEY_SUFFIX_DB)?;
 
         Ok(())
     }
 
     #[inline]
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+    fn _self_contains_key(&self, key: &[u8]) -> Result<bool> {
         let this = self;
-        if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB, |k| {
+        if this._is_expired(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
             Self::_db_contains_key(this.db.as_ref(), k)
         })? {
             Ok(false)
@@ -850,12 +1059,8 @@ impl StorageDB for SledStorageDB {
 
     #[inline]
     #[cfg(feature = "ttl")]
-    async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
-        let expire_key = Self::_make_expire_key(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB);
-
+    fn _expire_at(&self, key: &[u8], at: TimestampMillis) -> Result<bool> {
+        let expire_key = Self::_make_expire_key(key, EXPIRE_AT_KEY_SUFFIX_DB);
         if self._contains_key(key)? {
             let at_bytes = at.to_be_bytes();
             self.db
@@ -865,6 +1070,297 @@ impl StorageDB for SledStorageDB {
         } else {
             Ok(false)
         }
+    }
+
+    #[inline]
+    #[cfg(feature = "ttl")]
+    fn _self_ttl(&self, key: &[u8]) -> Result<Option<TimestampMillis>> {
+        self._ttl(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
+            Self::_db_contains_key(self.db.as_ref(), k)
+        })
+    }
+
+    #[inline]
+    fn _map_scan_prefix(&self) -> sled::Iter {
+        self.map_tree.scan_prefix(MAP_NAME_PREFIX)
+    }
+
+    #[inline]
+    fn _list_scan_prefix(&self) -> sled::Iter {
+        self.list_tree.scan_prefix(LIST_NAME_PREFIX)
+    }
+
+    #[inline]
+    fn cmd_tx(&self) -> &mpsc::Sender<Command> {
+        &self.cmd_tx
+    }
+}
+
+#[async_trait]
+impl StorageDB for SledStorageDB {
+    type MapType = SledStorageMap;
+    type ListType = SledStorageList;
+
+    #[inline]
+    fn map<K: AsRef<[u8]>>(&self, name: K) -> Self::MapType {
+        let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_ref());
+        let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_ref());
+        #[cfg(feature = "map_len")]
+        let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_ref());
+        SledStorageMap {
+            name: name.as_ref().to_vec(),
+            map_prefix_name,
+            map_item_prefix_name,
+            #[cfg(feature = "map_len")]
+            map_count_key_name,
+            db: self.clone(),
+        }
+    }
+
+    #[inline]
+    async fn map_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBMapRemove(self.clone(), name.as_ref().into(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBMapContainsKey(
+                self.clone(),
+                key.as_ref().into(),
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
+        SledStorageList {
+            name: name.as_ref().to_vec(),
+            prefix_name: SledStorageDB::make_list_prefix(name),
+            db: self.clone(),
+        }
+    }
+
+    #[inline]
+    async fn list_remove<K>(&self, name: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBListRemove(
+                self.clone(),
+                name.as_ref().into(),
+                tx,
+            ))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBListContainsKey(
+                self.clone(),
+                key.as_ref().into(),
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: serde::ser::Serialize + Sync + Send,
+    {
+        let val = bincode::serialize(val)?;
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBInsert(
+                self.db.clone(),
+                key.as_ref().to_vec(),
+                val,
+                tx,
+            ))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: DeserializeOwned + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBGet(self.clone(), key.as_ref().into(), tx))
+            .await?;
+        match rx.await?? {
+            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
+            None => Ok(None),
+        }
+    }
+
+    #[inline]
+    async fn remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBRemove(self.clone(), key.as_ref().into(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    where
+        V: Serialize + Sync + Send,
+    {
+        if key_vals.is_empty() {
+            return Ok(());
+        }
+
+        let key_vals = key_vals
+            .into_iter()
+            .map(|(k, v)| {
+                bincode::serialize(&v)
+                    .map(|v| (k, v.into()))
+                    .map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBBatchInsert(self.clone(), key_vals, tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBBatchRemove(self.clone(), keys, tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBCounterIncr(
+                self.clone(),
+                key.as_ref().into(),
+                increment,
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBCounterDecr(
+                self.clone(),
+                key.as_ref().into(),
+                decrement,
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBCounterGet(self.clone(), key.as_ref().into(), tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBCounterSet(
+                self.clone(),
+                key.as_ref().into(),
+                val,
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBContainsKey(
+                self.clone(),
+                key.as_ref().into(),
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    #[cfg(feature = "ttl")]
+    async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBExpireAt(
+                self.clone(),
+                key.as_ref().into(),
+                at,
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
     }
 
     #[inline]
@@ -883,16 +1379,22 @@ impl StorageDB for SledStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        Ok(self._ttl(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-            Self::_db_contains_key(self.db.as_ref(), k)
-        })?)
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBTtl(self.clone(), key.as_ref().into(), tx))
+            .await?;
+        Ok(rx.await??)
     }
 
     #[inline]
     async fn map_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageMap>> + Send + 'a>> {
-        let iter = self.map_tree.scan_prefix(MAP_NAME_PREFIX);
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBMapPrefixIter(self.clone(), tx))
+            .await?;
+        let iter = rx.await?;
         let iter = Box::new(AsyncMapIter::new(self, iter));
         Ok(iter)
     }
@@ -901,9 +1403,35 @@ impl StorageDB for SledStorageDB {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>> {
-        let iter = self.list_tree.scan_prefix(LIST_NAME_PREFIX);
-        let iter = Box::new(AsyncListIter { db: self, iter });
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx()
+            .send(Command::DBListPrefixIter(self.clone(), tx))
+            .await?;
+        let iter = rx.await?;
+        let iter = Box::new(AsyncListIter {
+            db: self,
+            iter: Some(iter),
+        });
         Ok(iter)
+    }
+
+    #[inline]
+    async fn info(&self) -> Result<Value> {
+        let active_count = self.active_count.load(Ordering::Relaxed);
+        let this = self.clone();
+        Ok(spawn_blocking(move || {
+            let db_size = this.db_size();
+            let map_size = this.map_size();
+            let list_size = this.list_size();
+            serde_json::json!({
+                "storage_engine": "Sled",
+                "active_count": active_count,
+                "db_size": db_size,
+                "map_size": map_size,
+                "list_size": list_size,
+            })
+        })
+        .await?)
     }
 }
 
@@ -929,6 +1457,7 @@ impl SledStorageMap {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn map_item_key_to_name(map_prefix_len: usize, key: &[u8]) -> &[u8] {
         key[map_prefix_len..].as_ref()
     }
@@ -937,17 +1466,6 @@ impl SledStorageMap {
     #[inline]
     fn _len_get(&self) -> Result<isize> {
         self._counter_get(self.map_count_key_name.as_slice())
-    }
-
-    #[inline]
-    fn _tx_len_add<K: AsRef<[u8]>>(
-        tx: &TransactionalTree,
-        count_name: K,
-        v: isize,
-    ) -> ConflictableTransactionResult<()> {
-        let c = Self::_tx_counter_get(tx, count_name.as_ref())?;
-        Self::_tx_counter_set(tx, count_name.as_ref(), c + v)?;
-        Ok(())
     }
 
     #[inline]
@@ -1043,107 +1561,6 @@ impl SledStorageMap {
     }
 
     #[inline]
-    async fn _retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<Key>) -> Out + Send + Sync,
-        Out: Future<Output = bool> + Send + 'a,
-    {
-        let mut batch = Batch::default();
-        #[cfg(feature = "map_len")]
-        let mut count = 0;
-        for key in self
-            .tree()
-            .scan_prefix(self.map_item_prefix_name.as_slice())
-            .keys()
-        {
-            match key {
-                Ok(k) => {
-                    let name = SledStorageMap::map_item_key_to_name(
-                        self.map_item_prefix_name.len(),
-                        k.as_ref(),
-                    );
-                    if !f(Ok(name.to_vec())).await {
-                        batch.remove(k);
-                        #[cfg(feature = "map_len")]
-                        {
-                            count += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("{:?}", e);
-                }
-            }
-        }
-
-        #[cfg(feature = "map_len")]
-        if count > 0 {
-            let count_key = self.map_count_key_name.as_slice();
-            let res: TransactionResult<()> = self.tree().transaction(move |tx| {
-                tx.apply_batch(&batch)?;
-                Self::_tx_len_add(tx, count_key, -count)?;
-                Ok(())
-            });
-            res.map_err(|e| anyhow!(format!("{:?}", e)))?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    async fn _retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
-        Out: Future<Output = bool> + Send + 'a,
-        V: DeserializeOwned + Sync + Send + 'a,
-    {
-        let mut batch = Batch::default();
-        #[cfg(feature = "map_len")]
-        let mut count = 0;
-        for item in self
-            .tree()
-            .scan_prefix(self.map_item_prefix_name.as_slice())
-        {
-            let (k, v) = item?;
-            match bincode::deserialize::<V>(v.as_ref()) {
-                Ok(v) => {
-                    let name = SledStorageMap::map_item_key_to_name(
-                        self.map_item_prefix_name.len(),
-                        k.as_ref(),
-                    );
-                    if !f(Ok((name.to_vec(), v))).await {
-                        batch.remove(k.as_ref());
-                        #[cfg(feature = "map_len")]
-                        {
-                            count += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !f(Err(anyhow::Error::new(e))).await {
-                        batch.remove(k.as_ref());
-                        #[cfg(feature = "map_len")]
-                        {
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        #[cfg(feature = "map_len")]
-        if count > 0 {
-            let count_key = self.map_count_key_name.as_slice();
-            let res: TransactionResult<()> = self.tree().transaction(move |tx| {
-                tx.apply_batch(&batch)?;
-                Self::_tx_len_add(tx, count_key, -count)?;
-                Ok(())
-            });
-            res.map_err(|e| anyhow!(format!("{:?}", e)))?;
-        }
-        Ok(())
-    }
-
-    #[inline]
     fn _clear(&self) -> Result<()> {
         let mut batch = Batch::default();
         //clear key-value
@@ -1162,28 +1579,7 @@ impl SledStorageMap {
     }
 
     #[inline]
-    fn _is_empty(&self) -> bool {
-        self.tree()
-            .scan_prefix(self.map_item_prefix_name.as_slice())
-            .next()
-            .is_none()
-    }
-}
-
-#[async_trait]
-impl Map for SledStorageMap {
-    #[inline]
-    fn name(&self) -> &[u8] {
-        self.name.as_slice()
-    }
-
-    #[inline]
-    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: Serialize + Sync + Send + ?Sized,
-    {
-        let val = bincode::serialize(val)?;
+    fn _insert(&self, key: IVec, val: IVec) -> Result<()> {
         let item_key = self.make_map_item_key(key.as_ref());
         let this = self;
 
@@ -1192,7 +1588,7 @@ impl Map for SledStorageMap {
             let count_key = this.map_count_key_name.as_slice();
             this.tree()
                 .transaction(move |tx| {
-                    if tx.insert(item_key.as_slice(), val.as_slice())?.is_none() {
+                    if tx.insert(item_key.as_slice(), val.as_ref())?.is_none() {
                         Self::_tx_counter_inc(tx, count_key)?;
                     }
                     Ok(())
@@ -1200,7 +1596,7 @@ impl Map for SledStorageMap {
                 .map_err(|e| anyhow!(format!("{:?}", e)))?;
         }
         #[cfg(not(feature = "map_len"))]
-        this.tree().insert(item_key.as_slice(), val.as_slice())?;
+        this.tree().insert(item_key.as_slice(), val.as_ref())?;
 
         #[cfg(feature = "ttl")]
         {
@@ -1222,11 +1618,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: DeserializeOwned + Sync + Send,
-    {
+    fn _get(&self, key: IVec) -> Result<Option<IVec>> {
         let this = self;
         let item_key = self.make_map_item_key(key.as_ref());
         let res = if !this
@@ -1238,18 +1630,11 @@ impl Map for SledStorageMap {
         } else {
             None
         };
-
-        match res {
-            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
-            None => Ok(None),
-        }
+        Ok(res)
     }
 
     #[inline]
-    async fn remove<K>(&self, key: K) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
+    fn _remove(&self, key: IVec) -> Result<()> {
         let tree = self.tree();
         let key = self.make_map_item_key(key.as_ref());
         #[cfg(feature = "map_len")]
@@ -1275,14 +1660,14 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+    fn _contains_key(&self, key: IVec) -> Result<bool> {
         let key = self.make_map_item_key(key.as_ref());
         Ok(self.tree().contains_key(key)?)
     }
 
     #[cfg(feature = "map_len")]
     #[inline]
-    async fn len(&self) -> Result<usize> {
+    fn _len(&self) -> Result<usize> {
         let this = self;
         let len = {
             if this
@@ -1301,7 +1686,7 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn is_empty(&self) -> Result<bool> {
+    fn _is_empty(&self) -> Result<bool> {
         let this = self;
         let res = {
             if this
@@ -1312,24 +1697,17 @@ impl Map for SledStorageMap {
             {
                 true
             } else {
-                this._is_empty()
+                self.tree()
+                    .scan_prefix(self.map_item_prefix_name.as_slice())
+                    .next()
+                    .is_none()
             }
         };
         Ok(res)
     }
 
     #[inline]
-    async fn clear(&self) -> Result<()> {
-        self._clear()?;
-        Ok(())
-    }
-
-    #[inline]
-    async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-        V: DeserializeOwned + Sync + Send,
-    {
+    fn _remove_and_fetch(&self, key: IVec) -> Result<Option<IVec>> {
         let key = self.make_map_item_key(key.as_ref());
         let this = self;
         let removed = {
@@ -1362,18 +1740,11 @@ impl Map for SledStorageMap {
         }
         .map_err(|e| anyhow!(format!("{:?}", e)))?;
 
-        if let Some(removed) = removed {
-            Ok(Some(bincode::deserialize::<V>(removed.as_ref())?))
-        } else {
-            Ok(None)
-        }
+        Ok(removed)
     }
 
     #[inline]
-    async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
+    fn _remove_with_prefix(&self, prefix: IVec) -> Result<()> {
         let tree = self.tree();
         let prefix = [self.map_item_prefix_name.as_slice(), prefix.as_ref()]
             .concat()
@@ -1423,152 +1794,24 @@ impl Map for SledStorageMap {
     }
 
     #[inline]
-    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
-    where
-        V: serde::ser::Serialize + Sync + Send,
-    {
+    fn _batch_insert(&self, key_vals: Vec<(IVec, IVec)>) -> Result<()> {
         for (k, v) in key_vals {
-            self.insert(k, &v).await?;
+            self._insert(k, v)?;
         }
         Ok(())
     }
 
     #[inline]
-    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+    fn _batch_remove(&self, keys: Vec<IVec>) -> Result<()> {
         for k in keys {
-            self.remove(k).await?;
+            self._remove(k)?;
         }
-        Ok(())
-    }
-
-    #[inline]
-    async fn iter<'a, V>(
-        &'a mut self,
-    ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
-    where
-        V: DeserializeOwned + Sync + Send + 'a + 'static,
-    {
-        let this = self;
-        let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
-                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
-                    Box::new(AsyncEmptyIter {
-                        _m: std::marker::PhantomData,
-                    });
-                Ok::<_, anyhow::Error>(iter)
-            } else {
-                let tem_prefix_name = this.map_item_prefix_name.len();
-                let iter = this
-                    .tree()
-                    .scan_prefix(this.map_item_prefix_name.as_slice());
-                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
-                    prefix_len: tem_prefix_name,
-                    iter,
-                    _m: std::marker::PhantomData,
-                });
-                Ok::<_, anyhow::Error>(iter)
-            }
-        }?;
-        Ok(res)
-    }
-
-    #[inline]
-    async fn key_iter<'a>(
-        &'a mut self,
-    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
-        let this = self;
-        let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
-                let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
-                    Box::new(AsyncEmptyIter {
-                        _m: std::marker::PhantomData,
-                    });
-                Ok::<_, anyhow::Error>(iter)
-            } else {
-                let iter = this
-                    .tree()
-                    .scan_prefix(this.map_item_prefix_name.as_slice());
-                let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
-                    Box::new(AsyncKeyIter {
-                        prefix_len: this.map_item_prefix_name.len(),
-                        iter,
-                    });
-                Ok::<_, anyhow::Error>(iter)
-            }
-        }?;
-        Ok(res)
-    }
-
-    #[inline]
-    async fn prefix_iter<'a, P, V>(
-        &'a mut self,
-        prefix: P,
-    ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
-    where
-        P: AsRef<[u8]> + Send,
-        V: DeserializeOwned + Sync + Send + 'a + 'static,
-    {
-        let this = self;
-        let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
-                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
-                    Box::new(AsyncEmptyIter {
-                        _m: std::marker::PhantomData,
-                    });
-                Ok::<_, anyhow::Error>(iter)
-            } else {
-                let iter = this
-                    .tree()
-                    .scan_prefix([this.map_item_prefix_name.as_slice(), prefix.as_ref()].concat());
-                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
-                    prefix_len: this.map_item_prefix_name.len(),
-                    iter,
-                    _m: std::marker::PhantomData,
-                });
-                Ok::<_, anyhow::Error>(iter)
-            }
-        }?;
-        Ok(res)
-    }
-
-    #[inline]
-    async fn retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-        V: DeserializeOwned + Sync + Send + 'a,
-    {
-        self._retain(f).await?;
-        Ok(())
-    }
-
-    #[inline]
-    async fn retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-    {
-        self._retain_with_key(f).await?;
         Ok(())
     }
 
     #[cfg(feature = "ttl")]
-    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
+    #[inline]
+    fn _expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let this = self;
         let expire_key =
             SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP);
@@ -1588,6 +1831,336 @@ impl Map for SledStorageMap {
     }
 
     #[cfg(feature = "ttl")]
+    #[inline]
+    fn _ttl(&self) -> Result<Option<TimestampMillis>> {
+        let res = self.db._ttl(self.name(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
+            SledStorageDB::_map_contains_key(self.tree(), k)
+        })?;
+        Ok(res)
+    }
+
+    #[inline]
+    fn _is_expired(&self) -> Result<bool> {
+        self.db
+            ._is_expired(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
+                SledStorageDB::_map_contains_key(self.tree(), k)
+            })
+    }
+
+    #[inline]
+    async fn call_is_expired(&self) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapIsExpired(self.clone(), tx))
+            .await?;
+        rx.await?
+    }
+
+    #[inline]
+    fn _prefix_iter(&self, prefix: Option<IVec>) -> sled::Iter {
+        if let Some(prefix) = prefix {
+            self.tree()
+                .scan_prefix([self.map_item_prefix_name.as_slice(), prefix.as_ref()].concat())
+        } else {
+            self.tree()
+                .scan_prefix(self.map_item_prefix_name.as_slice())
+        }
+    }
+
+    #[inline]
+    async fn call_prefix_iter(&self, prefix: Option<IVec>) -> Result<sled::Iter> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapPrefixIter(self.clone(), prefix, tx))
+            .await?;
+        Ok(rx.await?)
+    }
+}
+
+#[async_trait]
+impl Map for SledStorageMap {
+    #[inline]
+    fn name(&self) -> &[u8] {
+        self.name.as_slice()
+    }
+
+    #[inline]
+    async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: Serialize + Sync + Send + ?Sized,
+    {
+        let val = bincode::serialize(val)?;
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapInsert(
+                self.clone(),
+                key.as_ref().into(),
+                val.into(),
+                tx,
+            ))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn get<K, V>(&self, key: K) -> Result<Option<V>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: DeserializeOwned + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapGet(self.clone(), key.as_ref().into(), tx))
+            .await?;
+
+        match rx.await?? {
+            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
+            None => Ok(None),
+        }
+    }
+
+    #[inline]
+    async fn remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapRemove(self.clone(), key.as_ref().into(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapContainsKey(
+                self.clone(),
+                key.as_ref().into(),
+                tx,
+            ))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[cfg(feature = "map_len")]
+    #[inline]
+    async fn len(&self) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapLen(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn is_empty(&self) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapIsEmpty(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn clear(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapClear(self.clone(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: DeserializeOwned + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapRemoveAndFetch(
+                self.clone(),
+                key.as_ref().into(),
+                tx,
+            ))
+            .await?;
+
+        match rx.await?? {
+            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
+            None => Ok(None),
+        }
+    }
+
+    #[inline]
+    async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapRemoveWithPrefix(
+                self.clone(),
+                prefix.as_ref().into(),
+                tx,
+            ))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
+    where
+        V: serde::ser::Serialize + Sync + Send,
+    {
+        let key_vals = key_vals
+            .into_iter()
+            .map(|(k, v)| {
+                bincode::serialize(&v)
+                    .map(|v| (k.into(), v.into()))
+                    .map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<(IVec, IVec)>>>()?;
+
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapBatchInsert(self.clone(), key_vals, tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
+        let keys = keys.into_iter().map(|k| k.into()).collect::<Vec<IVec>>();
+
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapBatchRemove(self.clone(), keys, tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn iter<'a, V>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
+    where
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
+    {
+        let this = self;
+        let res = {
+            if this.call_is_expired().await? {
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
+            } else {
+                let tem_prefix_name = this.map_item_prefix_name.len();
+                let iter = this.call_prefix_iter(None).await?;
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
+                    cmd_tx: this.db.cmd_tx().clone(),
+                    prefix_len: tem_prefix_name,
+                    iter: Some(iter),
+                    _m: std::marker::PhantomData,
+                });
+                Ok::<_, anyhow::Error>(iter)
+            }
+        }?;
+        Ok(res)
+    }
+
+    #[inline]
+    async fn key_iter<'a>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
+        let this = self;
+        let res = {
+            if this.call_is_expired().await? {
+                let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
+            } else {
+                let iter = this.call_prefix_iter(None).await?;
+                let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
+                    Box::new(AsyncKeyIter {
+                        cmd_tx: this.db.cmd_tx().clone(),
+                        prefix_len: this.map_item_prefix_name.len(),
+                        iter: Some(iter),
+                    });
+                Ok::<_, anyhow::Error>(iter)
+            }
+        }?;
+        Ok(res)
+    }
+
+    #[inline]
+    async fn prefix_iter<'a, P, V>(
+        &'a mut self,
+        prefix: P,
+    ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
+    where
+        P: AsRef<[u8]> + Send,
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
+    {
+        let this = self;
+        let res = {
+            if this.call_is_expired().await? {
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
+            } else {
+                let iter = this
+                    .call_prefix_iter(Some(IVec::from(prefix.as_ref())))
+                    .await?;
+                let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
+                    cmd_tx: this.db.cmd_tx().clone(),
+                    prefix_len: this.map_item_prefix_name.len(),
+                    iter: Some(iter),
+                    _m: std::marker::PhantomData,
+                });
+                Ok::<_, anyhow::Error>(iter)
+            }
+        }?;
+        Ok(res)
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapExpireAt(self.clone(), at, tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         let at = timestamp_millis() + dur;
         self.expire_at(at).await
@@ -1595,10 +2168,12 @@ impl Map for SledStorageMap {
 
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
-        let res = self.db._ttl(self.name(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-            SledStorageDB::_map_contains_key(self.tree(), k)
-        })?;
-        Ok(res)
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::MapTTL(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
     }
 }
 
@@ -1743,30 +2318,7 @@ impl SledStorageList {
     }
 
     #[inline]
-    fn _is_empty(&self) -> Result<bool> {
-        let list_content_prefix = Self::make_list_content_prefix(self.prefix_name.as_slice(), None);
-        Ok(self
-            .tree()
-            .scan_prefix(list_content_prefix)
-            .keys()
-            .next()
-            .is_none())
-    }
-}
-
-#[async_trait]
-impl List for SledStorageList {
-    #[inline]
-    fn name(&self) -> &[u8] {
-        self.name.as_slice()
-    }
-
-    #[inline]
-    async fn push<V>(&self, val: &V) -> Result<()>
-    where
-        V: serde::ser::Serialize + Sync + Send,
-    {
-        let data = bincode::serialize(val)?;
+    fn _push(&self, data: IVec) -> Result<()> {
         let this = self;
 
         this.tree().transaction(move |tx| {
@@ -1779,7 +2331,7 @@ impl List for SledStorageList {
             Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
 
             let list_content_key = this.make_list_content_key(end);
-            Self::tx_list_content_set(tx, list_content_key.as_slice(), &data)?;
+            Self::tx_list_content_set(tx, list_content_key.as_slice(), data.as_ref())?;
             Ok(())
         })?;
 
@@ -1803,18 +2355,11 @@ impl List for SledStorageList {
     }
 
     #[inline]
-    async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
-    where
-        V: Serialize + Sync + Send,
-    {
+    fn _pushs(&self, vals: Vec<IVec>) -> Result<()> {
         if vals.is_empty() {
             return Ok(());
         }
 
-        let vals = vals
-            .into_iter()
-            .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
-            .collect::<Result<Vec<_>>>()?;
         let tree = self.tree();
         let this = self;
 
@@ -1857,17 +2402,12 @@ impl List for SledStorageList {
     }
 
     #[inline]
-    async fn push_limit<V>(
+    fn _push_limit(
         &self,
-        val: &V,
+        data: IVec,
         limit: usize,
         pop_front_if_limited: bool,
-    ) -> Result<Option<V>>
-    where
-        V: serde::ser::Serialize + Sync + Send,
-        V: DeserializeOwned,
-    {
-        let data = bincode::serialize(val)?;
+    ) -> Result<Option<IVec>> {
         let tree = self.tree();
         let this = self;
 
@@ -1884,7 +2424,7 @@ impl List for SledStorageList {
                     end += 1;
                     Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
                     let list_content_key = this.make_list_content_key(end);
-                    Self::tx_list_content_set(tx, list_content_key.as_slice(), &data)?;
+                    Self::tx_list_content_set(tx, list_content_key.as_slice(), data.as_ref())?;
                     Ok(None)
                 } else if pop_front_if_limited {
                     let mut removed = None;
@@ -1896,7 +2436,7 @@ impl List for SledStorageList {
                     end += 1;
                     Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
                     let list_content_key = this.make_list_content_key(end);
-                    Self::tx_list_content_set(tx, list_content_key.as_slice(), &data)?;
+                    Self::tx_list_content_set(tx, list_content_key.as_slice(), data.as_ref())?;
                     Ok(removed)
                 } else {
                     Err(ConflictableTransactionError::Storage(sled::Error::Io(
@@ -1925,22 +2465,11 @@ impl List for SledStorageList {
         }
         .map_err(|e| anyhow!(format!("{:?}", e)))??;
 
-        let removed = if let Some(removed) = removed {
-            Some(
-                bincode::deserialize::<V>(removed.as_ref())
-                    .map_err(|e| sled::Error::Io(io::Error::new(ErrorKind::InvalidData, e)))?,
-            )
-        } else {
-            None
-        };
         Ok(removed)
     }
 
     #[inline]
-    async fn pop<V>(&self) -> Result<Option<V>>
-    where
-        V: DeserializeOwned + Sync + Send,
-    {
+    fn _pop(&self) -> Result<Option<IVec>> {
         let this = self;
         let removed = {
             if this
@@ -1969,71 +2498,11 @@ impl List for SledStorageList {
             }
         }?;
 
-        let removed = if let Some(v) = removed {
-            Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
-        } else {
-            None
-        };
-
         Ok(removed)
     }
 
     #[inline]
-    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
-    where
-        F: Fn(&V) -> bool + Send + Sync + 'static,
-        V: DeserializeOwned + Sync + Send + 'a + 'static,
-    {
-        let this = self;
-        let removed = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
-                Ok(None)
-            } else {
-                let removed = this.tree().transaction(move |tx| {
-                    let list_count_key = this.make_list_count_key();
-                    let (start, end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
-
-                    let mut removed = None;
-                    if (end - start) > 0 {
-                        let removed_content_key = this.make_list_content_key(start + 1);
-                        let saved_val = tx.get(removed_content_key.as_slice())?;
-                        if let Some(v) = saved_val {
-                            let val = bincode::deserialize::<V>(v.as_ref()).map_err(|e| {
-                                ConflictableTransactionError::<()>::Storage(sled::Error::Io(
-                                    io::Error::new(ErrorKind::InvalidData, e),
-                                ))
-                            })?;
-                            if f(&val) {
-                                tx.remove(removed_content_key)?;
-                                removed = Some(val);
-                                Self::tx_list_count_set(
-                                    tx,
-                                    list_count_key.as_slice(),
-                                    start + 1,
-                                    end,
-                                )?;
-                            }
-                        }
-                    }
-                    Ok(removed)
-                });
-                removed
-            }
-        }
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
-        Ok(removed)
-    }
-
-    #[inline]
-    async fn all<V>(&self) -> Result<Vec<V>>
-    where
-        V: DeserializeOwned + Sync + Send,
-    {
+    fn _all(&self) -> Result<Vec<IVec>> {
         let this = self;
         let res = {
             if this
@@ -2053,17 +2522,11 @@ impl List for SledStorageList {
                     .collect::<Result<Vec<_>>>()
             }
         }?;
-
-        res.iter()
-            .map(|v| bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
-            .collect::<Result<Vec<_>>>()
+        Ok(res)
     }
 
     #[inline]
-    async fn get_index<V>(&self, idx: usize) -> Result<Option<V>>
-    where
-        V: DeserializeOwned + Sync + Send,
-    {
+    fn _get_index(&self, idx: usize) -> Result<Option<IVec>> {
         let this = self;
         let res = {
             if this
@@ -2093,16 +2556,11 @@ impl List for SledStorageList {
                 })
             }
         }?;
-
-        Ok(if let Some(res) = res {
-            Some(bincode::deserialize::<V>(res.as_ref()).map_err(|e| anyhow!(e))?)
-        } else {
-            None
-        })
+        Ok(res)
     }
 
     #[inline]
-    async fn len(&self) -> Result<usize> {
+    fn _len(&self) -> Result<usize> {
         let this = self;
         let res = {
             if this
@@ -2126,7 +2584,7 @@ impl List for SledStorageList {
     }
 
     #[inline]
-    async fn is_empty(&self) -> Result<bool> {
+    fn _is_empty(&self) -> Result<bool> {
         let this = self;
         let res = {
             if this
@@ -2135,57 +2593,24 @@ impl List for SledStorageList {
                     SledStorageDB::_list_contains_key(this.tree(), k)
                 })?
             {
-                Ok(true)
-            } else {
-                this._is_empty()
-            }
-        }?;
-        Ok(res)
-    }
-
-    #[inline]
-    async fn clear(&self) -> Result<()> {
-        self._clear()?;
-        Ok(())
-    }
-
-    #[inline]
-    async fn iter<'a, V>(
-        &'a mut self,
-    ) -> Result<Box<dyn AsyncIterator<Item = Result<V>> + Send + 'a>>
-    where
-        V: DeserializeOwned + Sync + Send + 'a + 'static,
-    {
-        let this = self;
-        let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
-                let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
-                    Box::new(AsyncEmptyIter {
-                        _m: std::marker::PhantomData,
-                    });
-                Ok::<_, anyhow::Error>(iter)
+                Ok::<bool, anyhow::Error>(true)
             } else {
                 let list_content_prefix =
                     Self::make_list_content_prefix(this.prefix_name.as_slice(), None);
-                let iter = this.tree().scan_prefix(list_content_prefix);
-                let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
-                    Box::new(AsyncListValIter {
-                        iter,
-                        _m: std::marker::PhantomData,
-                    });
-                Ok::<_, anyhow::Error>(iter)
+                Ok(this
+                    .tree()
+                    .scan_prefix(list_content_prefix)
+                    .keys()
+                    .next()
+                    .is_none())
             }
         }?;
         Ok(res)
     }
 
     #[cfg(feature = "ttl")]
-    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
+    #[inline]
+    fn _expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let this = self;
         let expire_key =
             SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST);
@@ -2205,6 +2630,260 @@ impl List for SledStorageList {
     }
 
     #[cfg(feature = "ttl")]
+    #[inline]
+    fn _ttl(&self) -> Result<Option<TimestampMillis>> {
+        self.db._ttl(self.name(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
+            SledStorageDB::_list_contains_key(self.tree(), k)
+        })
+    }
+
+    #[inline]
+    fn _is_expired(&self) -> Result<bool> {
+        self.db
+            ._is_expired(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
+                SledStorageDB::_list_contains_key(self.tree(), k)
+            })
+    }
+
+    #[inline]
+    async fn call_is_expired(&self) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListIsExpired(self.clone(), tx))
+            .await?;
+        rx.await?
+    }
+
+    #[inline]
+    fn _prefix_iter(&self) -> sled::Iter {
+        let list_content_prefix = Self::make_list_content_prefix(self.prefix_name.as_slice(), None);
+        self.tree().scan_prefix(list_content_prefix)
+    }
+
+    #[inline]
+    async fn call_prefix_iter(&self) -> Result<sled::Iter> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListPrefixIter(self.clone(), tx))
+            .await?;
+        Ok(rx.await?)
+    }
+}
+
+#[async_trait]
+impl List for SledStorageList {
+    #[inline]
+    fn name(&self) -> &[u8] {
+        self.name.as_slice()
+    }
+
+    #[inline]
+    async fn push<V>(&self, val: &V) -> Result<()>
+    where
+        V: serde::ser::Serialize + Sync + Send,
+    {
+        let val = bincode::serialize(val)?;
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListPush(self.clone(), val.into(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
+    where
+        V: Serialize + Sync + Send,
+    {
+        if vals.is_empty() {
+            return Ok(());
+        }
+
+        let vals = vals
+            .into_iter()
+            .map(|v| {
+                bincode::serialize(&v)
+                    .map(|v| v.into())
+                    .map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListPushs(self.clone(), vals, tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    async fn push_limit<V>(
+        &self,
+        val: &V,
+        limit: usize,
+        pop_front_if_limited: bool,
+    ) -> Result<Option<V>>
+    where
+        V: serde::ser::Serialize + Sync + Send,
+        V: DeserializeOwned,
+    {
+        let data = bincode::serialize(val)?;
+
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListPushLimit(
+                self.clone(),
+                data.into(),
+                limit,
+                pop_front_if_limited,
+                tx,
+            ))
+            .await?;
+
+        let removed = if let Some(removed) = rx.await?? {
+            Some(
+                bincode::deserialize::<V>(removed.as_ref())
+                    .map_err(|e| sled::Error::Io(io::Error::new(ErrorKind::InvalidData, e)))?,
+            )
+        } else {
+            None
+        };
+        Ok(removed)
+    }
+
+    #[inline]
+    async fn pop<V>(&self) -> Result<Option<V>>
+    where
+        V: DeserializeOwned + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListPop(self.clone(), tx))
+            .await?;
+
+        let removed = if let Some(removed) = rx.await?? {
+            Some(
+                bincode::deserialize::<V>(removed.as_ref())
+                    .map_err(|e| sled::Error::Io(io::Error::new(ErrorKind::InvalidData, e)))?,
+            )
+        } else {
+            None
+        };
+        Ok(removed)
+    }
+
+    #[inline]
+    async fn all<V>(&self) -> Result<Vec<V>>
+    where
+        V: DeserializeOwned + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListAll(self.clone(), tx))
+            .await?;
+
+        rx.await??
+            .iter()
+            .map(|v| bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    #[inline]
+    async fn get_index<V>(&self, idx: usize) -> Result<Option<V>>
+    where
+        V: DeserializeOwned + Sync + Send,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListGetIndex(self.clone(), idx, tx))
+            .await?;
+
+        Ok(if let Some(res) = rx.await?? {
+            Some(bincode::deserialize::<V>(res.as_ref()).map_err(|e| anyhow!(e))?)
+        } else {
+            None
+        })
+    }
+
+    #[inline]
+    async fn len(&self) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListLen(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn is_empty(&self) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListIsEmpty(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn clear(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListClear(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn iter<'a, V>(
+        &'a mut self,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<V>> + Send + 'a>>
+    where
+        V: DeserializeOwned + Sync + Send + 'a + 'static,
+    {
+        let this = self;
+        let res = {
+            if this.call_is_expired().await? {
+                let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
+                    Box::new(AsyncEmptyIter {
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
+            } else {
+                let iter = this.call_prefix_iter().await?;
+                let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
+                    Box::new(AsyncListValIter {
+                        cmd_tx: this.db.cmd_tx().clone(),
+                        iter: Some(iter),
+                        _m: std::marker::PhantomData,
+                    });
+                Ok::<_, anyhow::Error>(iter)
+            }
+        }?;
+        Ok(res)
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListExpireAt(self.clone(), at, tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         let at = timestamp_millis() + dur;
         self.expire_at(at).await
@@ -2212,15 +2891,19 @@ impl List for SledStorageList {
 
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
-        self.db._ttl(self.name(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-            SledStorageDB::_list_contains_key(self.tree(), k)
-        })
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_tx()
+            .send(Command::ListTTL(self.clone(), tx))
+            .await?;
+        Ok(rx.await??)
     }
 }
 
 pub struct AsyncIter<V> {
+    cmd_tx: mpsc::Sender<Command>,
     prefix_len: usize,
-    iter: sled::Iter,
+    iter: Option<sled::Iter>,
     _m: std::marker::PhantomData<V>,
 }
 
@@ -2238,24 +2921,42 @@ where
     type Item = IterItem<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let item = match self.iter.next() {
+        let mut iter = self.iter.take()?;
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.cmd_tx.send(Command::IterNext(iter, tx)).await {
+            return Some(Err(anyhow::Error::new(e)));
+        }
+        let item = match rx.await {
+            Err(e) => {
+                return Some(Err(anyhow::Error::new(e)));
+            }
+            Ok((it, item)) => {
+                iter = it;
+                item
+            }
+        };
+
+        match item {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, v))) => {
                 let name = k.as_ref()[self.prefix_len..].to_vec();
                 match bincode::deserialize::<V>(v.as_ref()) {
-                    Ok(v) => Some(Ok((name, v))),
+                    Ok(v) => {
+                        self.iter = Some(iter);
+                        Some(Ok((name, v)))
+                    }
                     Err(e) => Some(Err(anyhow::Error::new(e))),
                 }
             }
-        };
-        item
+        }
     }
 }
 
 pub struct AsyncKeyIter {
+    cmd_tx: mpsc::Sender<Command>,
     prefix_len: usize,
-    iter: sled::Iter,
+    iter: Option<sled::Iter>,
 }
 
 impl Debug for AsyncKeyIter {
@@ -2269,10 +2970,26 @@ impl AsyncIterator for AsyncKeyIter {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        return match self.iter.next() {
+        let mut iter = self.iter.take()?;
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.cmd_tx.send(Command::IterNext(iter, tx)).await {
+            return Some(Err(anyhow::Error::new(e)));
+        }
+        let item = match rx.await {
+            Err(e) => {
+                return Some(Err(anyhow::Error::new(e)));
+            }
+            Ok((it, item)) => {
+                iter = it;
+                item
+            }
+        };
+
+        return match item {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, _))) => {
+                self.iter = Some(iter);
                 let name = k.as_ref()[self.prefix_len..].to_vec();
                 Some(Ok(name))
             }
@@ -2281,7 +2998,8 @@ impl AsyncIterator for AsyncKeyIter {
 }
 
 pub struct AsyncListValIter<V> {
-    iter: sled::Iter,
+    cmd_tx: mpsc::Sender<Command>,
+    iter: Option<sled::Iter>,
     _m: std::marker::PhantomData<V>,
 }
 
@@ -2299,10 +3017,26 @@ where
     type Item = Result<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.next() {
+        let mut iter = self.iter.take()?;
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.cmd_tx.send(Command::IterNext(iter, tx)).await {
+            return Some(Err(anyhow::Error::new(e)));
+        }
+        let item = match rx.await {
+            Err(e) => {
+                return Some(Err(anyhow::Error::new(e)));
+            }
+            Ok((it, item)) => {
+                iter = it;
+                item
+            }
+        };
+
+        match item {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((_k, v))) => {
+                self.iter = Some(iter);
                 Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
             }
         }
@@ -2333,7 +3067,7 @@ where
 
 pub struct AsyncMapIter<'a> {
     db: &'a SledStorageDB,
-    iter: sled::Iter,
+    iter: Option<sled::Iter>,
     #[cfg(not(feature = "map_len"))]
     names: Arc<dashmap::DashSet<sled::IVec>>,
 }
@@ -2342,7 +3076,7 @@ impl<'a> AsyncMapIter<'a> {
     fn new(db: &'a SledStorageDB, iter: sled::Iter) -> Self {
         Self {
             db,
-            iter,
+            iter: Some(iter),
             #[cfg(not(feature = "map_len"))]
             names: Arc::new(dashmap::DashSet::new()),
         }
@@ -2360,9 +3094,23 @@ impl<'a> AsyncIterator for AsyncMapIter<'a> {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let this = self;
+        let mut iter = self.iter.take()?;
         loop {
-            match this.iter.next() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = self.db.cmd_tx().send(Command::IterNext(iter, tx)).await {
+                return Some(Err(anyhow::Error::new(e)));
+            }
+            let item = match rx.await {
+                Err(e) => {
+                    return Some(Err(anyhow::Error::new(e)));
+                }
+                Ok((it, item)) => {
+                    iter = it;
+                    item
+                }
+            };
+
+            match item {
                 None => return None,
                 Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
@@ -2371,17 +3119,19 @@ impl<'a> AsyncIterator for AsyncMapIter<'a> {
                         if !SledStorageDB::is_map_count_key(k.as_ref()) {
                             continue;
                         }
+                        self.iter = Some(iter);
                         let name = SledStorageDB::map_count_key_to_name(k.as_ref());
-                        return Some(Ok(StorageMap::Sled(this.db.map(name))));
+                        return Some(Ok(StorageMap::Sled(self.db.map(name))));
                     }
 
                     #[cfg(not(feature = "map_len"))]
                     if let Some(name) = SledStorageDB::map_item_key_to_name(k.as_ref()) {
-                        if this.names.contains(name) {
+                        if self.names.contains(name) {
                             continue;
                         } else {
-                            this.names.insert(name.into());
-                            return Some(Ok(StorageMap::Sled(this.db.map(name))));
+                            self.iter = Some(iter);
+                            self.names.insert(name.into());
+                            return Some(Ok(StorageMap::Sled(self.db.map(name))));
                         }
                     } else {
                         continue;
@@ -2394,7 +3144,7 @@ impl<'a> AsyncIterator for AsyncMapIter<'a> {
 
 pub struct AsyncListIter<'a> {
     db: &'a SledStorageDB,
-    iter: sled::Iter,
+    iter: Option<sled::Iter>,
 }
 
 impl<'a> Debug for AsyncListIter<'a> {
@@ -2408,14 +3158,29 @@ impl<'a> AsyncIterator for AsyncListIter<'a> {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
+        let mut iter = self.iter.take()?;
         loop {
-            return match self.iter.next() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = self.db.cmd_tx().send(Command::IterNext(iter, tx)).await {
+                return Some(Err(anyhow::Error::new(e)));
+            }
+            let item = match rx.await {
+                Err(e) => {
+                    return Some(Err(anyhow::Error::new(e)));
+                }
+                Ok((it, item)) => {
+                    iter = it;
+                    item
+                }
+            };
+            return match item {
                 None => None,
                 Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
                     if !SledStorageDB::is_list_count_key(k.as_ref()) {
                         continue;
                     }
+                    self.iter = Some(iter);
                     let name = SledStorageDB::list_count_key_to_name(k.as_ref());
                     Some(Ok(StorageList::Sled(self.db.list(name))))
                 }

@@ -1,11 +1,10 @@
-use std::future::Future;
-
 use anyhow::anyhow;
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 use crate::{Result, StorageList, StorageMap};
@@ -374,6 +373,13 @@ impl StorageDB for RedisStorageDB {
         };
         Ok(Box::new(iter))
     }
+
+    #[inline]
+    async fn info(&self) -> Result<Value> {
+        Ok(serde_json::json!({
+            "storage_engine": "Redis",
+        }))
+    }
 }
 
 #[derive(Clone)]
@@ -401,77 +407,6 @@ impl RedisStorageMap {
     #[inline]
     fn async_conn_mut(&mut self) -> &mut RedisConnection {
         self.db.async_conn_mut()
-    }
-
-    #[inline]
-    async fn _retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync,
-        Out: Future<Output = bool> + Send + 'a,
-        V: DeserializeOwned + Sync + Send + 'a,
-    {
-        let name = self.full_name.clone();
-        let mut async_conn = self.async_conn();
-        let batch_size = 20;
-
-        let mut removeds = Vec::new();
-        //Remove hash
-        let mut iter = async_conn
-            .hscan::<_, (Key, Vec<u8>)>(name.as_slice())
-            .await?;
-        while let Some((key, val)) = iter.next_item().await {
-            match bincode::deserialize::<V>(val.as_ref()) {
-                Ok(v) => {
-                    if !f(Ok((key.clone(), v))).await {
-                        removeds.push(key);
-                    }
-                }
-                Err(e) => {
-                    if !f(Err(anyhow::Error::new(e))).await {
-                        removeds.push(key);
-                    }
-                }
-            }
-        }
-
-        drop(iter);
-        for batch in removeds.chunks(batch_size) {
-            if !batch.is_empty() {
-                async_conn.hdel(name.as_slice(), batch).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    async fn _retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<Key>) -> Out + Send + Sync,
-        Out: Future<Output = bool> + Send + 'a,
-    {
-        let name = self.full_name.clone();
-        let mut async_conn = self.async_conn();
-
-        let batch_size = 20;
-
-        let mut removeds = Vec::new();
-        //Remove hash
-        let mut iter = async_conn.hscan::<_, (Key, ())>(name.as_slice()).await?;
-        while let Some((key, _)) = iter.next_item().await {
-            if !f(Ok(key.clone())).await {
-                removeds.push(key);
-            }
-        }
-
-        drop(iter);
-        for batch in removeds.chunks(batch_size) {
-            if !batch.is_empty() {
-                async_conn.hdel(name.as_slice(), batch).await?;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -696,25 +631,6 @@ impl Map for RedisStorageMap {
         Ok(Box::new(iter))
     }
 
-    #[inline]
-    async fn retain<'a, F, Out, V>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<(Key, V)>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-        V: DeserializeOwned + Sync + Send + 'a,
-    {
-        self._retain(f).await
-    }
-
-    #[inline]
-    async fn retain_with_key<'a, F, Out>(&'a self, f: F) -> Result<()>
-    where
-        F: Fn(Result<Key>) -> Out + Send + Sync + 'static,
-        Out: Future<Output = bool> + Send + 'a,
-    {
-        self._retain_with_key(f).await
-    }
-
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let res = self
@@ -860,32 +776,6 @@ impl List for RedisStorageList {
             None
         };
 
-        Ok(removed)
-    }
-
-    #[inline]
-    async fn pop_f<'a, F, V>(&'a self, f: F) -> Result<Option<V>>
-    where
-        F: Fn(&V) -> bool + Send + Sync + 'static,
-        V: DeserializeOwned + Sync + Send + 'a + 'static,
-    {
-        let mut async_conn = self.async_conn();
-        let v = async_conn
-            .lindex::<_, Option<Vec<u8>>>(self.full_name.as_slice(), 0)
-            .await?;
-        let removed = if let Some(v) = v {
-            let val = bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?;
-            if f(&val) {
-                async_conn
-                    .lpop::<_, Option<Vec<u8>>>(self.full_name.as_slice(), None)
-                    .await?;
-                Some(val)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         Ok(removed)
     }
 
