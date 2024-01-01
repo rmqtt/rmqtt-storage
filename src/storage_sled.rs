@@ -169,13 +169,14 @@ fn def_cleanup(_db: &SledStorageDB) {
                 loop {
                     let count = db.cleanup(limit);
                     total_cleanups += count;
-                    log::debug!(
-                        "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
-                        count,
-                        total_cleanups,
-                        now.elapsed()
-                    );
-
+                    if count > 0 {
+                        log::info!(
+                            "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
+                            count,
+                            total_cleanups,
+                            now.elapsed()
+                        );
+                    }
                     if count < limit {
                         break;
                     }
@@ -840,7 +841,7 @@ impl SledStorageDB {
         };
 
         let ttl_millis = if let Some(at) = ttl_at {
-            let now = timestamp_millis();
+            let now = timestamp_millis() + (1000 * 10);
             if now > at {
                 None
             } else {
@@ -1390,15 +1391,55 @@ impl StorageDB for SledStorageDB {
         let active_count = self.active_count.load(Ordering::Relaxed);
         let this = self.clone();
         Ok(spawn_blocking(move || {
+            let size_on_disk = this.db.size_on_disk().unwrap_or_default();
             let db_size = this.db_size();
             let map_size = this.map_size();
             let list_size = this.list_size();
+
+            let limit = 100;
+
+            let mut db_keys = Vec::new();
+            for (i, key) in this.db.iter().keys().enumerate() {
+                let key = key
+                    .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                db_keys.push(key);
+                if i > limit {
+                    break;
+                }
+            }
+
+            let mut map_names = Vec::new();
+            for (i, key) in this.map_tree.iter().keys().enumerate() {
+                let key = key
+                    .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                map_names.push(key);
+                if i > limit {
+                    break;
+                }
+            }
+
+            let mut list_names = Vec::new();
+            for (i, key) in this.list_tree.iter().keys().enumerate() {
+                let key = key
+                    .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+                    .unwrap_or_else(|e| e.to_string());
+                list_names.push(key);
+                if i > limit {
+                    break;
+                }
+            }
             serde_json::json!({
                 "storage_engine": "Sled",
                 "active_count": active_count,
                 "db_size": db_size,
                 "map_size": map_size,
                 "list_size": list_size,
+                "size_on_disk": size_on_disk,
+                "db_keys": db_keys,
+                "map_names": map_names,
+                "list_names": list_names,
             })
         })
         .await?)
@@ -1424,12 +1465,6 @@ impl SledStorageMap {
     #[inline]
     fn make_map_item_key<K: AsRef<[u8]>>(&self, key: K) -> Key {
         [self.map_item_prefix_name.as_ref(), key.as_ref()].concat()
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    fn map_item_key_to_name(map_prefix_len: usize, key: &[u8]) -> &[u8] {
-        key[map_prefix_len..].as_ref()
     }
 
     #[cfg(feature = "map_len")]

@@ -376,8 +376,23 @@ impl StorageDB for RedisStorageDB {
 
     #[inline]
     async fn info(&self) -> Result<Value> {
+        let mut conn = self.async_conn();
+        let dbsize = redis::pipe()
+            .cmd("dbsize")
+            .query_async::<_, redis::Value>(&mut conn)
+            .await?;
+        let dbsize = dbsize.as_sequence().and_then(|vs| {
+            vs.iter().next().and_then(|v| {
+                if let redis::Value::Int(v) = v {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+        });
         Ok(serde_json::json!({
             "storage_engine": "Redis",
+            "dbsize": dbsize,
         }))
     }
 }
