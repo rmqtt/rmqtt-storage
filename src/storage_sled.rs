@@ -443,7 +443,7 @@ impl SledStorageDB {
                         log::error!("{:?}", e);
                     }
 
-                    active_count1.fetch_sub(1, Ordering::SeqCst);
+                    active_count1.fetch_sub(1, Ordering::Relaxed);
                 }
             })
         });
@@ -873,15 +873,6 @@ impl SledStorageDB {
         Ok(res)
     }
 
-    // #[inline]
-    // async fn map_remove<K>(&self, name: K) -> Result<()>
-    //     where
-    //         K: AsRef<[u8]> + Sync + Send,
-    // {
-    //     self._map_remove(name)?;
-    //     Ok(())
-    // }
-
     #[inline]
     fn _self_map_contains_key(&self, key: &[u8]) -> Result<bool> {
         let this = self;
@@ -893,15 +884,6 @@ impl SledStorageDB {
             Self::_map_contains_key(&this.map_tree, key)
         }
     }
-
-    // #[inline]
-    // fn list_remove<K>(&self, name: K) -> Result<()>
-    //     where
-    //         K: AsRef<[u8]> + Sync + Send,
-    // {
-    //     self._list_remove(name)?;
-    //     Ok(())
-    // }
 
     #[inline]
     fn _self_list_contains_key(&self, key: &[u8]) -> Result<bool> {
@@ -1091,8 +1073,14 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn cmd_tx(&self) -> &mpsc::Sender<Command> {
-        &self.cmd_tx
+    async fn cmd_send(&self, cmd: Command) -> Result<()> {
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = self.cmd_tx.send(cmd).await {
+            self.active_count.fetch_sub(1, Ordering::Relaxed);
+            Err(anyhow!(e))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1123,8 +1111,7 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBMapRemove(self.clone(), name.as_ref().into(), tx))
+        self.cmd_send(Command::DBMapRemove(self.clone(), name.as_ref().into(), tx))
             .await?;
         rx.await??;
         Ok(())
@@ -1133,13 +1120,12 @@ impl StorageDB for SledStorageDB {
     #[inline]
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBMapContainsKey(
-                self.clone(),
-                key.as_ref().into(),
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBMapContainsKey(
+            self.clone(),
+            key.as_ref().into(),
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
@@ -1158,13 +1144,12 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBListRemove(
-                self.clone(),
-                name.as_ref().into(),
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBListRemove(
+            self.clone(),
+            name.as_ref().into(),
+            tx,
+        ))
+        .await?;
         rx.await??;
         Ok(())
     }
@@ -1172,13 +1157,12 @@ impl StorageDB for SledStorageDB {
     #[inline]
     async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBListContainsKey(
-                self.clone(),
-                key.as_ref().into(),
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBListContainsKey(
+            self.clone(),
+            key.as_ref().into(),
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
@@ -1190,14 +1174,13 @@ impl StorageDB for SledStorageDB {
     {
         let val = bincode::serialize(val)?;
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBInsert(
-                self.db.clone(),
-                key.as_ref().to_vec(),
-                val,
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBInsert(
+            self.db.clone(),
+            key.as_ref().to_vec(),
+            val,
+            tx,
+        ))
+        .await?;
         rx.await??;
         Ok(())
     }
@@ -1209,8 +1192,7 @@ impl StorageDB for SledStorageDB {
         V: DeserializeOwned + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBGet(self.clone(), key.as_ref().into(), tx))
+        self.cmd_send(Command::DBGet(self.clone(), key.as_ref().into(), tx))
             .await?;
         match rx.await?? {
             Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
@@ -1224,8 +1206,7 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBRemove(self.clone(), key.as_ref().into(), tx))
+        self.cmd_send(Command::DBRemove(self.clone(), key.as_ref().into(), tx))
             .await?;
         rx.await??;
         Ok(())
@@ -1250,8 +1231,7 @@ impl StorageDB for SledStorageDB {
             .collect::<Result<Vec<_>>>()?;
 
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBBatchInsert(self.clone(), key_vals, tx))
+        self.cmd_send(Command::DBBatchInsert(self.clone(), key_vals, tx))
             .await?;
         Ok(rx.await??)
     }
@@ -1263,8 +1243,7 @@ impl StorageDB for SledStorageDB {
         }
 
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBBatchRemove(self.clone(), keys, tx))
+        self.cmd_send(Command::DBBatchRemove(self.clone(), keys, tx))
             .await?;
         Ok(rx.await??)
     }
@@ -1275,14 +1254,13 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBCounterIncr(
-                self.clone(),
-                key.as_ref().into(),
-                increment,
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBCounterIncr(
+            self.clone(),
+            key.as_ref().into(),
+            increment,
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
@@ -1292,14 +1270,13 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBCounterDecr(
-                self.clone(),
-                key.as_ref().into(),
-                decrement,
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBCounterDecr(
+            self.clone(),
+            key.as_ref().into(),
+            decrement,
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
@@ -1309,8 +1286,7 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBCounterGet(self.clone(), key.as_ref().into(), tx))
+        self.cmd_send(Command::DBCounterGet(self.clone(), key.as_ref().into(), tx))
             .await?;
         Ok(rx.await??)
     }
@@ -1321,27 +1297,25 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBCounterSet(
-                self.clone(),
-                key.as_ref().into(),
-                val,
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBCounterSet(
+            self.clone(),
+            key.as_ref().into(),
+            val,
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBContainsKey(
-                self.clone(),
-                key.as_ref().into(),
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBContainsKey(
+            self.clone(),
+            key.as_ref().into(),
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
@@ -1352,14 +1326,13 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBExpireAt(
-                self.clone(),
-                key.as_ref().into(),
-                at,
-                tx,
-            ))
-            .await?;
+        self.cmd_send(Command::DBExpireAt(
+            self.clone(),
+            key.as_ref().into(),
+            at,
+            tx,
+        ))
+        .await?;
         Ok(rx.await??)
     }
 
@@ -1380,8 +1353,7 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBTtl(self.clone(), key.as_ref().into(), tx))
+        self.cmd_send(Command::DBTtl(self.clone(), key.as_ref().into(), tx))
             .await?;
         Ok(rx.await??)
     }
@@ -1391,8 +1363,7 @@ impl StorageDB for SledStorageDB {
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageMap>> + Send + 'a>> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBMapPrefixIter(self.clone(), tx))
+        self.cmd_send(Command::DBMapPrefixIter(self.clone(), tx))
             .await?;
         let iter = rx.await?;
         let iter = Box::new(AsyncMapIter::new(self, iter));
@@ -1404,8 +1375,7 @@ impl StorageDB for SledStorageDB {
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx()
-            .send(Command::DBListPrefixIter(self.clone(), tx))
+        self.cmd_send(Command::DBListPrefixIter(self.clone(), tx))
             .await?;
         let iter = rx.await?;
         let iter = Box::new(AsyncListIter {
@@ -1851,8 +1821,7 @@ impl SledStorageMap {
     async fn call_is_expired(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapIsExpired(self.clone(), tx))
+            .cmd_send(Command::MapIsExpired(self.clone(), tx))
             .await?;
         rx.await?
     }
@@ -1872,8 +1841,7 @@ impl SledStorageMap {
     async fn call_prefix_iter(&self, prefix: Option<IVec>) -> Result<sled::Iter> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapPrefixIter(self.clone(), prefix, tx))
+            .cmd_send(Command::MapPrefixIter(self.clone(), prefix, tx))
             .await?;
         Ok(rx.await?)
     }
@@ -1895,8 +1863,7 @@ impl Map for SledStorageMap {
         let val = bincode::serialize(val)?;
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapInsert(
+            .cmd_send(Command::MapInsert(
                 self.clone(),
                 key.as_ref().into(),
                 val.into(),
@@ -1915,8 +1882,7 @@ impl Map for SledStorageMap {
     {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapGet(self.clone(), key.as_ref().into(), tx))
+            .cmd_send(Command::MapGet(self.clone(), key.as_ref().into(), tx))
             .await?;
 
         match rx.await?? {
@@ -1932,8 +1898,7 @@ impl Map for SledStorageMap {
     {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapRemove(self.clone(), key.as_ref().into(), tx))
+            .cmd_send(Command::MapRemove(self.clone(), key.as_ref().into(), tx))
             .await?;
         rx.await??;
         Ok(())
@@ -1943,8 +1908,7 @@ impl Map for SledStorageMap {
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapContainsKey(
+            .cmd_send(Command::MapContainsKey(
                 self.clone(),
                 key.as_ref().into(),
                 tx,
@@ -1957,10 +1921,7 @@ impl Map for SledStorageMap {
     #[inline]
     async fn len(&self) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
-        self.db
-            .cmd_tx()
-            .send(Command::MapLen(self.clone(), tx))
-            .await?;
+        self.db.cmd_send(Command::MapLen(self.clone(), tx)).await?;
         Ok(rx.await??)
     }
 
@@ -1968,8 +1929,7 @@ impl Map for SledStorageMap {
     async fn is_empty(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapIsEmpty(self.clone(), tx))
+            .cmd_send(Command::MapIsEmpty(self.clone(), tx))
             .await?;
         Ok(rx.await??)
     }
@@ -1978,8 +1938,7 @@ impl Map for SledStorageMap {
     async fn clear(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapClear(self.clone(), tx))
+            .cmd_send(Command::MapClear(self.clone(), tx))
             .await?;
         rx.await??;
         Ok(())
@@ -1993,8 +1952,7 @@ impl Map for SledStorageMap {
     {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapRemoveAndFetch(
+            .cmd_send(Command::MapRemoveAndFetch(
                 self.clone(),
                 key.as_ref().into(),
                 tx,
@@ -2014,8 +1972,7 @@ impl Map for SledStorageMap {
     {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapRemoveWithPrefix(
+            .cmd_send(Command::MapRemoveWithPrefix(
                 self.clone(),
                 prefix.as_ref().into(),
                 tx,
@@ -2041,8 +1998,7 @@ impl Map for SledStorageMap {
 
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapBatchInsert(self.clone(), key_vals, tx))
+            .cmd_send(Command::MapBatchInsert(self.clone(), key_vals, tx))
             .await?;
         rx.await??;
         Ok(())
@@ -2054,8 +2010,7 @@ impl Map for SledStorageMap {
 
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapBatchRemove(self.clone(), keys, tx))
+            .cmd_send(Command::MapBatchRemove(self.clone(), keys, tx))
             .await?;
         rx.await??;
         Ok(())
@@ -2080,7 +2035,7 @@ impl Map for SledStorageMap {
                 let tem_prefix_name = this.map_item_prefix_name.len();
                 let iter = this.call_prefix_iter(None).await?;
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
-                    cmd_tx: this.db.cmd_tx().clone(),
+                    db: &this.db,
                     prefix_len: tem_prefix_name,
                     iter: Some(iter),
                     _m: std::marker::PhantomData,
@@ -2107,7 +2062,7 @@ impl Map for SledStorageMap {
                 let iter = this.call_prefix_iter(None).await?;
                 let iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send> =
                     Box::new(AsyncKeyIter {
-                        cmd_tx: this.db.cmd_tx().clone(),
+                        db: &this.db,
                         prefix_len: this.map_item_prefix_name.len(),
                         iter: Some(iter),
                     });
@@ -2139,7 +2094,7 @@ impl Map for SledStorageMap {
                     .call_prefix_iter(Some(IVec::from(prefix.as_ref())))
                     .await?;
                 let iter: Box<dyn AsyncIterator<Item = IterItem<V>> + Send> = Box::new(AsyncIter {
-                    cmd_tx: this.db.cmd_tx().clone(),
+                    db: &this.db,
                     prefix_len: this.map_item_prefix_name.len(),
                     iter: Some(iter),
                     _m: std::marker::PhantomData,
@@ -2154,8 +2109,7 @@ impl Map for SledStorageMap {
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::MapExpireAt(self.clone(), at, tx))
+            .cmd_send(Command::MapExpireAt(self.clone(), at, tx))
             .await?;
         Ok(rx.await??)
     }
@@ -2169,10 +2123,7 @@ impl Map for SledStorageMap {
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         let (tx, rx) = oneshot::channel();
-        self.db
-            .cmd_tx()
-            .send(Command::MapTTL(self.clone(), tx))
-            .await?;
+        self.db.cmd_send(Command::MapTTL(self.clone(), tx)).await?;
         Ok(rx.await??)
     }
 }
@@ -2649,8 +2600,7 @@ impl SledStorageList {
     async fn call_is_expired(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListIsExpired(self.clone(), tx))
+            .cmd_send(Command::ListIsExpired(self.clone(), tx))
             .await?;
         rx.await?
     }
@@ -2665,8 +2615,7 @@ impl SledStorageList {
     async fn call_prefix_iter(&self) -> Result<sled::Iter> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListPrefixIter(self.clone(), tx))
+            .cmd_send(Command::ListPrefixIter(self.clone(), tx))
             .await?;
         Ok(rx.await?)
     }
@@ -2687,8 +2636,7 @@ impl List for SledStorageList {
         let val = bincode::serialize(val)?;
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListPush(self.clone(), val.into(), tx))
+            .cmd_send(Command::ListPush(self.clone(), val.into(), tx))
             .await?;
         rx.await??;
         Ok(())
@@ -2714,8 +2662,7 @@ impl List for SledStorageList {
 
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListPushs(self.clone(), vals, tx))
+            .cmd_send(Command::ListPushs(self.clone(), vals, tx))
             .await?;
         rx.await??;
         Ok(())
@@ -2736,8 +2683,7 @@ impl List for SledStorageList {
 
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListPushLimit(
+            .cmd_send(Command::ListPushLimit(
                 self.clone(),
                 data.into(),
                 limit,
@@ -2763,10 +2709,7 @@ impl List for SledStorageList {
         V: DeserializeOwned + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.db
-            .cmd_tx()
-            .send(Command::ListPop(self.clone(), tx))
-            .await?;
+        self.db.cmd_send(Command::ListPop(self.clone(), tx)).await?;
 
         let removed = if let Some(removed) = rx.await?? {
             Some(
@@ -2785,10 +2728,7 @@ impl List for SledStorageList {
         V: DeserializeOwned + Sync + Send,
     {
         let (tx, rx) = oneshot::channel();
-        self.db
-            .cmd_tx()
-            .send(Command::ListAll(self.clone(), tx))
-            .await?;
+        self.db.cmd_send(Command::ListAll(self.clone(), tx)).await?;
 
         rx.await??
             .iter()
@@ -2803,8 +2743,7 @@ impl List for SledStorageList {
     {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListGetIndex(self.clone(), idx, tx))
+            .cmd_send(Command::ListGetIndex(self.clone(), idx, tx))
             .await?;
 
         Ok(if let Some(res) = rx.await?? {
@@ -2817,10 +2756,7 @@ impl List for SledStorageList {
     #[inline]
     async fn len(&self) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
-        self.db
-            .cmd_tx()
-            .send(Command::ListLen(self.clone(), tx))
-            .await?;
+        self.db.cmd_send(Command::ListLen(self.clone(), tx)).await?;
         Ok(rx.await??)
     }
 
@@ -2828,8 +2764,7 @@ impl List for SledStorageList {
     async fn is_empty(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListIsEmpty(self.clone(), tx))
+            .cmd_send(Command::ListIsEmpty(self.clone(), tx))
             .await?;
         Ok(rx.await??)
     }
@@ -2838,8 +2773,7 @@ impl List for SledStorageList {
     async fn clear(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListClear(self.clone(), tx))
+            .cmd_send(Command::ListClear(self.clone(), tx))
             .await?;
         Ok(rx.await??)
     }
@@ -2863,7 +2797,7 @@ impl List for SledStorageList {
                 let iter = this.call_prefix_iter().await?;
                 let iter: Box<dyn AsyncIterator<Item = Result<V>> + Send> =
                     Box::new(AsyncListValIter {
-                        cmd_tx: this.db.cmd_tx().clone(),
+                        db: &this.db,
                         iter: Some(iter),
                         _m: std::marker::PhantomData,
                     });
@@ -2877,8 +2811,7 @@ impl List for SledStorageList {
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         self.db
-            .cmd_tx()
-            .send(Command::ListExpireAt(self.clone(), at, tx))
+            .cmd_send(Command::ListExpireAt(self.clone(), at, tx))
             .await?;
         Ok(rx.await??)
     }
@@ -2892,29 +2825,26 @@ impl List for SledStorageList {
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         let (tx, rx) = oneshot::channel();
-        self.db
-            .cmd_tx()
-            .send(Command::ListTTL(self.clone(), tx))
-            .await?;
+        self.db.cmd_send(Command::ListTTL(self.clone(), tx)).await?;
         Ok(rx.await??)
     }
 }
 
-pub struct AsyncIter<V> {
-    cmd_tx: mpsc::Sender<Command>,
+pub struct AsyncIter<'a, V> {
+    db: &'a SledStorageDB,
     prefix_len: usize,
     iter: Option<sled::Iter>,
     _m: std::marker::PhantomData<V>,
 }
 
-impl<V> Debug for AsyncIter<V> {
+impl<'a, V> Debug for AsyncIter<'a, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<V> AsyncIterator for AsyncIter<V>
+impl<'a, V> AsyncIterator for AsyncIter<'a, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -2923,8 +2853,8 @@ where
     async fn next(&mut self) -> Option<Self::Item> {
         let mut iter = self.iter.take()?;
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.cmd_tx.send(Command::IterNext(iter, tx)).await {
-            return Some(Err(anyhow::Error::new(e)));
+        if let Err(e) = self.db.cmd_send(Command::IterNext(iter, tx)).await {
+            return Some(Err(e));
         }
         let item = match rx.await {
             Err(e) => {
@@ -2953,27 +2883,27 @@ where
     }
 }
 
-pub struct AsyncKeyIter {
-    cmd_tx: mpsc::Sender<Command>,
+pub struct AsyncKeyIter<'a> {
+    db: &'a SledStorageDB,
     prefix_len: usize,
     iter: Option<sled::Iter>,
 }
 
-impl Debug for AsyncKeyIter {
+impl<'a> Debug for AsyncKeyIter<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncKeyIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl AsyncIterator for AsyncKeyIter {
+impl<'a> AsyncIterator for AsyncKeyIter<'a> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
         let mut iter = self.iter.take()?;
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.cmd_tx.send(Command::IterNext(iter, tx)).await {
-            return Some(Err(anyhow::Error::new(e)));
+        if let Err(e) = self.db.cmd_send(Command::IterNext(iter, tx)).await {
+            return Some(Err(e));
         }
         let item = match rx.await {
             Err(e) => {
@@ -2997,20 +2927,20 @@ impl AsyncIterator for AsyncKeyIter {
     }
 }
 
-pub struct AsyncListValIter<V> {
-    cmd_tx: mpsc::Sender<Command>,
+pub struct AsyncListValIter<'a, V> {
+    db: &'a SledStorageDB,
     iter: Option<sled::Iter>,
     _m: std::marker::PhantomData<V>,
 }
 
-impl<V> Debug for AsyncListValIter<V> {
+impl<'a, V> Debug for AsyncListValIter<'a, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncListValIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<V> AsyncIterator for AsyncListValIter<V>
+impl<'a, V> AsyncIterator for AsyncListValIter<'a, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -3019,8 +2949,8 @@ where
     async fn next(&mut self) -> Option<Self::Item> {
         let mut iter = self.iter.take()?;
         let (tx, rx) = oneshot::channel();
-        if let Err(e) = self.cmd_tx.send(Command::IterNext(iter, tx)).await {
-            return Some(Err(anyhow::Error::new(e)));
+        if let Err(e) = self.db.cmd_send(Command::IterNext(iter, tx)).await {
+            return Some(Err(e));
         }
         let item = match rx.await {
             Err(e) => {
@@ -3097,8 +3027,8 @@ impl<'a> AsyncIterator for AsyncMapIter<'a> {
         let mut iter = self.iter.take()?;
         loop {
             let (tx, rx) = oneshot::channel();
-            if let Err(e) = self.db.cmd_tx().send(Command::IterNext(iter, tx)).await {
-                return Some(Err(anyhow::Error::new(e)));
+            if let Err(e) = self.db.cmd_send(Command::IterNext(iter, tx)).await {
+                return Some(Err(e));
             }
             let item = match rx.await {
                 Err(e) => {
@@ -3161,8 +3091,8 @@ impl<'a> AsyncIterator for AsyncListIter<'a> {
         let mut iter = self.iter.take()?;
         loop {
             let (tx, rx) = oneshot::channel();
-            if let Err(e) = self.db.cmd_tx().send(Command::IterNext(iter, tx)).await {
-                return Some(Err(anyhow::Error::new(e)));
+            if let Err(e) = self.db.cmd_send(Command::IterNext(iter, tx)).await {
+                return Some(Err(e));
             }
             let item = match rx.await {
                 Err(e) => {
