@@ -36,6 +36,7 @@ const MAP_NAME_PREFIX: &[u8] = b"__map@";
 const MAP_KEY_SEPARATOR: &[u8] = b"@__item@";
 #[allow(dead_code)]
 const MAP_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
+
 const LIST_NAME_PREFIX: &[u8] = b"__list@";
 const LIST_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
 const LIST_KEY_CONTENT_SUFFIX: &[u8] = b"@__content@";
@@ -170,7 +171,7 @@ fn def_cleanup(_db: &SledStorageDB) {
                     let count = db.cleanup(limit);
                     total_cleanups += count;
                     if count > 0 {
-                        log::info!(
+                        log::debug!(
                             "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
                             count,
                             total_cleanups,
@@ -1391,12 +1392,12 @@ impl StorageDB for SledStorageDB {
         let active_count = self.active_count.load(Ordering::Relaxed);
         let this = self.clone();
         Ok(spawn_blocking(move || {
-            let size_on_disk = this.db.size_on_disk().unwrap_or_default();
-            let db_size = this.db_size();
-            let map_size = this.map_size();
-            let list_size = this.list_size();
+            // let size_on_disk = this.db.size_on_disk().unwrap_or_default();
+            // let db_size = this.db_size();
+            // let map_size = this.map_size();
+            // let list_size = this.list_size();
 
-            let limit = 100;
+            let limit = 20;
 
             let mut db_keys = Vec::new();
             for (i, key) in this.db.iter().keys().enumerate() {
@@ -1433,10 +1434,10 @@ impl StorageDB for SledStorageDB {
             serde_json::json!({
                 "storage_engine": "Sled",
                 "active_count": active_count,
-                "db_size": db_size,
-                "map_size": map_size,
-                "list_size": list_size,
-                "size_on_disk": size_on_disk,
+                // "db_size": db_size,
+                // "map_size": map_size,
+                // "list_size": list_size,
+                // "size_on_disk": size_on_disk,
                 "db_keys": db_keys,
                 "map_names": map_names,
                 "list_names": list_names,
