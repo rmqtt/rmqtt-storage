@@ -171,7 +171,7 @@ fn def_cleanup(_db: &SledStorageDB) {
                     let count = db.cleanup(limit);
                     total_cleanups += count;
                     if count > 0 {
-                        log::info!(
+                        log::debug!(
                             "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
                             count,
                             total_cleanups,
