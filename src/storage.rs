@@ -39,7 +39,13 @@ pub trait StorageDB: Send + Sync {
     type MapType: Map;
     type ListType: List;
 
-    fn map<V: AsRef<[u8]>>(&self, name: V) -> Self::MapType;
+    fn map<N: AsRef<[u8]>>(&self, name: N) -> Self::MapType;
+
+    async fn map_expire<N: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: N,
+        expire: Option<TimestampMillis>,
+    ) -> Result<Self::MapType>;
 
     async fn map_remove<K>(&self, name: K) -> Result<()>
     where
@@ -48,6 +54,12 @@ pub trait StorageDB: Send + Sync {
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType;
+
+    async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<Self::ListType>;
 
     async fn list_remove<K>(&self, name: K) -> Result<()>
     where
@@ -94,7 +106,7 @@ pub trait StorageDB: Send + Sync {
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
     #[cfg(feature = "ttl")]
-    async fn expire_at<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
+    async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send;
 
@@ -180,7 +192,7 @@ pub trait Map: Sync + Send {
         V: DeserializeOwned + Sync + Send + 'a + 'static;
 
     #[cfg(feature = "ttl")]
-    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool>;
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool>;
 
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool>;
@@ -236,7 +248,7 @@ pub trait List: Sync + Send {
         V: DeserializeOwned + Sync + Send + 'a + 'static;
 
     #[cfg(feature = "ttl")]
-    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool>;
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool>;
 
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool>;
@@ -258,6 +270,18 @@ impl DefaultStorageDB {
             DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name)),
             DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name)),
         }
+    }
+
+    #[inline]
+    pub async fn map_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<StorageMap> {
+        Ok(match self {
+            DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map_expire(name, expire).await?),
+            DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map_expire(name, expire).await?),
+        })
     }
 
     #[inline]
@@ -285,6 +309,18 @@ impl DefaultStorageDB {
             DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name)),
             DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name)),
         }
+    }
+
+    #[inline]
+    pub async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<StorageList> {
+        Ok(match self {
+            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list_expire(name, expire).await?),
+            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list_expire(name, expire).await?),
+        })
     }
 
     #[inline]
@@ -414,13 +450,13 @@ impl DefaultStorageDB {
 
     #[inline]
     #[cfg(feature = "ttl")]
-    pub async fn expire_at<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
+    pub async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
-            DefaultStorageDB::Sled(db) => db.expire_at(key, dur).await,
-            DefaultStorageDB::Redis(db) => db.expire_at(key, dur).await,
+            DefaultStorageDB::Sled(db) => db.expire_at(key, at).await,
+            DefaultStorageDB::Redis(db) => db.expire_at(key, at).await,
         }
     }
 
@@ -627,10 +663,10 @@ impl Map for StorageMap {
     }
 
     #[cfg(feature = "ttl")]
-    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool> {
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         match self {
-            StorageMap::Sled(m) => m.expire_at(dur).await,
-            StorageMap::Redis(m) => m.expire_at(dur).await,
+            StorageMap::Sled(m) => m.expire_at(at).await,
+            StorageMap::Redis(m) => m.expire_at(at).await,
         }
     }
 
@@ -778,10 +814,10 @@ impl List for StorageList {
     }
 
     #[cfg(feature = "ttl")]
-    async fn expire_at(&self, dur: TimestampMillis) -> Result<bool> {
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         match self {
-            StorageList::Sled(l) => l.expire_at(dur).await,
-            StorageList::Redis(l) => l.expire_at(dur).await,
+            StorageList::Sled(l) => l.expire_at(at).await,
+            StorageList::Redis(l) => l.expire_at(at).await,
         }
     }
 

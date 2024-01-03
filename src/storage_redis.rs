@@ -5,6 +5,8 @@ use redis::AsyncCommands;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 use crate::{Result, StorageList, StorageMap};
@@ -147,9 +149,22 @@ impl StorageDB for RedisStorageDB {
     type ListType = RedisStorageList;
 
     #[inline]
-    fn map<V: AsRef<[u8]>>(&self, name: V) -> Self::MapType {
+    fn map<N: AsRef<[u8]>>(&self, name: N) -> Self::MapType {
         let full_name = self.make_map_full_name(name.as_ref());
         RedisStorageMap::new(name.as_ref().to_vec(), full_name, self.clone())
+    }
+
+    #[inline]
+    async fn map_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<Self::MapType> {
+        let full_name = self.make_map_full_name(name.as_ref());
+        Ok(
+            RedisStorageMap::new_expire(name.as_ref().to_vec(), full_name, expire, self.clone())
+                .await?,
+        )
     }
 
     #[inline]
@@ -172,6 +187,19 @@ impl StorageDB for RedisStorageDB {
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
         let full_name = self.make_list_full_name(name.as_ref());
         RedisStorageList::new(name.as_ref().to_vec(), full_name, self.clone())
+    }
+
+    #[inline]
+    async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<Self::ListType> {
+        let full_name = self.make_list_full_name(name.as_ref());
+        Ok(
+            RedisStorageList::new_expire(name.as_ref().to_vec(), full_name, expire, self.clone())
+                .await?,
+        )
     }
 
     #[inline]
@@ -311,14 +339,14 @@ impl StorageDB for RedisStorageDB {
 
     #[inline]
     #[cfg(feature = "ttl")]
-    async fn expire_at<K>(&self, key: K, e_at: TimestampMillis) -> Result<bool>
+    async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
         let full_name = self.make_full_key(key.as_ref());
         let res = self
             .async_conn()
-            .pexpire_at::<_, bool>(full_name, e_at)
+            .pexpire_at::<_, bool>(full_name, at)
             .await?;
         Ok(res)
     }
@@ -401,6 +429,9 @@ impl StorageDB for RedisStorageDB {
 pub struct RedisStorageMap {
     name: Key,
     full_name: Key,
+    #[allow(dead_code)]
+    expire: Option<TimestampMillis>,
+    empty: Arc<AtomicBool>,
     pub(crate) db: RedisStorageDB,
 }
 
@@ -410,8 +441,32 @@ impl RedisStorageMap {
         Self {
             name,
             full_name,
+            expire: None,
+            empty: Arc::new(AtomicBool::new(true)),
             db,
         }
+    }
+
+    #[inline]
+    pub(crate) async fn new_expire(
+        name: Key,
+        full_name: Key,
+        expire: Option<TimestampMillis>,
+        mut db: RedisStorageDB,
+    ) -> Result<Self> {
+        let empty = if expire.is_some() {
+            let empty = Self::_is_empty(&mut db.async_conn, full_name.as_slice()).await?;
+            Arc::new(AtomicBool::new(empty))
+        } else {
+            Arc::new(AtomicBool::new(true))
+        };
+        Ok(Self {
+            name,
+            full_name,
+            expire,
+            empty,
+            db,
+        })
     }
 
     #[inline]
@@ -422,6 +477,71 @@ impl RedisStorageMap {
     #[inline]
     fn async_conn_mut(&mut self) -> &mut RedisConnection {
         self.db.async_conn_mut()
+    }
+
+    #[inline]
+    async fn _is_empty(async_conn: &mut RedisConnection, full_name: &[u8]) -> Result<bool> {
+        //HSCAN key cursor [MATCH pattern] [COUNT count]
+        let res = async_conn
+            .hscan::<_, Vec<u8>>(full_name)
+            .await?
+            .next_item()
+            .await
+            .is_none();
+        Ok(res)
+    }
+
+    #[inline]
+    async fn _insert_expire(&self, key: &[u8], val: Vec<u8>) -> Result<()> {
+        let mut async_conn = self.async_conn();
+        let name = self.full_name.as_slice();
+
+        #[cfg(feature = "ttl")]
+        if self.empty.load(Ordering::SeqCst) {
+            if let Some(expire) = self.expire.as_ref() {
+                //HSET key field value
+                //PEXPIRE key ms
+                redis::pipe()
+                    .atomic()
+                    .hset(name, key, val)
+                    .pexpire(name, *expire)
+                    .query_async(&mut async_conn)
+                    .await?;
+                self.empty.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+
+        //HSET key field value
+        async_conn.hset(name, key.as_ref(), val).await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn _batch_insert_expire(&self, key_vals: Vec<(Key, Vec<u8>)>) -> Result<()> {
+        let mut async_conn = self.async_conn();
+        let name = self.full_name.as_slice();
+
+        #[cfg(feature = "ttl")]
+        if self.empty.load(Ordering::SeqCst) {
+            if let Some(expire) = self.expire.as_ref() {
+                //HMSET key field value
+                //PEXPIRE key ms
+                redis::pipe()
+                    .atomic()
+                    .hset_multiple(name, key_vals.as_slice())
+                    .pexpire(name, *expire)
+                    .query_async(&mut async_conn)
+                    .await?;
+
+                self.empty.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+
+        //HSET key field value
+        async_conn.hset_multiple(name, key_vals.as_slice()).await?;
+        Ok(())
     }
 }
 
@@ -438,12 +558,8 @@ impl Map for RedisStorageMap {
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send + ?Sized,
     {
-        //HSET key field value
-        let name = self.full_name.clone();
-        self.async_conn()
-            .hset(name, key.as_ref(), bincode::serialize(val)?)
-            .await?;
-        Ok(())
+        self._insert_expire(key.as_ref(), bincode::serialize(val)?)
+            .await
     }
 
     #[inline]
@@ -453,8 +569,10 @@ impl Map for RedisStorageMap {
         V: DeserializeOwned + Sync + Send,
     {
         //HSET key field value
-        let name = self.full_name.clone();
-        let res: Option<Vec<u8>> = self.async_conn().hget(name, key.as_ref()).await?;
+        let res: Option<Vec<u8>> = self
+            .async_conn()
+            .hget(self.full_name.as_slice(), key.as_ref())
+            .await?;
         if let Some(res) = res {
             Ok(Some(bincode::deserialize::<V>(res.as_ref())?))
         } else {
@@ -468,16 +586,19 @@ impl Map for RedisStorageMap {
         K: AsRef<[u8]> + Sync + Send,
     {
         //HDEL key field [field ...]
-        let name = self.full_name.clone();
-        self.async_conn().hdel(name, key.as_ref()).await?;
+        self.async_conn()
+            .hdel(self.full_name.as_slice(), key.as_ref())
+            .await?;
         Ok(())
     }
 
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         //HEXISTS key field
-        let name = self.full_name.clone();
-        let res = self.async_conn().hexists(name, key.as_ref()).await?;
+        let res = self
+            .async_conn()
+            .hexists(self.full_name.as_slice(), key.as_ref())
+            .await?;
         Ok(res)
     }
 
@@ -485,17 +606,15 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn len(&self) -> Result<usize> {
         //HLEN key
-        let name = self.full_name.clone();
-        Ok(self.async_conn().hlen(name).await?)
+        Ok(self.async_conn().hlen(self.full_name.as_slice()).await?)
     }
 
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
         //HSCAN key cursor [MATCH pattern] [COUNT count]
-        let name = self.full_name.clone();
         let res = self
             .async_conn()
-            .hscan::<_, Vec<u8>>(name)
+            .hscan::<_, Vec<u8>>(self.full_name.as_slice())
             .await?
             .next_item()
             .await
@@ -506,8 +625,8 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn clear(&self) -> Result<()> {
         //DEL key [key ...]
-        let name = self.full_name.clone();
-        self.async_conn().del(name).await?;
+        self.async_conn().del(self.full_name.as_slice()).await?;
+        self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -519,12 +638,12 @@ impl Map for RedisStorageMap {
     {
         //HSET key field value
         //HDEL key field [field ...]
-        let name = self.full_name.clone();
+        let name = self.full_name.as_slice();
         let mut conn = self.async_conn();
         let (res, _): (Option<Vec<u8>>, isize) = redis::pipe()
             .atomic()
-            .hget(name.as_slice(), key.as_ref())
-            .hdel(name.as_slice(), key.as_ref())
+            .hget(name, key.as_ref())
+            .hdel(name, key.as_ref())
             .query_async(&mut conn)
             .await?;
 
@@ -540,26 +659,26 @@ impl Map for RedisStorageMap {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let name = self.full_name.clone();
+        let name = self.full_name.as_slice();
         let mut conn = self.async_conn();
         let mut conn2 = conn.clone();
         let mut prefix = prefix.as_ref().to_vec();
         prefix.push(b'*');
         let mut removeds = Vec::new();
         while let Some(key) = conn
-            .hscan_match::<_, _, Vec<u8>>(name.as_slice(), prefix.as_slice())
+            .hscan_match::<_, _, Vec<u8>>(name, prefix.as_slice())
             .await?
             .next_item()
             .await
         {
             removeds.push(key);
             if removeds.len() > 20 {
-                conn2.hdel(name.as_slice(), removeds.as_slice()).await?;
+                conn2.hdel(name, removeds.as_slice()).await?;
                 removeds.clear();
             }
         }
         if !removeds.is_empty() {
-            conn.hdel(name.as_slice(), removeds).await?;
+            conn.hdel(name, removeds).await?;
         }
         Ok(())
     }
@@ -578,10 +697,8 @@ impl Map for RedisStorageMap {
                         .map_err(|e| anyhow!(e))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let name = self.full_name.clone();
-            self.async_conn()
-                .hset_multiple(name, key_vals.as_slice())
-                .await?;
+
+            self._batch_insert_expire(key_vals).await?;
         }
         Ok(())
     }
@@ -589,8 +706,9 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if !keys.is_empty() {
-            let name = self.full_name.clone();
-            self.async_conn().hdel(name, keys).await?;
+            self.async_conn()
+                .hdel(self.full_name.as_slice(), keys)
+                .await?;
         }
         Ok(())
     }
@@ -617,9 +735,12 @@ impl Map for RedisStorageMap {
     async fn key_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
-        let name = self.full_name.clone();
         let iter = AsyncKeyIter {
-            iter: self.db.async_conn.hscan::<_, (Key, ())>(name).await?,
+            iter: self
+                .db
+                .async_conn
+                .hscan::<_, (Key, ())>(self.full_name.as_slice())
+                .await?,
         };
         Ok(Box::new(iter))
     }
@@ -682,6 +803,9 @@ impl Map for RedisStorageMap {
 pub struct RedisStorageList {
     name: Key,
     full_name: Key,
+    #[allow(dead_code)]
+    expire: Option<TimestampMillis>,
+    empty: Arc<AtomicBool>,
     pub(crate) db: RedisStorageDB,
 }
 
@@ -691,13 +815,166 @@ impl RedisStorageList {
         Self {
             name,
             full_name,
+            expire: None,
+            empty: Arc::new(AtomicBool::new(true)),
             db,
         }
     }
 
     #[inline]
+    pub(crate) async fn new_expire(
+        name: Key,
+        full_name: Key,
+        expire: Option<TimestampMillis>,
+        mut db: RedisStorageDB,
+    ) -> Result<Self> {
+        let empty = if expire.is_some() {
+            let empty = Self::_is_empty(&mut db.async_conn, full_name.as_slice()).await?;
+            Arc::new(AtomicBool::new(empty))
+        } else {
+            Arc::new(AtomicBool::new(true))
+        };
+        Ok(Self {
+            name,
+            full_name,
+            expire,
+            empty,
+            db,
+        })
+    }
+
+    #[inline]
     pub(crate) fn async_conn(&self) -> RedisConnection {
         self.db.async_conn()
+    }
+
+    #[inline]
+    async fn _is_empty(async_conn: &mut RedisConnection, full_name: &[u8]) -> Result<bool> {
+        Ok(async_conn.llen::<_, usize>(full_name).await? == 0)
+    }
+
+    #[inline]
+    async fn _push_expire(&self, val: Vec<u8>) -> Result<()> {
+        let mut async_conn = self.async_conn();
+        let name = self.full_name.as_slice();
+
+        #[cfg(feature = "ttl")]
+        if self.empty.load(Ordering::SeqCst) {
+            if let Some(expire) = self.expire.as_ref() {
+                //RPUSH key value [value ...]
+                //PEXPIRE key ms
+                redis::pipe()
+                    .atomic()
+                    .rpush(name, val)
+                    .pexpire(name, *expire)
+                    .query_async(&mut async_conn)
+                    .await?;
+                self.empty.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+
+        //RPUSH key value [value ...]
+        async_conn.rpush(name, val).await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn _pushs_expire(&self, vals: Vec<Vec<u8>>) -> Result<()> {
+        let mut async_conn = self.async_conn();
+
+        #[cfg(feature = "ttl")]
+        if self.empty.load(Ordering::SeqCst) {
+            if let Some(expire) = self.expire.as_ref() {
+                let name = self.full_name.as_slice();
+                //RPUSH key value [value ...]
+                //PEXPIRE key ms
+                redis::pipe()
+                    .atomic()
+                    .rpush(name, vals)
+                    .pexpire(name, *expire)
+                    .query_async(&mut async_conn)
+                    .await?;
+                self.empty.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+
+        //RPUSH key value [value ...]
+        async_conn.rpush(self.full_name.as_slice(), vals).await?;
+        Ok(())
+    }
+
+    #[inline]
+    async fn _push_limit_expire(
+        &self,
+        val: Vec<u8>,
+        limit: usize,
+        pop_front_if_limited: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut conn = self.async_conn();
+
+        #[cfg(feature = "ttl")]
+        if self.empty.load(Ordering::SeqCst) {
+            if let Some(expire) = self.expire.as_ref() {
+                let name = self.full_name.as_slice();
+                let count = conn.llen::<_, usize>(name).await?;
+                let res = if count < limit {
+                    redis::pipe()
+                        .atomic()
+                        .rpush(name, val)
+                        .pexpire(name, *expire)
+                        .query_async(&mut conn)
+                        .await?;
+                    Ok(None)
+                } else if pop_front_if_limited {
+                    let (poped, _): (Option<Vec<u8>>, Option<()>) = redis::pipe()
+                        .atomic()
+                        .lpop(name, None)
+                        .rpush(name, val)
+                        .pexpire(name, *expire)
+                        .query_async(&mut conn)
+                        .await?;
+
+                    Ok(if let Some(v) = poped { Some(v) } else { None })
+                } else {
+                    Err(anyhow::Error::msg("Is full"))
+                };
+                self.empty.store(false, Ordering::SeqCst);
+                return res;
+            }
+        }
+
+        self._push_limit(val, limit, pop_front_if_limited, &mut conn)
+            .await
+    }
+
+    #[inline]
+    async fn _push_limit(
+        &self,
+        val: Vec<u8>,
+        limit: usize,
+        pop_front_if_limited: bool,
+        async_conn: &mut RedisConnection,
+    ) -> Result<Option<Vec<u8>>> {
+        let name = self.full_name.as_slice();
+
+        let count = async_conn.llen::<_, usize>(name).await?;
+        if count < limit {
+            async_conn.rpush(name, val).await?;
+            Ok(None)
+        } else if pop_front_if_limited {
+            let (poped, _): (Option<Vec<u8>>, Option<()>) = redis::pipe()
+                .atomic()
+                .lpop(name, None)
+                .rpush(name, val)
+                .query_async(async_conn)
+                .await?;
+
+            Ok(if let Some(v) = poped { Some(v) } else { None })
+        } else {
+            Err(anyhow::Error::msg("Is full"))
+        }
     }
 }
 
@@ -713,11 +990,7 @@ impl List for RedisStorageList {
     where
         V: Serialize + Sync + Send,
     {
-        //RPUSH key value [value ...]
-        self.async_conn()
-            .rpush(self.full_name.as_slice(), bincode::serialize(val)?)
-            .await?;
-        Ok(())
+        self._push_expire(bincode::serialize(val)?).await
     }
 
     #[inline]
@@ -730,10 +1003,7 @@ impl List for RedisStorageList {
             .into_iter()
             .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
             .collect::<Result<Vec<_>>>()?;
-        self.async_conn()
-            .rpush(self.full_name.as_slice(), vals)
-            .await?;
-        Ok(())
+        self._pushs_expire(vals).await
     }
 
     #[inline]
@@ -749,28 +1019,15 @@ impl List for RedisStorageList {
     {
         let data = bincode::serialize(val)?;
 
-        let key = self.full_name.as_slice();
-        let mut conn = self.async_conn();
-
-        let count = conn.llen::<_, usize>(key).await?;
-        if count < limit {
-            conn.rpush(key, data).await?;
-            Ok(None)
-        } else if pop_front_if_limited {
-            let (poped, _): (Option<Vec<u8>>, Option<()>) = redis::pipe()
-                .atomic()
-                .lpop(key, None)
-                .rpush(key, data)
-                .query_async(&mut conn)
-                .await?;
-
-            Ok(if let Some(v) = poped {
-                Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
-            } else {
-                None
-            })
+        if let Some(res) = self
+            ._push_limit_expire(data, limit, pop_front_if_limited)
+            .await?
+        {
+            Ok(Some(
+                bincode::deserialize::<V>(res.as_ref()).map_err(|e| anyhow!(e))?,
+            ))
         } else {
-            Err(anyhow::Error::msg("Is full"))
+            Ok(None)
         }
     }
 
@@ -841,6 +1098,7 @@ impl List for RedisStorageList {
     #[inline]
     async fn clear(&self) -> Result<()> {
         self.async_conn().del(self.full_name.as_slice()).await?;
+        self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
 

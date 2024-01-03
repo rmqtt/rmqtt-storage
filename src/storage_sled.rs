@@ -171,7 +171,7 @@ fn def_cleanup(_db: &SledStorageDB) {
                     let count = db.cleanup(limit);
                     total_cleanups += count;
                     if count > 0 {
-                        log::debug!(
+                        log::info!(
                             "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
                             count,
                             total_cleanups,
@@ -266,9 +266,9 @@ fn _decrement(old: Option<&[u8]>) -> Option<Vec<u8>> {
 
 #[derive(Clone)]
 pub struct SledStorageDB {
-    db: Arc<sled::Db>,
-    map_tree: sled::Tree,
-    list_tree: sled::Tree,
+    pub(crate) db: Arc<sled::Db>,
+    pub(crate) map_tree: sled::Tree,
+    pub(crate) list_tree: sled::Tree,
     cmd_tx: mpsc::Sender<Command>,
     active_count: Arc<AtomicIsize>, //Active Command Count
 }
@@ -777,6 +777,10 @@ impl SledStorageDB {
     {
         let ttl_res = match self.db.get(expire_key) {
             Ok(Some(v)) => {
+                // println!(
+                //     "expire_ttl is {:?}",
+                //     TimestampMillis::from_be_bytes(v.as_ref().try_into()?)
+                // );
                 if contains_key_f(c_key.as_ref())? {
                     Ok(Some(TimestampMillis::from_be_bytes(v.as_ref().try_into()?)))
                 } else {
@@ -784,6 +788,7 @@ impl SledStorageDB {
                 }
             }
             Ok(None) => {
+                // println!("expire_ttl is None");
                 if contains_key_f(c_key.as_ref())? {
                     Ok(Some(TimestampMillis::MAX))
                 } else {
@@ -795,6 +800,7 @@ impl SledStorageDB {
 
         let ttl_res = if let Some(at) = ttl_res {
             let now = timestamp_millis();
+            // println!("at: {}, now: {}", at, now);
             if now > at {
                 //is expire
                 None
@@ -1092,19 +1098,17 @@ impl StorageDB for SledStorageDB {
     type ListType = SledStorageList;
 
     #[inline]
-    fn map<K: AsRef<[u8]>>(&self, name: K) -> Self::MapType {
-        let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_ref());
-        let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_ref());
-        #[cfg(feature = "map_len")]
-        let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_ref());
-        SledStorageMap {
-            name: name.as_ref().to_vec(),
-            map_prefix_name,
-            map_item_prefix_name,
-            #[cfg(feature = "map_len")]
-            map_count_key_name,
-            db: self.clone(),
-        }
+    fn map<N: AsRef<[u8]>>(&self, name: N) -> Self::MapType {
+        SledStorageMap::new(name.as_ref().to_vec(), self.clone())
+    }
+
+    #[inline]
+    async fn map_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<Self::MapType> {
+        SledStorageMap::new_expire(name.as_ref().to_vec(), expire, self.clone()).await
     }
 
     #[inline]
@@ -1133,11 +1137,16 @@ impl StorageDB for SledStorageDB {
 
     #[inline]
     fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
-        SledStorageList {
-            name: name.as_ref().to_vec(),
-            prefix_name: SledStorageDB::make_list_prefix(name),
-            db: self.clone(),
-        }
+        SledStorageList::new(name.as_ref().to_vec(), self.clone())
+    }
+
+    #[inline]
+    async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+        &self,
+        name: V,
+        expire: Option<TimestampMillis>,
+    ) -> Result<Self::ListType> {
+        SledStorageList::new_expire(name.as_ref().to_vec(), expire, self.clone())
     }
 
     #[inline]
@@ -1458,6 +1467,36 @@ pub struct SledStorageMap {
 }
 
 impl SledStorageMap {
+    #[inline]
+    fn new(name: Key, db: SledStorageDB) -> Self {
+        let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_slice());
+        let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_slice());
+        #[cfg(feature = "map_len")]
+        let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_slice());
+        SledStorageMap {
+            name,
+            map_prefix_name,
+            map_item_prefix_name,
+            #[cfg(feature = "map_len")]
+            map_count_key_name,
+            db,
+        }
+    }
+
+    #[inline]
+    async fn new_expire(
+        name: Key,
+        _expire_ms: Option<TimestampMillis>,
+        db: SledStorageDB,
+    ) -> Result<Self> {
+        let m = Self::new(name, db);
+        #[cfg(feature = "ttl")]
+        if let Some(expire_ms) = _expire_ms.as_ref() {
+            m._expire_at(timestamp_millis() + *expire_ms)?;
+        }
+        Ok(m)
+    }
+
     #[inline]
     fn tree(&self) -> &sled::Tree {
         &self.db.map_tree
@@ -1822,16 +1861,16 @@ impl SledStorageMap {
         let expire_key =
             SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP);
         let res = {
-            if SledStorageDB::_map_contains_key(this.tree(), this.name.as_slice())? {
-                let at_bytes = at.to_be_bytes();
-                this.db
-                    .db
-                    .insert(expire_key, at_bytes.as_slice())
-                    .map_err(|e| anyhow!(e))
-                    .map(|_| true)
-            } else {
-                Ok(false)
-            }
+            // if SledStorageDB::_map_contains_key(this.tree(), this.name.as_slice())? {
+            let at_bytes = at.to_be_bytes();
+            this.db
+                .db
+                .insert(expire_key, at_bytes.as_slice())
+                .map_err(|e| anyhow!(e))
+                .map(|_| true)
+            // } else {
+            //     Ok(false)
+            // }
         }?;
         Ok(res)
     }
@@ -2172,6 +2211,30 @@ pub struct SledStorageList {
 }
 
 impl SledStorageList {
+    #[inline]
+    fn new(name: Key, db: SledStorageDB) -> Self {
+        let prefix_name = SledStorageDB::make_list_prefix(name.as_slice());
+        SledStorageList {
+            name,
+            prefix_name,
+            db,
+        }
+    }
+
+    #[inline]
+    fn new_expire(
+        name: Key,
+        _expire_ms: Option<TimestampMillis>,
+        db: SledStorageDB,
+    ) -> Result<Self> {
+        let l = Self::new(name, db);
+        #[cfg(feature = "ttl")]
+        if let Some(expire_ms) = _expire_ms {
+            l._expire_at(timestamp_millis() + expire_ms)?;
+        }
+        Ok(l)
+    }
+
     #[inline]
     pub(crate) fn name(&self) -> &[u8] {
         self.name.as_slice()
@@ -2602,16 +2665,16 @@ impl SledStorageList {
         let expire_key =
             SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST);
         let res = {
-            if SledStorageDB::_list_contains_key(this.tree(), this.name.as_slice())? {
-                let at_bytes = at.to_be_bytes();
-                this.db
-                    .db
-                    .insert(expire_key, at_bytes.as_slice())
-                    .map_err(|e| anyhow!(e))
-                    .map(|_| true)
-            } else {
-                Ok(false)
-            }
+            //if SledStorageDB::_list_contains_key(this.tree(), this.name.as_slice())? {
+            let at_bytes = at.to_be_bytes();
+            this.db
+                .db
+                .insert(expire_key, at_bytes.as_slice())
+                .map_err(|e| anyhow!(e))
+                .map(|_| true)
+            // } else {
+            //     Ok(false)
+            // }
         }?;
         Ok(res)
     }

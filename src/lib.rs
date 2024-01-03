@@ -103,6 +103,7 @@ mod tests {
     use super::storage::*;
     use super::*;
     use std::time::Duration;
+    use tokio::time::sleep;
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
@@ -1423,5 +1424,195 @@ mod tests {
             count += 1;
         }
         println!("count: {}, cost time: {:?}", count, now.elapsed());
+    }
+
+    #[tokio::main]
+    // #[test]
+    async fn test_map_expire() {
+        let cfg = get_cfg("map_expire");
+        let db = init_db(&cfg).await.unwrap();
+
+        #[cfg(feature = "ttl")]
+        #[cfg(feature = "map_len")]
+        {
+            let map1 = db.map_expire("map1", Some(1000)).await.unwrap();
+            println!("ttl: {:?}", map1.ttl().await.unwrap());
+            map1.insert("k1", &1).await.unwrap();
+            map1.insert("k2", &2).await.unwrap();
+            println!("ttl: {:?}", map1.ttl().await.unwrap());
+            assert_eq!(map1.is_empty().await.unwrap(), false);
+            assert_eq!(map1.len().await.unwrap(), 2);
+            sleep(Duration::from_millis(1200)).await;
+            println!("ttl: {:?}", map1.ttl().await.unwrap());
+            assert_eq!(map1.len().await.unwrap(), 0);
+            assert_eq!(map1.is_empty().await.unwrap(), true);
+            map1.clear().await.unwrap();
+        }
+
+        let mut db1 = db.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(10000)).await;
+                let mut iter = db1.map_iter().await.unwrap();
+                let limit = 10;
+                let mut c = 0;
+                while let Some(map) = iter.next().await {
+                    let map = map.unwrap();
+                    println!(
+                        "map.is_empty(): {:?}, now: {:?}",
+                        map.is_empty().await.unwrap(),
+                        timestamp_millis()
+                    );
+                    c += 1;
+                    if c > limit {
+                        break;
+                    }
+                }
+            }
+        });
+
+        for x in 0..500 {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for i in 0..10_000 {
+                    let map = match db
+                        .map_expire(format!("map_{}_{}", x, i), Some(1000 * 60))
+                        //.map_expire(format!("map_{}_{}", x, i), None)
+                        .await
+                    {
+                        Ok(map) => map,
+                        Err(e) => {
+                            println!("map_expire {:?}", e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = map.insert(format!("k1_{}", i), &i).await {
+                        println!("insert {:?}", e);
+                    }
+                    sleep(Duration::from_millis(0)).await;
+                    if let Err(e) = map.insert(format!("k2_{}", i), &i).await {
+                        println!("insert {:?}", e);
+                    }
+                    sleep(Duration::from_millis(0)).await;
+                    if let Err(e) = map.insert(format!("k3_{}", i), &i).await {
+                        println!("insert {:?}", e);
+                    }
+                    sleep(Duration::from_millis(0)).await;
+                }
+                println!("********************* end {:?}", x);
+            });
+        }
+
+        // for x in 0..500 {
+        //     let db = db.clone();
+        //     tokio::spawn(async move {
+        //         for i in 0..10_000 {
+        //             let map = db.map(format!("map_{}_{}", x, i));
+        //
+        //             if let Err(e) = map.insert(format!("k1_{}", i), &i).await {
+        //                 println!("insert {:?}", e);
+        //             }
+        //             sleep(Duration::from_millis(0)).await;
+        //             if let Err(e) = map.expire(1000 * 60).await {
+        //                 println!("expire {:?}", e);
+        //             }
+        //             sleep(Duration::from_millis(0)).await;
+        //             if let Err(e) = map.insert(format!("k2_{}", i), &i).await {
+        //                 println!("insert {:?}", e);
+        //             }
+        //             sleep(Duration::from_millis(0)).await;
+        //             if let Err(e) = map.insert(format!("k3_{}", i), &i).await {
+        //                 println!("insert {:?}", e);
+        //             }
+        //             sleep(Duration::from_millis(0)).await;
+        //             // println!("len: {:?}", db.info().await);
+        //         }
+        //         println!("********************* end {:?}", x);
+        //     });
+        // }
+
+        sleep(Duration::from_secs(100000)).await;
+    }
+
+    #[tokio::main]
+    // #[test]
+    async fn test_map_expire_list() {
+        use super::{SledStorageDB, StorageDB};
+        let cfg = Config {
+            typ: StorageType::Sled,
+            sled: SledConfig {
+                path: format!("./.catch/{}", "map_expire"),
+                cache_capacity: convert::Bytesize::from(1024 * 1024 * 1024 * 3),
+                cleanup_f: move |_db| {
+                    #[cfg(feature = "ttl")]
+                    {
+                        let db = _db.clone();
+                        std::thread::spawn(move || {
+                            let limit = 1000;
+                            for _ in 0..5 {
+                                std::thread::sleep(std::time::Duration::from_secs(3));
+                                let mut total_cleanups = 0;
+                                let now = std::time::Instant::now();
+                                loop {
+                                    let count = db.cleanup(limit);
+                                    total_cleanups += count;
+                                    println!(
+                                        "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
+                                        count,
+                                        total_cleanups,
+                                        now.elapsed()
+                                    );
+
+                                    if count < limit {
+                                        break;
+                                    }
+
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                println!(
+                                    "total cleanups: {}, cost time: {:?}",
+                                    total_cleanups,
+                                    now.elapsed()
+                                );
+                            }
+                        });
+                    }
+                },
+                ..Default::default()
+            },
+            redis: RedisConfig {
+                url: "redis://127.0.0.1:6379/".into(),
+                prefix: "sled_cleanup".to_owned(),
+            },
+        };
+
+        let mut db = SledStorageDB::new(cfg.sled.clone()).await.unwrap();
+
+        let mut expireat_count = 0;
+        for item in db.db.iter() {
+            let (key, val) = item.unwrap();
+            println!(
+                "item: {:?}, val: {:?}",
+                String::from_utf8_lossy(key.as_ref()),
+                val.as_ref()
+                    .try_into()
+                    .map(|v: [u8; 8]| usize::from_be_bytes(v))
+            );
+            expireat_count += 1;
+        }
+        println!("expireat_count: {}", expireat_count);
+
+        let mut iter = db.map_iter().await.unwrap();
+        // let limit = 1000;
+        let mut c = 0;
+        let mut emptys = 0;
+        while let Some(map) = iter.next().await {
+            let map = map.unwrap();
+            c += 1;
+            if map.is_empty().await.unwrap() {
+                emptys += 1;
+            }
+        }
+        println!("c: {}, emptys: {}", c, emptys);
     }
 }
