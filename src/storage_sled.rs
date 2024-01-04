@@ -2153,7 +2153,7 @@ impl Map for SledStorageMap {
         prefix: P,
     ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
     where
-        P: AsRef<[u8]> + Send,
+        P: AsRef<[u8]> + Send + Sync,
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         let this = self;

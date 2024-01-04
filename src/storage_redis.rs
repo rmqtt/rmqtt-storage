@@ -751,7 +751,7 @@ impl Map for RedisStorageMap {
         prefix: P,
     ) -> Result<Box<dyn AsyncIterator<Item = IterItem<V>> + Send + 'a>>
     where
-        P: AsRef<[u8]> + Send,
+        P: AsRef<[u8]> + Send + Sync,
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         let name = self.full_name.clone();
@@ -970,8 +970,7 @@ impl RedisStorageList {
                 .rpush(name, val)
                 .query_async(async_conn)
                 .await?;
-
-            Ok(if let Some(v) = poped { Some(v) } else { None })
+            Ok(poped)
         } else {
             Err(anyhow::Error::msg("Is full"))
         }
