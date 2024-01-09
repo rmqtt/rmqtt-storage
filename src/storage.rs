@@ -39,9 +39,7 @@ pub trait StorageDB: Send + Sync {
     type MapType: Map;
     type ListType: List;
 
-    fn map<N: AsRef<[u8]>>(&self, name: N) -> Self::MapType;
-
-    async fn map_expire<N: AsRef<[u8]> + Sync + Send>(
+    async fn map<N: AsRef<[u8]> + Sync + Send>(
         &self,
         name: N,
         expire: Option<TimestampMillis>,
@@ -265,22 +263,14 @@ pub enum DefaultStorageDB {
 
 impl DefaultStorageDB {
     #[inline]
-    pub fn map<V: AsRef<[u8]>>(&self, name: V) -> StorageMap {
-        match self {
-            DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name)),
-            DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name)),
-        }
-    }
-
-    #[inline]
-    pub async fn map_expire<V: AsRef<[u8]> + Sync + Send>(
+    pub async fn map<V: AsRef<[u8]> + Sync + Send>(
         &self,
         name: V,
         expire: Option<TimestampMillis>,
     ) -> Result<StorageMap> {
         Ok(match self {
-            DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map_expire(name, expire).await?),
-            DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map_expire(name, expire).await?),
+            DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name, expire).await?),
+            DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name, expire).await?),
         })
     }
 

@@ -2,7 +2,7 @@ use core::fmt;
 use std::fmt::Debug;
 use std::io;
 use std::io::ErrorKind;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -58,6 +58,12 @@ enum Command {
     DBInsert(Arc<Db>, Key, Vec<u8>, oneshot::Sender<Result<()>>),
     DBGet(SledStorageDB, IVec, oneshot::Sender<Result<Option<IVec>>>),
     DBRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
+    DBMapNew(
+        SledStorageDB,
+        IVec,
+        Option<TimestampMillis>,
+        oneshot::Sender<Result<SledStorageMap>>,
+    ),
     DBMapRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
     DBMapContainsKey(SledStorageDB, IVec, oneshot::Sender<Result<bool>>),
     DBListRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
@@ -306,6 +312,12 @@ impl SledStorageDB {
                         Command::DBRemove(db, key, res_tx) => {
                             res_tx.send(db._db_remove(key.as_ref())).map_err(|_| err)
                         }
+                        Command::DBMapNew(db, name, expire_ms, res_tx) => {
+                            let map =
+                                SledStorageMap::_new_expire(name.as_ref().to_vec(), expire_ms, db)
+                                    .await;
+                            res_tx.send(map).map_err(|_| err)
+                        }
                         Command::DBMapRemove(db, name, res_tx) => {
                             res_tx.send(db._map_remove(name.as_ref())).map_err(|_| err)
                         }
@@ -467,6 +479,59 @@ impl SledStorageDB {
     #[inline]
     pub fn cleanup(&self, limit: usize) -> usize {
         let mut count = 0;
+        let mut expire_key_vals = Vec::new();
+        for item in self.db.scan_prefix(EXPIRE_AT_KEY_PREFIX) {
+            if count > limit {
+                break;
+            }
+            match item {
+                Ok((expire_key, v)) => {
+                    if let Some((key, key_type)) = Self::_separate_expire_key(expire_key.as_ref()) {
+                        expire_key_vals.push((key, key_type, v));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("{:?}", e);
+                }
+            }
+        }
+        log::info!("cleanup scan_prefix end ...");
+        for (key, key_type, v) in expire_key_vals {
+            match self._ttl3(key_type, key.as_slice(), v.as_ref()) {
+                Ok(None) => {
+                    match key_type {
+                        KeyType::Map => {
+                            if let Err(e) = self._map_remove(key) {
+                                log::warn!("{:?}", e);
+                            }
+                        }
+                        KeyType::List => {
+                            if let Err(e) = self._list_remove(key) {
+                                log::warn!("{:?}", e);
+                            }
+                        }
+                        KeyType::DB => {
+                            if let Err(e) = self._db_remove(key) {
+                                log::warn!("{:?}", e);
+                            }
+                        }
+                    }
+                    count += 1;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("{:?}", e);
+                }
+            }
+        }
+
+        count
+    }
+
+    #[cfg(feature = "ttl")]
+    #[inline]
+    pub fn cleanup_old(&self, limit: usize) -> usize {
+        let mut count = 0;
         for item in self.db.scan_prefix(EXPIRE_AT_KEY_PREFIX) {
             if count > limit {
                 break;
@@ -508,6 +573,11 @@ impl SledStorageDB {
             }
         }
         count
+    }
+
+    #[inline]
+    pub fn active_count(&self) -> isize {
+        self.active_count.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -580,7 +650,6 @@ impl SledStorageDB {
         [MAP_NAME_PREFIX, name.as_ref(), MAP_KEY_SEPARATOR].concat()
     }
 
-    #[cfg(feature = "map_len")]
     #[inline]
     fn make_map_count_key_name<K>(name: K) -> Key
     where
@@ -589,13 +658,11 @@ impl SledStorageDB {
         [MAP_NAME_PREFIX, name.as_ref(), MAP_KEY_COUNT_SUFFIX].concat()
     }
 
-    #[cfg(feature = "map_len")]
     #[inline]
     fn map_count_key_to_name(key: &[u8]) -> &[u8] {
         key[MAP_NAME_PREFIX.len()..key.as_ref().len() - MAP_KEY_COUNT_SUFFIX.len()].as_ref()
     }
 
-    #[cfg(feature = "map_len")]
     #[inline]
     fn is_map_count_key(key: &[u8]) -> bool {
         key.starts_with(MAP_NAME_PREFIX) && key.ends_with(MAP_KEY_COUNT_SUFFIX)
@@ -625,6 +692,12 @@ impl SledStorageDB {
     }
 
     #[inline]
+    fn make_list_count_key(name: &[u8]) -> Vec<u8> {
+        let list_count_key = [LIST_NAME_PREFIX, name, LIST_KEY_COUNT_SUFFIX].concat();
+        list_count_key
+    }
+
+    #[inline]
     fn list_count_key_to_name(key: &[u8]) -> &[u8] {
         key[LIST_NAME_PREFIX.len()..key.as_ref().len() - LIST_KEY_COUNT_SUFFIX.len()].as_ref()
     }
@@ -646,25 +719,14 @@ impl SledStorageDB {
 
     #[inline]
     fn _map_contains_key<K: AsRef<[u8]> + Sync + Send>(tree: &Tree, key: K) -> Result<bool> {
-        let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(key.as_ref());
-        let is_empty = tree
-            .scan_prefix(map_item_prefix_name.as_slice())
-            .next()
-            .is_none();
-        Ok(!is_empty)
+        let count_key = SledStorageDB::make_map_count_key_name(key.as_ref());
+        Ok(tree.contains_key(count_key)?)
     }
 
     #[inline]
-    fn _list_contains_key<K: AsRef<[u8]> + Sync + Send>(tree: &Tree, key: K) -> Result<bool> {
-        let prefix_name = SledStorageDB::make_list_prefix(key.as_ref());
-        let list_content_prefix =
-            SledStorageList::make_list_content_prefix(prefix_name.as_slice(), None);
-        let is_empty = tree
-            .scan_prefix(list_content_prefix)
-            .keys()
-            .next()
-            .is_none();
-        Ok(!is_empty)
+    fn _list_contains_key<K: AsRef<[u8]> + Sync + Send>(tree: &Tree, name: K) -> Result<bool> {
+        let count_key = SledStorageDB::make_list_count_key(name.as_ref());
+        Ok(tree.contains_key(count_key)?)
     }
 
     #[inline]
@@ -672,7 +734,7 @@ impl SledStorageDB {
     where
         K: AsRef<[u8]>,
     {
-        self.map(key.as_ref())._clear()?;
+        self._map(key.as_ref())._clear()?;
         #[cfg(feature = "ttl")]
         Self::_remove_expire_key(self.db.as_ref(), key.as_ref(), EXPIRE_AT_KEY_SUFFIX_MAP)
             .map_err(|e| anyhow!(format!("{:?}", e)))?;
@@ -724,13 +786,6 @@ impl SledStorageDB {
         b.remove(expire_key);
     }
 
-    // #[inline]
-    // fn _list_is_expired(&self, name: &[u8]) -> Result<bool> {
-    //     self._is_expired(name, EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-    //         SledStorageDB::_list_contains_key(&self.list_tree, k)
-    //     })
-    // }
-
     #[inline]
     fn _is_expired<K, F>(&self, _key: K, _suffix: &[u8], _contains_key_f: F) -> Result<bool>
     where
@@ -777,10 +832,6 @@ impl SledStorageDB {
     {
         let ttl_res = match self.db.get(expire_key) {
             Ok(Some(v)) => {
-                // println!(
-                //     "expire_ttl is {:?}",
-                //     TimestampMillis::from_be_bytes(v.as_ref().try_into()?)
-                // );
                 if contains_key_f(c_key.as_ref())? {
                     Ok(Some(TimestampMillis::from_be_bytes(v.as_ref().try_into()?)))
                 } else {
@@ -788,7 +839,6 @@ impl SledStorageDB {
                 }
             }
             Ok(None) => {
-                // println!("expire_ttl is None");
                 if contains_key_f(c_key.as_ref())? {
                     Ok(Some(TimestampMillis::MAX))
                 } else {
@@ -800,7 +850,6 @@ impl SledStorageDB {
 
         let ttl_res = if let Some(at) = ttl_res {
             let now = timestamp_millis();
-            // println!("at: {}, now: {}", at, now);
             if now > at {
                 //is expire
                 None
@@ -1090,6 +1139,11 @@ impl SledStorageDB {
             Ok(())
         }
     }
+
+    #[inline]
+    fn _map<N: AsRef<[u8]>>(&self, name: N) -> SledStorageMap {
+        SledStorageMap::_new(name.as_ref().to_vec(), self.clone())
+    }
 }
 
 #[async_trait]
@@ -1098,14 +1152,9 @@ impl StorageDB for SledStorageDB {
     type ListType = SledStorageList;
 
     #[inline]
-    fn map<N: AsRef<[u8]>>(&self, name: N) -> Self::MapType {
-        SledStorageMap::new(name.as_ref().to_vec(), self.clone())
-    }
-
-    #[inline]
-    async fn map_expire<V: AsRef<[u8]> + Sync + Send>(
+    async fn map<N: AsRef<[u8]> + Sync + Send>(
         &self,
-        name: V,
+        name: N,
         expire: Option<TimestampMillis>,
     ) -> Result<Self::MapType> {
         SledStorageMap::new_expire(name.as_ref().to_vec(), expire, self.clone()).await
@@ -1399,47 +1448,48 @@ impl StorageDB for SledStorageDB {
     #[inline]
     async fn info(&self) -> Result<Value> {
         let active_count = self.active_count.load(Ordering::Relaxed);
-        let this = self.clone();
+        // let this = self.clone();
         Ok(spawn_blocking(move || {
             // let size_on_disk = this.db.size_on_disk().unwrap_or_default();
             // let db_size = this.db_size();
             // let map_size = this.map_size();
             // let list_size = this.list_size();
 
-            let limit = 20;
+            // let limit = 20;
 
-            let mut db_keys = Vec::new();
-            for (i, key) in this.db.iter().keys().enumerate() {
-                let key = key
-                    .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
-                    .unwrap_or_else(|e| e.to_string());
-                db_keys.push(key);
-                if i > limit {
-                    break;
-                }
-            }
+            // let mut db_keys = Vec::new();
+            // for (i, key) in this.db.iter().keys().enumerate() {
+            //     let key = key
+            //         .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+            //         .unwrap_or_else(|e| e.to_string());
+            //     db_keys.push(key);
+            //     if i > limit {
+            //         break;
+            //     }
+            // }
 
-            let mut map_names = Vec::new();
-            for (i, key) in this.map_tree.iter().keys().enumerate() {
-                let key = key
-                    .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
-                    .unwrap_or_else(|e| e.to_string());
-                map_names.push(key);
-                if i > limit {
-                    break;
-                }
-            }
+            // let mut map_names = Vec::new();
+            // for (i, key) in this.map_tree.iter().keys().enumerate() {
+            //     let key = key
+            //         .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+            //         .unwrap_or_else(|e| e.to_string());
+            //     map_names.push(key);
+            //     if i > limit {
+            //         break;
+            //     }
+            // }
 
-            let mut list_names = Vec::new();
-            for (i, key) in this.list_tree.iter().keys().enumerate() {
-                let key = key
-                    .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
-                    .unwrap_or_else(|e| e.to_string());
-                list_names.push(key);
-                if i > limit {
-                    break;
-                }
-            }
+            // let mut list_names = Vec::new();
+            // for (i, key) in this.list_tree.iter().keys().enumerate() {
+            //     let key = key
+            //         .map(|k| String::from_utf8_lossy(k.as_ref()).to_string())
+            //         .unwrap_or_else(|e| e.to_string());
+            //     list_names.push(key);
+            //     if i > limit {
+            //         break;
+            //     }
+            // }
+
             serde_json::json!({
                 "storage_engine": "Sled",
                 "active_count": active_count,
@@ -1447,9 +1497,9 @@ impl StorageDB for SledStorageDB {
                 // "map_size": map_size,
                 // "list_size": list_size,
                 // "size_on_disk": size_on_disk,
-                "db_keys": db_keys,
-                "map_names": map_names,
-                "list_names": list_names,
+                // "db_keys": db_keys,
+                // "map_names": map_names,
+                // "list_names": list_names,
             })
         })
         .await?)
@@ -1461,40 +1511,52 @@ pub struct SledStorageMap {
     name: Key,
     map_prefix_name: Key,
     map_item_prefix_name: Key,
-    #[cfg(feature = "map_len")]
     map_count_key_name: Key,
+    empty: Arc<AtomicBool>,
     pub(crate) db: SledStorageDB,
 }
 
 impl SledStorageMap {
     #[inline]
-    fn new(name: Key, db: SledStorageDB) -> Self {
+    async fn new_expire(
+        name: Key,
+        expire_ms: Option<TimestampMillis>,
+        db: SledStorageDB,
+    ) -> Result<Self> {
+        let (tx, rx) = oneshot::channel();
+        db.cmd_send(Command::DBMapNew(db.clone(), name.into(), expire_ms, tx))
+            .await?;
+        Ok(rx.await??)
+    }
+
+    #[inline]
+    async fn _new_expire(
+        name: Key,
+        expire_ms: Option<TimestampMillis>,
+        db: SledStorageDB,
+    ) -> Result<Self> {
+        let m = Self::_new(name, db);
+        m.empty.store(m._is_empty()?, Ordering::SeqCst);
+        #[cfg(feature = "ttl")]
+        if let Some(expire_ms) = expire_ms.as_ref() {
+            m._expire_at(timestamp_millis() + *expire_ms)?;
+        }
+        Ok(m)
+    }
+
+    #[inline]
+    fn _new(name: Key, db: SledStorageDB) -> Self {
         let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_slice());
         let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_slice());
-        #[cfg(feature = "map_len")]
         let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_slice());
         SledStorageMap {
             name,
             map_prefix_name,
             map_item_prefix_name,
-            #[cfg(feature = "map_len")]
             map_count_key_name,
+            empty: Arc::new(AtomicBool::new(true)),
             db,
         }
-    }
-
-    #[inline]
-    async fn new_expire(
-        name: Key,
-        _expire_ms: Option<TimestampMillis>,
-        db: SledStorageDB,
-    ) -> Result<Self> {
-        let m = Self::new(name, db);
-        #[cfg(feature = "ttl")]
-        if let Some(expire_ms) = _expire_ms.as_ref() {
-            m._expire_at(timestamp_millis() + *expire_ms)?;
-        }
-        Ok(m)
     }
 
     #[inline]
@@ -1606,6 +1668,18 @@ impl SledStorageMap {
     }
 
     #[inline]
+    fn _counter_init(&self) -> Result<()> {
+        let tree = self.tree();
+        if !tree.contains_key(self.map_count_key_name.as_slice())? {
+            tree.insert(
+                self.map_count_key_name.as_slice(),
+                0isize.to_be_bytes().as_slice(),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn _clear(&self) -> Result<()> {
         let mut batch = Batch::default();
         //clear key-value
@@ -1620,6 +1694,7 @@ impl SledStorageMap {
             }
         }
         self.tree().apply_batch(batch)?;
+        self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1627,7 +1702,6 @@ impl SledStorageMap {
     fn _insert(&self, key: IVec, val: IVec) -> Result<()> {
         let item_key = self.make_map_item_key(key.as_ref());
         let this = self;
-
         #[cfg(feature = "map_len")]
         {
             let count_key = this.map_count_key_name.as_slice();
@@ -1641,7 +1715,13 @@ impl SledStorageMap {
                 .map_err(|e| anyhow!(format!("{:?}", e)))?;
         }
         #[cfg(not(feature = "map_len"))]
-        this.tree().insert(item_key.as_slice(), val.as_ref())?;
+        {
+            if self.empty.load(Ordering::SeqCst) {
+                self._counter_init()?;
+                self.empty.store(false, Ordering::SeqCst)
+            }
+            this.tree().insert(item_key.as_slice(), val.as_ref())?;
+        }
 
         #[cfg(feature = "ttl")]
         {
@@ -1861,16 +1941,12 @@ impl SledStorageMap {
         let expire_key =
             SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP);
         let res = {
-            // if SledStorageDB::_map_contains_key(this.tree(), this.name.as_slice())? {
             let at_bytes = at.to_be_bytes();
             this.db
                 .db
                 .insert(expire_key, at_bytes.as_slice())
                 .map_err(|e| anyhow!(e))
                 .map(|_| true)
-            // } else {
-            //     Ok(false)
-            // }
         }?;
         Ok(res)
     }
@@ -2665,16 +2741,12 @@ impl SledStorageList {
         let expire_key =
             SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST);
         let res = {
-            //if SledStorageDB::_list_contains_key(this.tree(), this.name.as_slice())? {
             let at_bytes = at.to_be_bytes();
             this.db
                 .db
                 .insert(expire_key, at_bytes.as_slice())
                 .map_err(|e| anyhow!(e))
                 .map(|_| true)
-            // } else {
-            //     Ok(false)
-            // }
         }?;
         Ok(res)
     }
@@ -3097,8 +3169,6 @@ where
 pub struct AsyncMapIter<'a> {
     db: &'a SledStorageDB,
     iter: Option<sled::Iter>,
-    #[cfg(not(feature = "map_len"))]
-    names: Arc<dashmap::DashSet<sled::IVec>>,
 }
 
 impl<'a> AsyncMapIter<'a> {
@@ -3106,8 +3176,6 @@ impl<'a> AsyncMapIter<'a> {
         Self {
             db,
             iter: Some(iter),
-            #[cfg(not(feature = "map_len"))]
-            names: Arc::new(dashmap::DashSet::new()),
         }
     }
 }
@@ -3143,28 +3211,12 @@ impl<'a> AsyncIterator for AsyncMapIter<'a> {
                 None => return None,
                 Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
-                    #[cfg(feature = "map_len")]
-                    {
-                        if !SledStorageDB::is_map_count_key(k.as_ref()) {
-                            continue;
-                        }
-                        self.iter = Some(iter);
-                        let name = SledStorageDB::map_count_key_to_name(k.as_ref());
-                        return Some(Ok(StorageMap::Sled(self.db.map(name))));
-                    }
-
-                    #[cfg(not(feature = "map_len"))]
-                    if let Some(name) = SledStorageDB::map_item_key_to_name(k.as_ref()) {
-                        if self.names.contains(name) {
-                            continue;
-                        } else {
-                            self.iter = Some(iter);
-                            self.names.insert(name.into());
-                            return Some(Ok(StorageMap::Sled(self.db.map(name))));
-                        }
-                    } else {
+                    if !SledStorageDB::is_map_count_key(k.as_ref()) {
                         continue;
                     }
+                    self.iter = Some(iter);
+                    let name = SledStorageDB::map_count_key_to_name(k.as_ref());
+                    return Some(Ok(StorageMap::Sled(self.db._map(name))));
                 }
             }
         }
