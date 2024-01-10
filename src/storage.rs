@@ -51,9 +51,7 @@ pub trait StorageDB: Send + Sync {
 
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
-    fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType;
-
-    async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+    async fn list<V: AsRef<[u8]> + Sync + Send>(
         &self,
         name: V,
         expire: Option<TimestampMillis>,
@@ -294,22 +292,14 @@ impl DefaultStorageDB {
     }
 
     #[inline]
-    pub fn list<V: AsRef<[u8]>>(&self, name: V) -> StorageList {
-        match self {
-            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name)),
-            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name)),
-        }
-    }
-
-    #[inline]
-    pub async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+    pub async fn list<V: AsRef<[u8]> + Sync + Send>(
         &self,
         name: V,
         expire: Option<TimestampMillis>,
     ) -> Result<StorageList> {
         Ok(match self {
-            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list_expire(name, expire).await?),
-            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list_expire(name, expire).await?),
+            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name, expire).await?),
+            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name, expire).await?),
         })
     }
 

@@ -178,13 +178,7 @@ impl StorageDB for RedisStorageDB {
     }
 
     #[inline]
-    fn list<V: AsRef<[u8]>>(&self, name: V) -> Self::ListType {
-        let full_name = self.make_list_full_name(name.as_ref());
-        RedisStorageList::new(name.as_ref().to_vec(), full_name, self.clone())
-    }
-
-    #[inline]
-    async fn list_expire<V: AsRef<[u8]> + Sync + Send>(
+    async fn list<V: AsRef<[u8]> + Sync + Send>(
         &self,
         name: V,
         expire: Option<TimestampMillis>,

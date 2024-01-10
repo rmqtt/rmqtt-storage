@@ -182,7 +182,7 @@ mod tests {
         }
 
         for i in 0..max {
-            let list = db.list(format!("list_{}", i));
+            let list = db.list(format!("list_{}", i), None).await.unwrap();
             list.push(&1).await.unwrap();
             list.push(&2).await.unwrap();
             list.expire(100).await.unwrap();
@@ -238,7 +238,7 @@ mod tests {
         );
         assert_eq!(k_9999_val, Some(9999));
 
-        let s_l_1 = db.list("s_l_1");
+        let s_l_1 = db.list("s_l_1", None).await.unwrap();
         s_l_1.clear().await.unwrap();
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
@@ -265,7 +265,7 @@ mod tests {
 
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
-            let s_l = db.list(format!("s_l_{}", i));
+            let s_l = db.list(format!("s_l_{}", i), None).await.unwrap();
             s_l.push(&i).await.unwrap();
         }
         println!("s_l, cost time: {:?}", now.elapsed());
@@ -293,7 +293,7 @@ mod tests {
         let res = m_1.expire(1500).await.unwrap();
         println!("m_1 expire res: {:?}", res);
 
-        let l_1 = db.list("l_1");
+        let l_1 = db.list("l_1", None).await.unwrap();
         l_1.clear().await.unwrap();
         l_1.push(&11).await.unwrap();
         l_1.push(&22).await.unwrap();
@@ -365,7 +365,7 @@ mod tests {
         );
         assert!(!db.map_contains_key("map_2").await.unwrap());
 
-        let list_1 = db.list("list_1");
+        let list_1 = db.list("list_1", None).await.unwrap();
         list_1.clear().await.unwrap();
         println!(
             "test_db_insert contains_key(list_1) {:?}",
@@ -437,7 +437,7 @@ mod tests {
         let c_res = db.map_contains_key("map_001").await.unwrap();
         assert!(!c_res);
 
-        let l1 = db.list("list_001");
+        let l1 = db.list("list_001", None).await.unwrap();
         l1.push(&"aa").await.unwrap();
         l1.push(&"bb").await.unwrap();
         assert_eq!(l1.is_empty().await.unwrap(), false);
@@ -458,7 +458,7 @@ mod tests {
         #[cfg(feature = "map_len")]
         assert_eq!(map_002.len().await.unwrap(), 0);
 
-        let list_002 = db.list("list_002");
+        let list_002 = db.list("list_002", None).await.unwrap();
         let c_res = db.list_contains_key("list_002").await.unwrap();
         assert!(!c_res);
         assert_eq!(list_002.is_empty().await.unwrap(), true);
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(db.map_contains_key("ttl_001").await.unwrap(), true);
 
         //-----------------------------------------------------------------------------
-        let mut l_ttl_001 = db.list("l_ttl_001");
+        let mut l_ttl_001 = db.list("l_ttl_001", None).await.unwrap();
         l_ttl_001.clear().await.unwrap();
         let l_ttl_001_res_none = l_ttl_001.ttl().await.unwrap();
         println!(
@@ -1035,9 +1035,9 @@ mod tests {
         let cfg = get_cfg("array");
         let db = init_db(&cfg).await.unwrap();
 
-        let array_a = db.list("array_a");
-        let array_b = db.list("array_b");
-        let mut array_c = db.list("array_c");
+        let array_a = db.list("array_a", None).await.unwrap();
+        let array_b = db.list("array_b", None).await.unwrap();
+        let mut array_c = db.list("array_c", None).await.unwrap();
 
         array_a.clear().await.unwrap();
         array_b.clear().await.unwrap();
@@ -1109,7 +1109,7 @@ mod tests {
         assert_eq!(ml001.len().await.unwrap(), 0);
         assert_eq!(ml001.is_empty().await.unwrap(), true);
 
-        let mut l001 = db.list("l_001");
+        let mut l001 = db.list("l_001", None).await.unwrap();
         l001.clear().await.unwrap();
         assert_eq!(l001.len().await.unwrap(), 0);
         assert_eq!(l001.is_empty().await.unwrap(), true);
@@ -1154,7 +1154,7 @@ mod tests {
             l001.push_limit(&v, 5, true).await.unwrap();
         }
 
-        let l002 = db.list("l_002");
+        let l002 = db.list("l_002", None).await.unwrap();
         for v in 20..30 {
             l002.push_limit(&v, 5, true).await.unwrap();
         }
@@ -1183,9 +1183,9 @@ mod tests {
         let cfg = get_cfg("list_iter");
         let mut db = init_db(&cfg).await.unwrap();
 
-        let l1 = db.list("l1");
-        let l2 = db.list("l2");
-        let l3 = db.list("l3");
+        let l1 = db.list("l1", None).await.unwrap();
+        let l2 = db.list("l2", None).await.unwrap();
+        let l3 = db.list("l3", None).await.unwrap();
         l1.clear().await.unwrap();
         l2.clear().await.unwrap();
         l3.clear().await.unwrap();
@@ -1314,7 +1314,7 @@ mod tests {
     async fn test_list_pushs() {
         let cfg = get_cfg("list_pushs");
         let db = init_db(&cfg).await.unwrap();
-        let l11 = db.list("l11");
+        let l11 = db.list("l11", None).await.unwrap();
         l11.clear().await.unwrap();
         let mut vals = Vec::new();
         for i in 0..10 {
@@ -1346,7 +1346,7 @@ mod tests {
     async fn test_list_pop() {
         let cfg = get_cfg("list_pop");
         let db = init_db(&cfg).await.unwrap();
-        let l11 = db.list("l11");
+        let l11 = db.list("l11", None).await.unwrap();
         l11.clear().await.unwrap();
         for i in 0..10 {
             l11.push(&i).await.unwrap();
