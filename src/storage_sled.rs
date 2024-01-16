@@ -1462,12 +1462,12 @@ impl StorageDB for SledStorageDB {
     #[inline]
     async fn info(&self) -> Result<Value> {
         let active_count = self.active_count.load(Ordering::Relaxed);
-        let this = self.clone();
+        // let this = self.clone();
         Ok(spawn_blocking(move || {
-            let size_on_disk = this.db.size_on_disk().unwrap_or_default();
-            let db_size = this.db_size();
-            let map_size = this.map_size();
-            let list_size = this.list_size();
+            // let size_on_disk = this.db.size_on_disk().unwrap_or_default();
+            // let db_size = this.db_size();
+            // let map_size = this.map_size();
+            // let list_size = this.list_size();
 
             // let limit = 20;
 
@@ -1507,10 +1507,10 @@ impl StorageDB for SledStorageDB {
             serde_json::json!({
                 "storage_engine": "Sled",
                 "active_count": active_count,
-                "db_size": db_size,
-                "map_size": map_size,
-                "list_size": list_size,
-                "size_on_disk": size_on_disk,
+                // "db_size": db_size,
+                // "map_size": map_size,
+                // "list_size": list_size,
+                // "size_on_disk": size_on_disk,
                 // "db_keys": db_keys,
                 // "map_names": map_names,
                 // "list_names": list_names,
