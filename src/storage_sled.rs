@@ -174,26 +174,32 @@ fn def_cleanup(_db: &SledStorageDB) {
     {
         let db = _db.clone();
         std::thread::spawn(move || {
-            let limit = 1000;
+            let limit = 500;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                std::thread::sleep(std::time::Duration::from_secs(10));
                 let mut total_cleanups = 0;
                 let now = std::time::Instant::now();
                 loop {
+                    let now = std::time::Instant::now();
                     let count = db.cleanup(limit);
                     total_cleanups += count;
                     if count > 0 {
                         log::debug!(
                             "def_cleanup: {}, total cleanups: {}, active_count(): {}, cost time: {:?}",
                             count,
-                            total_cleanups,  db.active_count(),
+                            total_cleanups,
+                            db.active_count(),
                             now.elapsed()
                         );
                     }
                     if count < limit {
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if db.active_count() > 50 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(0));
+                    }
                 }
                 if now.elapsed().as_secs() > 3 {
                     log::info!(
@@ -1456,12 +1462,12 @@ impl StorageDB for SledStorageDB {
     #[inline]
     async fn info(&self) -> Result<Value> {
         let active_count = self.active_count.load(Ordering::Relaxed);
-        // let this = self.clone();
+        let this = self.clone();
         Ok(spawn_blocking(move || {
-            // let size_on_disk = this.db.size_on_disk().unwrap_or_default();
-            // let db_size = this.db_size();
-            // let map_size = this.map_size();
-            // let list_size = this.list_size();
+            let size_on_disk = this.db.size_on_disk().unwrap_or_default();
+            let db_size = this.db_size();
+            let map_size = this.map_size();
+            let list_size = this.list_size();
 
             // let limit = 20;
 
@@ -1501,10 +1507,10 @@ impl StorageDB for SledStorageDB {
             serde_json::json!({
                 "storage_engine": "Sled",
                 "active_count": active_count,
-                // "db_size": db_size,
-                // "map_size": map_size,
-                // "list_size": list_size,
-                // "size_on_disk": size_on_disk,
+                "db_size": db_size,
+                "map_size": map_size,
+                "list_size": list_size,
+                "size_on_disk": size_on_disk,
                 // "db_keys": db_keys,
                 // "map_names": map_names,
                 // "list_names": list_names,
