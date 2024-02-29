@@ -98,6 +98,7 @@ enum Command {
     ),
     DBMapPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
     DBListPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
+    DBScanIter(SledStorageDB, Vec<u8>, oneshot::Sender<sled::Iter>),
 
     MapInsert(SledStorageMap, IVec, IVec, oneshot::Sender<Result<()>>),
     MapGet(SledStorageMap, IVec, oneshot::Sender<Result<Option<IVec>>>),
@@ -497,6 +498,9 @@ impl SledStorageDB {
                         Command::DBListPrefixIter(db, res_tx) => {
                             res_tx.send(db._list_scan_prefix()).map_err(|_| err)
                         }
+                        Command::DBScanIter(db, pattern, res_tx) => {
+                            res_tx.send(db._db_scan_prefix(pattern)).map_err(|_| err)
+                        }
 
                         Command::MapInsert(map, key, val, res_tx) => {
                             res_tx.send(map._insert(key, val)).map_err(|_| err)
@@ -727,6 +731,11 @@ impl SledStorageDB {
         K: AsRef<[u8]>,
     {
         [EXPIRE_AT_KEY_PREFIX, key.as_ref(), suffix].concat()
+    }
+
+    #[inline]
+    fn is_db_expire_key(key: &[u8]) -> bool {
+        key.starts_with(EXPIRE_AT_KEY_PREFIX) && key.ends_with(EXPIRE_AT_KEY_SUFFIX_DB)
     }
 
     #[inline]
@@ -1255,6 +1264,43 @@ impl SledStorageDB {
     }
 
     #[inline]
+    fn _db_scan_prefix(&self, pattern: Vec<u8>) -> sled::Iter {
+        let mut last_esc_char = false;
+        let mut has_esc_char = false;
+        let start_pattern = pattern
+            .splitn(2, |x| {
+                if !last_esc_char && (*x == b'*' || *x == b'?') {
+                    true
+                } else {
+                    last_esc_char = *x == b'\\';
+                    if last_esc_char && !has_esc_char {
+                        has_esc_char = true;
+                    }
+                    false
+                }
+            })
+            .next();
+        let start_pattern = if has_esc_char {
+            start_pattern.map(|start_pattern| {
+                Cow::Owned(
+                    start_pattern
+                        .replace(b"\\*", b"*")
+                        .as_slice()
+                        .replace(b"\\?", b"?"),
+                )
+            })
+        } else {
+            start_pattern.map(Cow::Borrowed)
+        };
+        let iter = if let Some(start_pattern) = start_pattern {
+            self.db.scan_prefix(start_pattern.as_ref())
+        } else {
+            self.db.iter()
+        };
+        iter
+    }
+
+    #[inline]
     async fn cmd_send(&self, cmd: Command) -> Result<()> {
         self.active_count.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.cmd_tx.send(cmd).await {
@@ -1583,41 +1629,11 @@ impl StorageDB for SledStorageDB {
         P: AsRef<[u8]> + Send + Sync,
     {
         let pattern = pattern.as_ref();
-        let mut last_esc_char = false;
-        let mut has_esc_char = false;
-        let start_pattern = pattern
-            .splitn(2, |x| {
-                if !last_esc_char && (*x == b'*' || *x == b'?') {
-                    true
-                } else {
-                    last_esc_char = *x == b'\\';
-                    if last_esc_char && !has_esc_char {
-                        has_esc_char = true;
-                    }
-                    false
-                }
-            })
-            .next();
-        let start_pattern = if has_esc_char {
-            start_pattern.map(|start_pattern| {
-                Cow::Owned(
-                    start_pattern
-                        .replace(b"\\*", b"*")
-                        .as_slice()
-                        .replace(b"\\?", b"?"),
-                )
-            })
-        } else {
-            start_pattern.map(Cow::Borrowed)
-        };
-        let iter = if let Some(start_pattern) = start_pattern {
-            self.db.scan_prefix(start_pattern.as_ref())
-        } else {
-            self.db.iter()
-        };
-
+        let (tx, rx) = oneshot::channel();
+        self.cmd_send(Command::DBScanIter(self.clone(), pattern.to_vec(), tx))
+            .await?;
+        let iter = rx.await?;
         let pattern = Pattern::from(pattern);
-
         let iter = Box::new(AsyncDbKeyIter {
             db: self,
             pattern,
@@ -3500,6 +3516,10 @@ impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
                 None => None,
                 Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
+                    if SledStorageDB::is_db_expire_key(k.as_ref()) {
+                        continue;
+                    }
+
                     if !is_match(self.pattern.clone(), k.as_ref()) {
                         continue;
                     }
