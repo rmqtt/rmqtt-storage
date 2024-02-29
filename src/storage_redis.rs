@@ -90,6 +90,11 @@ impl RedisStorageDB {
     }
 
     #[inline]
+    fn make_scan_pattern_match<P: AsRef<[u8]>>(&self, pattern: P) -> Key {
+        [KEY_PREFIX, self.prefix.as_slice(), pattern.as_ref()].concat()
+    }
+
+    #[inline]
     fn make_map_full_name<K>(&self, name: K) -> Key
     where
         K: AsRef<[u8]>,
@@ -326,6 +331,26 @@ impl StorageDB for RedisStorageDB {
     }
 
     #[inline]
+    async fn db_size(&self) -> Result<i64> {
+        let mut async_conn = self.async_conn();
+        //DBSIZE
+        let dbsize = redis::pipe()
+            .cmd("DBSIZE")
+            .query_async::<_, redis::Value>(&mut async_conn)
+            .await?;
+        let dbsize = dbsize.as_sequence().and_then(|vs| {
+            vs.iter().next().and_then(|v| {
+                if let redis::Value::Int(v) = v {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+        });
+        Ok(dbsize.unwrap_or(-1))
+    }
+
+    #[inline]
     #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
@@ -386,6 +411,25 @@ impl StorageDB for RedisStorageDB {
         let iter = AsyncListIter {
             db: self.clone(),
             iter: self.async_conn_mut().scan_match::<_, Key>(pattern).await?,
+        };
+        Ok(Box::new(iter))
+    }
+
+    async fn scan<'a, P>(
+        &'a mut self,
+        pattern: P,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>>
+    where
+        P: AsRef<[u8]> + Send + Sync,
+    {
+        let pattern = self.make_scan_pattern_match(pattern);
+        let prefix_len = KEY_PREFIX.len() + self.prefix.len();
+        let iter = AsyncDbKeyIter {
+            prefix_len,
+            iter: self
+                .async_conn_mut()
+                .scan_match::<_, Key>(pattern.as_slice())
+                .await?,
         };
         Ok(Box::new(iter))
     }
@@ -1211,6 +1255,23 @@ where
             Ok(v) => Ok((key, v)),
             Err(e) => Err(anyhow::Error::new(e)),
         })
+    }
+}
+
+pub struct AsyncDbKeyIter<'a> {
+    prefix_len: usize,
+    iter: redis::AsyncIter<'a, Key>,
+}
+
+#[async_trait]
+impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
+    type Item = Result<Key>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        self.iter
+            .next_item()
+            .await
+            .map(|key| Ok(key[self.prefix_len..].to_vec()))
     }
 }
 

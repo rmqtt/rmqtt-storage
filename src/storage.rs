@@ -101,6 +101,8 @@ pub trait StorageDB: Send + Sync {
 
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
+    async fn db_size(&self) -> Result<i64>;
+
     #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
@@ -123,6 +125,14 @@ pub trait StorageDB: Send + Sync {
     async fn list_iter<'a>(
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>>;
+
+    //pattern - * or ?
+    async fn scan<'a, P>(
+        &'a mut self,
+        pattern: P,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>>
+    where
+        P: AsRef<[u8]> + Send + Sync;
 
     async fn info(&self) -> Result<serde_json::Value>;
 }
@@ -421,6 +431,14 @@ impl DefaultStorageDB {
     }
 
     #[inline]
+    pub async fn db_size(&self) -> Result<i64> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.db_size().await,
+            DefaultStorageDB::Redis(db) => db.db_size().await,
+        }
+    }
+
+    #[inline]
     pub async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self {
             DefaultStorageDB::Sled(db) => db.contains_key(key).await,
@@ -481,6 +499,20 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.list_iter().await,
             DefaultStorageDB::Redis(db) => db.list_iter().await,
+        }
+    }
+
+    #[inline]
+    pub async fn scan<'a, P>(
+        &'a mut self,
+        pattern: P,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>>
+    where
+        P: AsRef<[u8]> + Send + Sync,
+    {
+        match self {
+            DefaultStorageDB::Sled(db) => db.scan(pattern).await,
+            DefaultStorageDB::Redis(db) => db.scan(pattern).await,
         }
     }
 

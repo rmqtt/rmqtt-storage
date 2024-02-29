@@ -101,6 +101,7 @@ pub(crate) fn timestamp_millis() -> TimestampMillis {
 mod tests {
     use super::storage::*;
     use super::*;
+    use std::borrow::Cow;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -192,7 +193,7 @@ mod tests {
 
         println!(
             "db_size: {:?}, map_size: {}, list_size: {}",
-            db.db_size(),
+            db.db_size().await,
             db.map_size(),
             db.list_size()
         );
@@ -200,7 +201,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         println!(
             "db_size: {:?}, map_size: {}, list_size: {}",
-            db.db_size(),
+            db.db_size().await,
             db.map_size(),
             db.list_size()
         );
@@ -1427,6 +1428,7 @@ mod tests {
     }
 
     #[tokio::main]
+    #[allow(dead_code)]
     // #[test]
     async fn test_map_expire() {
         let cfg = get_cfg("map_expire");
@@ -1503,38 +1505,11 @@ mod tests {
             });
         }
 
-        // for x in 0..500 {
-        //     let db = db.clone();
-        //     tokio::spawn(async move {
-        //         for i in 0..10_000 {
-        //             let map = db.map(format!("map_{}_{}", x, i));
-        //
-        //             if let Err(e) = map.insert(format!("k1_{}", i), &i).await {
-        //                 println!("insert {:?}", e);
-        //             }
-        //             sleep(Duration::from_millis(0)).await;
-        //             if let Err(e) = map.expire(1000 * 60).await {
-        //                 println!("expire {:?}", e);
-        //             }
-        //             sleep(Duration::from_millis(0)).await;
-        //             if let Err(e) = map.insert(format!("k2_{}", i), &i).await {
-        //                 println!("insert {:?}", e);
-        //             }
-        //             sleep(Duration::from_millis(0)).await;
-        //             if let Err(e) = map.insert(format!("k3_{}", i), &i).await {
-        //                 println!("insert {:?}", e);
-        //             }
-        //             sleep(Duration::from_millis(0)).await;
-        //             // println!("len: {:?}", db.info().await);
-        //         }
-        //         println!("********************* end {:?}", x);
-        //     });
-        // }
-
         sleep(Duration::from_secs(100000)).await;
     }
 
     #[tokio::main]
+    #[allow(dead_code)]
     // #[test]
     async fn test_map_expire_list() {
         use super::{SledStorageDB, StorageDB};
@@ -1614,5 +1589,112 @@ mod tests {
             }
         }
         println!("c: {}, emptys: {}", c, emptys);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_db_size() {
+        let cfg = get_cfg("db_size");
+        let db = init_db(&cfg).await.unwrap();
+        db.insert("k1", &1).await.unwrap();
+        db.insert("k2", &2).await.unwrap();
+        db.insert("k3", &3).await.unwrap();
+        println!("test_db_size db_size: {:?}", db.db_size().await);
+        let m = db.map("map1", None).await.unwrap();
+        m.insert("mk1", &1).await.unwrap();
+        m.insert("mk2", &2).await.unwrap();
+        println!("test_db_size db_size: {:?}", db.db_size().await);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_scan() {
+        let cfg = get_cfg("scan");
+        let mut db = init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        println!("test_scan db_size: {:?}", db.db_size().await);
+        db.insert("foo/abcd/1", &1).await.unwrap();
+        db.insert("foo/abcd/2", &2).await.unwrap();
+        db.insert("foo/abcd/3", &3).await.unwrap();
+        db.insert("foo/abcd/**/4", &11).await.unwrap();
+        db.insert("foo/abcd/*/4", &22).await.unwrap();
+        db.insert("foo/abcd/*", &33).await.unwrap();
+        db.insert("iot/abcd/5/a", &5).await.unwrap();
+        db.insert("iot/abcd/6/b", &6).await.unwrap();
+        db.insert("iot/abcd/7/c", &7).await.unwrap();
+        db.insert("iot/abcd/", &8).await.unwrap();
+        db.insert("iot/abcd", &9).await.unwrap();
+
+        println!("test_scan db_size: {:?}", db.db_size().await);
+
+        let format_topic = |t: &str| -> Cow<'_, str> {
+            if t.len() == 1 {
+                if t == "#" || t == "+" {
+                    return Cow::Borrowed("*");
+                }
+            }
+
+            let t = t.replace("*", "\\*").replace("?", "\\?").replace("+", "*");
+
+            if t.len() > 1 && t.ends_with("/#") {
+                Cow::Owned([&t[0..(t.len() - 2)], "*"].concat())
+            } else {
+                Cow::Owned(t)
+            }
+        };
+
+        async fn collect(
+            mut iter: Box<dyn AsyncIterator<Item = Result<Key>> + Send + '_>,
+        ) -> Vec<Key> {
+            let mut data = Vec::new();
+            while let Some(key) = iter.next().await {
+                let key = key.unwrap();
+                println!(
+                    "test_scan next: key: {:?}",
+                    String::from_utf8_lossy(key.as_slice())
+                );
+                data.push(key)
+            }
+            data
+        }
+
+        //foo/abcd*
+        let topic = format_topic("foo/abcd/#");
+        println!("topic: {}", topic);
+        let iter = db.scan(topic.as_bytes()).await.unwrap();
+        assert_eq!(collect(iter).await.len(), 6);
+
+        //"foo/abcd/\\**"
+        let topic = format_topic("foo/abcd/*/#");
+        println!("---topic: {} {}---", topic, "foo/abcd/\\**");
+        let iter = db.scan(topic.as_bytes()).await.unwrap();
+        assert_eq!(collect(iter).await.len(), 3);
+
+        //"foo/abcd/\\*"
+        let topic = format_topic("foo/abcd/*");
+        println!("---topic: {} {}---", topic, "foo/abcd/\\*");
+        let iter = db.scan(topic.as_bytes()).await.unwrap();
+        assert_eq!(collect(iter).await.len(), 1);
+
+        //foo/abcd/*/*
+        let topic = format_topic("foo/abcd/+/#");
+        println!("---topic: {} {}---", topic, "foo/abcd/*/*");
+        let iter = db.scan(topic.as_bytes()).await.unwrap();
+        assert_eq!(collect(iter).await.len(), 6);
+
+        //iot/abcd*
+        let topic = format_topic("iot/abcd/#");
+        println!("---topic: {} {}---", topic, "iot/abcd*");
+        let iter = db.scan(topic.as_bytes()).await.unwrap();
+        assert_eq!(collect(iter).await.len(), 5);
+
+        //iot/abcd/+
+        let topic = format_topic("iot/abcd/+");
+        println!("---topic: {} {}---", topic, "iot/abcd/*");
+        let iter = db.scan(topic.as_bytes()).await.unwrap();
+        assert_eq!(collect(iter).await.len(), 4);
     }
 }

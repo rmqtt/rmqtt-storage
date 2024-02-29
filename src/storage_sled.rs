@@ -1,7 +1,9 @@
 use core::fmt;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
@@ -280,6 +282,120 @@ fn _decrement(old: Option<&[u8]>) -> Option<Vec<u8>> {
     };
 
     Some(number.to_be_bytes().to_vec())
+}
+
+#[derive(Clone)]
+pub struct Pattern(Arc<Vec<PatternChar>>);
+
+impl Deref for Pattern {
+    type Target = Vec<PatternChar>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<&str> for Pattern {
+    fn from(pattern: &str) -> Self {
+        Pattern::parse(pattern.as_bytes())
+    }
+}
+
+impl From<&[u8]> for Pattern {
+    fn from(pattern: &[u8]) -> Self {
+        Pattern::parse(pattern)
+    }
+}
+
+#[derive(Clone)]
+pub enum PatternChar {
+    Literal(u8),
+    Wildcard,
+    AnyChar,
+}
+
+impl Pattern {
+    pub fn parse(pattern: &[u8]) -> Self {
+        let mut parsed_pattern = Vec::new();
+        let mut chars = pattern.bytes().peekable();
+
+        while let Some(Ok(c)) = chars.next() {
+            if c == b'\\' {
+                if let Some(Ok(next_char)) = chars.next() {
+                    match next_char {
+                        b'?' => parsed_pattern.push(PatternChar::Literal(b'?')),
+                        b'*' => parsed_pattern.push(PatternChar::Literal(b'*')),
+                        _ => {
+                            parsed_pattern.push(PatternChar::Literal(b'\\'));
+                            parsed_pattern.push(PatternChar::Literal(next_char));
+                        }
+                    }
+                }
+            } else {
+                match c {
+                    b'?' => parsed_pattern.push(PatternChar::AnyChar),
+                    b'*' => parsed_pattern.push(PatternChar::Wildcard),
+                    _ => parsed_pattern.push(PatternChar::Literal(c)),
+                }
+            }
+        }
+
+        Pattern(Arc::new(parsed_pattern))
+    }
+}
+
+fn is_match<P: Into<Pattern>>(pattern: P, text: &[u8]) -> bool {
+    let pattern = pattern.into();
+    let text_chars = text;
+    let pattern_len = pattern.len();
+    let text_len = text_chars.len();
+
+    let mut dp = vec![vec![false; text_len + 1]; pattern_len + 1];
+    dp[0][0] = true;
+
+    for i in 1..=pattern_len {
+        if let PatternChar::Wildcard = pattern[i - 1] {
+            dp[i][0] = dp[i - 1][0];
+        }
+        for j in 1..=text_len {
+            match pattern[i - 1] {
+                PatternChar::Wildcard => {
+                    dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+                }
+                PatternChar::AnyChar | PatternChar::Literal(_) => {
+                    if let PatternChar::Literal(c) = pattern[i - 1] {
+                        dp[i][j] = (c == b'?' || c == text_chars[j - 1]) && dp[i - 1][j - 1];
+                    } else {
+                        dp[i][j] = dp[i - 1][j - 1];
+                    }
+                }
+            }
+        }
+    }
+
+    dp[pattern_len][text_len]
+}
+
+pub trait BytesReplace {
+    fn replace(self, from: &[u8], to: &[u8]) -> Vec<u8>;
+}
+
+impl BytesReplace for &[u8] {
+    fn replace(self, from: &[u8], to: &[u8]) -> Vec<u8> {
+        let input = self;
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            if input[i..].starts_with(from) {
+                result.extend_from_slice(to);
+                i += from.len();
+            } else {
+                result.push(input[i]);
+                i += 1;
+            }
+        }
+        result
+    }
 }
 
 #[derive(Clone)]
@@ -593,11 +709,6 @@ impl SledStorageDB {
     #[inline]
     pub fn active_count(&self) -> isize {
         self.active_count.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn db_size(&self) -> usize {
-        self.db.len()
     }
 
     #[inline]
@@ -1394,6 +1505,11 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
+    async fn db_size(&self) -> Result<i64> {
+        Ok(self.db.len() as i64)
+    }
+
+    #[inline]
     #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
     where
@@ -1454,6 +1570,57 @@ impl StorageDB for SledStorageDB {
         let iter = rx.await?;
         let iter = Box::new(AsyncListIter {
             db: self,
+            iter: Some(iter),
+        });
+        Ok(iter)
+    }
+
+    async fn scan<'a, P>(
+        &'a mut self,
+        pattern: P,
+    ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>>
+    where
+        P: AsRef<[u8]> + Send + Sync,
+    {
+        let pattern = pattern.as_ref();
+        let mut last_esc_char = false;
+        let mut has_esc_char = false;
+        let start_pattern = pattern
+            .splitn(2, |x| {
+                if !last_esc_char && (*x == b'*' || *x == b'?') {
+                    true
+                } else {
+                    last_esc_char = *x == b'\\';
+                    if last_esc_char && !has_esc_char {
+                        has_esc_char = true;
+                    }
+                    false
+                }
+            })
+            .next();
+        let start_pattern = if has_esc_char {
+            start_pattern.map(|start_pattern| {
+                Cow::Owned(
+                    start_pattern
+                        .replace(b"\\*", b"*")
+                        .as_slice()
+                        .replace(b"\\?", b"?"),
+                )
+            })
+        } else {
+            start_pattern.map(Cow::Borrowed)
+        };
+        let iter = if let Some(start_pattern) = start_pattern {
+            self.db.scan_prefix(start_pattern.as_ref())
+        } else {
+            self.db.iter()
+        };
+
+        let pattern = Pattern::from(pattern);
+
+        let iter = Box::new(AsyncDbKeyIter {
+            db: self,
+            pattern,
             iter: Some(iter),
         });
         Ok(iter)
@@ -3290,6 +3457,54 @@ impl<'a> AsyncIterator for AsyncListIter<'a> {
                     self.iter = Some(iter);
                     let name = SledStorageDB::list_count_key_to_name(k.as_ref());
                     Some(Ok(StorageList::Sled(self.db._list(name))))
+                }
+            };
+        }
+    }
+}
+
+pub struct AsyncDbKeyIter<'a> {
+    db: &'a SledStorageDB,
+    pattern: Pattern,
+    iter: Option<sled::Iter>,
+}
+
+impl<'a> Debug for AsyncDbKeyIter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AsyncDbKeyIter .. ").finish()
+    }
+}
+
+#[async_trait]
+impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
+    type Item = Result<Key>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        let mut iter = self.iter.take()?;
+        loop {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = self.db.cmd_send(Command::IterNext(iter, tx)).await {
+                return Some(Err(e));
+            }
+            let item = match rx.await {
+                Err(e) => {
+                    return Some(Err(anyhow::Error::new(e)));
+                }
+                Ok((it, item)) => {
+                    iter = it;
+                    item
+                }
+            };
+
+            return match item {
+                None => None,
+                Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+                Some(Ok((k, _))) => {
+                    if !is_match(self.pattern.clone(), k.as_ref()) {
+                        continue;
+                    }
+                    self.iter = Some(iter);
+                    Some(Ok(k.to_vec()))
                 }
             };
         }
