@@ -99,6 +99,7 @@ enum Command {
     DBMapPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
     DBListPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
     DBScanIter(SledStorageDB, Vec<u8>, oneshot::Sender<sled::Iter>),
+    DBSize(SledStorageDB, oneshot::Sender<usize>),
 
     MapInsert(SledStorageMap, IVec, IVec, oneshot::Sender<Result<()>>),
     MapGet(SledStorageMap, IVec, oneshot::Sender<Result<Option<IVec>>>),
@@ -501,6 +502,7 @@ impl SledStorageDB {
                         Command::DBScanIter(db, pattern, res_tx) => {
                             res_tx.send(db._db_scan_prefix(pattern)).map_err(|_| err)
                         }
+                        Command::DBSize(db, res_tx) => res_tx.send(db._db_size()).map_err(|_| err),
 
                         Command::MapInsert(map, key, val, res_tx) => {
                             res_tx.send(map._insert(key, val)).map_err(|_| err)
@@ -1301,6 +1303,11 @@ impl SledStorageDB {
     }
 
     #[inline]
+    fn _db_size(&self) -> usize {
+        self.db.len()
+    }
+
+    #[inline]
     async fn cmd_send(&self, cmd: Command) -> Result<()> {
         self.active_count.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = self.cmd_tx.send(cmd).await {
@@ -1551,8 +1558,17 @@ impl StorageDB for SledStorageDB {
     }
 
     #[inline]
-    async fn db_size(&self) -> Result<i64> {
-        Ok(self.db.len() as i64)
+    #[cfg(feature = "len")]
+    async fn len(&self) -> Result<usize> {
+        log::warn!("unimplemented!");
+        self.db_size().await
+    }
+
+    #[inline]
+    async fn db_size(&self) -> Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_send(Command::DBSize(self.clone(), tx)).await?;
+        Ok(rx.await?)
     }
 
     #[inline]

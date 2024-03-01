@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
+use redis::{pipe, AsyncCommands};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
@@ -12,10 +12,11 @@ use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 use crate::{Result, StorageList, StorageMap};
 
 #[allow(unused_imports)]
-use crate::TimestampMillis;
+use crate::{timestamp_millis, TimestampMillis};
 
 const SEPARATOR: &[u8] = b"@";
 const KEY_PREFIX: &[u8] = b"__rmqtt@";
+const KEY_PREFIX_LEN: &[u8] = b"__rmqtt_len@";
 const MAP_NAME_PREFIX: &[u8] = b"__rmqtt_map@";
 const LIST_NAME_PREFIX: &[u8] = b"__rmqtt_list@";
 
@@ -82,6 +83,12 @@ impl RedisStorageDB {
     }
 
     #[inline]
+    #[allow(dead_code)]
+    fn make_len_sortedset_key(&self) -> Key {
+        [KEY_PREFIX_LEN, self.prefix.as_slice()].concat()
+    }
+
+    #[inline]
     fn make_full_key<K>(&self, key: K) -> Key
     where
         K: AsRef<[u8]>,
@@ -145,6 +152,313 @@ impl RedisStorageDB {
             }
         };
         Ok(full_name)
+    }
+
+    #[inline]
+    async fn _insert<K, V>(
+        &self,
+        key: K,
+        val: &V,
+        expire_interval: Option<TimestampMillis>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+        V: serde::ser::Serialize + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+
+        #[cfg(not(feature = "len"))]
+        {
+            if let Some(expire_interval) = expire_interval {
+                let mut async_conn = self.async_conn();
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), bincode::serialize(val)?)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                self.async_conn()
+                    .set(full_key, bincode::serialize(val)?)
+                    .await?;
+            }
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            if let Some(expire_interval) = expire_interval {
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), bincode::serialize(val)?)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .zadd(db_zkey, full_key, timestamp_millis() + expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), bincode::serialize(val)?)
+                    .zadd(db_zkey, full_key, i64::MAX)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    async fn _batch_insert(
+        &self,
+        key_vals: Vec<(Key, Vec<u8>, Option<TimestampMillis>)>,
+    ) -> Result<()> {
+        #[cfg(not(feature = "len"))]
+        {
+            let keys_and_values: Vec<(&Key, &Vec<u8>)> = key_vals
+                .iter()
+                .map(|(key_ref, value, _)| (key_ref, value))
+                .collect();
+
+            let mut async_conn = self.async_conn();
+            let mut p = pipe();
+            let mut rpipe = p.atomic().mset(keys_and_values.as_slice());
+            for (k, _, at) in key_vals {
+                if let Some(at) = at {
+                    rpipe = rpipe.expire(k, at);
+                }
+            }
+            rpipe.query_async::<_, ()>(&mut async_conn).await?;
+        }
+
+        #[cfg(feature = "len")]
+        {
+            let (keys_and_values, keys_and_expire_at): (
+                Vec<(&Key, &Vec<u8>)>,
+                Vec<(TimestampMillis, &Key)>,
+            ) = key_vals
+                .iter()
+                .map(|(key_ref, value, timestamp)| {
+                    let value_tuple = (key_ref, value);
+                    let timestamp_tuple = (
+                        timestamp
+                            .map(|t| timestamp_millis() + t)
+                            .unwrap_or(i64::MAX),
+                        key_ref,
+                    );
+                    (value_tuple, timestamp_tuple)
+                })
+                .unzip();
+
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            let mut p = pipe();
+            let mut rpipe = p
+                .atomic()
+                .mset(keys_and_values.as_slice())
+                .zadd_multiple(db_zkey, keys_and_expire_at.as_slice());
+            for (k, _, at) in key_vals {
+                if let Some(at) = at {
+                    rpipe = rpipe.expire(k, at);
+                }
+            }
+            rpipe.query_async::<_, ((), ())>(&mut async_conn).await?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn _batch_remove(&self, full_keys: Vec<Key>) -> Result<()> {
+        #[cfg(not(feature = "len"))]
+        {
+            self.async_conn().del(full_keys).await?;
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            pipe()
+                .atomic()
+                .del(full_keys.as_slice())
+                .zrem(db_zkey, full_keys)
+                .query_async::<_, ()>(&mut async_conn)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn _counter_incr<K>(
+        &self,
+        key: K,
+        increment: isize,
+        expire_interval: Option<TimestampMillis>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+        #[cfg(not(feature = "len"))]
+        {
+            if let Some(expire_interval) = expire_interval {
+                let mut async_conn = self.async_conn();
+                pipe()
+                    .atomic()
+                    .incr(full_key.as_slice(), increment)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                self.async_conn().incr(full_key, increment).await?;
+            }
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            if let Some(expire_interval) = expire_interval {
+                pipe()
+                    .atomic()
+                    .incr(full_key.as_slice(), increment)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .zadd(db_zkey, full_key, timestamp_millis() + expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                pipe()
+                    .atomic()
+                    .incr(full_key.as_slice(), increment)
+                    .zadd(db_zkey, full_key, i64::MAX)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn _counter_decr<K>(
+        &self,
+        key: K,
+        decrement: isize,
+        expire_interval: Option<TimestampMillis>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+
+        #[cfg(not(feature = "len"))]
+        {
+            if let Some(expire_interval) = expire_interval {
+                let mut async_conn = self.async_conn();
+                pipe()
+                    .atomic()
+                    .decr(full_key.as_slice(), decrement)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                self.async_conn().decr(full_key, decrement).await?;
+            }
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            if let Some(expire_interval) = expire_interval {
+                pipe()
+                    .atomic()
+                    .decr(full_key.as_slice(), decrement)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .zadd(db_zkey, full_key, timestamp_millis() + expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                pipe()
+                    .atomic()
+                    .decr(full_key.as_slice(), decrement)
+                    .zadd(db_zkey, full_key, i64::MAX)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn _counter_set<K>(
+        &self,
+        key: K,
+        val: isize,
+        expire_interval: Option<TimestampMillis>,
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key);
+        #[cfg(not(feature = "len"))]
+        {
+            if let Some(expire_interval) = expire_interval {
+                let mut async_conn = self.async_conn();
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), val)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                self.async_conn().set(full_key, val).await?;
+            }
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            if let Some(expire_interval) = expire_interval {
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), val)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .zadd(db_zkey, full_key, timestamp_millis() + expire_interval)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            } else {
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), val)
+                    .zadd(db_zkey, full_key, i64::MAX)
+                    .query_async::<_, ()>(&mut async_conn)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    async fn _remove<K>(&self, key: K) -> Result<()>
+    where
+        K: AsRef<[u8]> + Sync + Send,
+    {
+        let full_key = self.make_full_key(key.as_ref());
+
+        #[cfg(not(feature = "len"))]
+        {
+            self.async_conn().del(full_key).await?;
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            pipe()
+                .atomic()
+                .del(full_key.as_slice())
+                .zrem(db_zkey, full_key)
+                .query_async::<_, ()>(&mut async_conn)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -217,11 +531,7 @@ impl StorageDB for RedisStorageDB {
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send,
     {
-        let full_key = self.make_full_key(key);
-        self.async_conn()
-            .set(full_key, bincode::serialize(val)?)
-            .await?;
-        Ok(())
+        self._insert(key, val, None).await
     }
 
     #[inline]
@@ -247,9 +557,7 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let full_key = self.make_full_key(key.as_ref());
-        self.async_conn().del(full_key).await?;
-        Ok(())
+        self._remove(key).await
     }
 
     #[inline]
@@ -258,16 +566,16 @@ impl StorageDB for RedisStorageDB {
         V: Serialize + Sync + Send,
     {
         if !key_vals.is_empty() {
-            let key_vals = key_vals
+            let keys_vals_expires = key_vals
                 .into_iter()
                 .map(|(k, v)| {
                     let full_key = self.make_full_key(k);
                     bincode::serialize(&v)
-                        .map(move |v| (full_key, v))
+                        .map(move |v| (full_key, v, None))
                         .map_err(|e| anyhow!(e))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            self.async_conn().mset(key_vals.as_slice()).await?;
+            self._batch_insert(keys_vals_expires).await?;
         }
         Ok(())
     }
@@ -279,7 +587,7 @@ impl StorageDB for RedisStorageDB {
                 .into_iter()
                 .map(|k| self.make_full_key(k))
                 .collect::<Vec<_>>();
-            self.async_conn().del(keys).await?;
+            self._batch_remove(keys).await?;
         }
         Ok(())
     }
@@ -289,9 +597,7 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let full_key = self.make_full_key(key);
-        self.async_conn().incr(full_key, increment).await?;
-        Ok(())
+        self._counter_incr(key, increment, None).await
     }
 
     #[inline]
@@ -299,9 +605,7 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let full_key = self.make_full_key(key);
-        self.async_conn().decr(full_key, decrement).await?;
-        Ok(())
+        self._counter_decr(key, decrement, None).await
     }
 
     #[inline]
@@ -318,9 +622,7 @@ impl StorageDB for RedisStorageDB {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        let full_key = self.make_full_key(key);
-        self.async_conn().set(full_key, val).await?;
-        Ok(())
+        self._counter_set(key, val, None).await
     }
 
     #[inline]
@@ -331,7 +633,20 @@ impl StorageDB for RedisStorageDB {
     }
 
     #[inline]
-    async fn db_size(&self) -> Result<i64> {
+    #[cfg(feature = "len")]
+    async fn len(&self) -> Result<usize> {
+        let db_zkey = self.make_len_sortedset_key();
+        let mut async_conn = self.async_conn();
+        let (_, count) = pipe()
+            .zrembyscore(db_zkey.as_slice(), 0, timestamp_millis())
+            .zcard(db_zkey.as_slice())
+            .query_async::<_, (i64, usize)>(&mut async_conn)
+            .await?;
+        Ok(count)
+    }
+
+    #[inline]
+    async fn db_size(&self) -> Result<usize> {
         let mut async_conn = self.async_conn();
         //DBSIZE
         let dbsize = redis::pipe()
@@ -347,7 +662,7 @@ impl StorageDB for RedisStorageDB {
                 }
             })
         });
-        Ok(dbsize.unwrap_or(-1))
+        Ok(dbsize.unwrap_or(0) as usize)
     }
 
     #[inline]
@@ -357,11 +672,26 @@ impl StorageDB for RedisStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let full_name = self.make_full_key(key.as_ref());
-        let res = self
-            .async_conn()
-            .pexpire_at::<_, bool>(full_name, at)
-            .await?;
-        Ok(res)
+        #[cfg(not(feature = "len"))]
+        {
+            let res = self
+                .async_conn()
+                .pexpire_at::<_, bool>(full_name, at)
+                .await?;
+            Ok(res)
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            let (_, res) = pipe()
+                .atomic()
+                .zadd(db_zkey, full_name.as_slice(), at)
+                .pexpire_at(full_name.as_slice(), at)
+                .query_async::<_, (i64, bool)>(&mut async_conn)
+                .await?;
+            Ok(res)
+        }
     }
 
     #[inline]
@@ -371,8 +701,24 @@ impl StorageDB for RedisStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let full_name = self.make_full_key(key.as_ref());
-        let res = self.async_conn().pexpire::<_, bool>(full_name, dur).await?;
-        Ok(res)
+
+        #[cfg(not(feature = "len"))]
+        {
+            let res = self.async_conn().pexpire::<_, bool>(full_name, dur).await?;
+            Ok(res)
+        }
+        #[cfg(feature = "len")]
+        {
+            let db_zkey = self.make_len_sortedset_key();
+            let mut async_conn = self.async_conn();
+            let (_, res) = pipe()
+                .atomic()
+                .zadd(db_zkey, full_name.as_slice(), timestamp_millis() + dur)
+                .pexpire(full_name.as_slice(), dur)
+                .query_async::<_, (i64, bool)>(&mut async_conn)
+                .await?;
+            Ok(res)
+        }
     }
 
     #[inline]

@@ -101,7 +101,10 @@ pub trait StorageDB: Send + Sync {
 
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
-    async fn db_size(&self) -> Result<i64>;
+    #[cfg(feature = "len")]
+    async fn len(&self) -> Result<usize>;
+
+    async fn db_size(&self) -> Result<usize>;
 
     #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
@@ -431,7 +434,16 @@ impl DefaultStorageDB {
     }
 
     #[inline]
-    pub async fn db_size(&self) -> Result<i64> {
+    #[cfg(feature = "len")]
+    pub async fn len(&self) -> Result<usize> {
+        match self {
+            DefaultStorageDB::Sled(db) => db.len().await,
+            DefaultStorageDB::Redis(db) => db.len().await,
+        }
+    }
+
+    #[inline]
+    pub async fn db_size(&self) -> Result<usize> {
         match self {
             DefaultStorageDB::Sled(db) => db.db_size().await,
             DefaultStorageDB::Redis(db) => db.db_size().await,
