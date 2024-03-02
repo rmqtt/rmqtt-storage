@@ -107,7 +107,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            typ: StorageType::Sled,
+            typ: StorageType::Redis,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 cleanup_f: |_db| {},
@@ -1759,5 +1759,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(db.len().await.unwrap(), 2);
+        println!("test_len len: {:?}", db.len().await);
     }
 }
