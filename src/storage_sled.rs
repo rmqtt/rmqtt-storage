@@ -20,7 +20,9 @@ use sled::transaction::{
     ConflictableTransactionError, ConflictableTransactionResult, TransactionError,
     TransactionalTree,
 };
-use sled::{Batch, Db, IVec, Tree};
+#[allow(unused_imports)]
+use sled::Transactional;
+use sled::{Batch, IVec, Tree};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -32,8 +34,11 @@ use crate::{timestamp_millis, TimestampMillis};
 use crate::{Error, Result, StorageList, StorageMap};
 
 const SEPARATOR: &[u8] = b"@";
+const KV_TREE: &[u8] = b"__kv_tree@";
 const MAP_TREE: &[u8] = b"__map_tree@";
 const LIST_TREE: &[u8] = b"__list_tree@";
+const EXPIRE_KEYS_TREE: &[u8] = b"__expire_key_tree@";
+const KEY_EXPIRE_TREE: &[u8] = b"__key_expire_tree@";
 const MAP_NAME_PREFIX: &[u8] = b"__map@";
 const MAP_KEY_SEPARATOR: &[u8] = b"@__item@";
 #[allow(dead_code)]
@@ -42,22 +47,44 @@ const MAP_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
 const LIST_NAME_PREFIX: &[u8] = b"__list@";
 const LIST_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
 const LIST_KEY_CONTENT_SUFFIX: &[u8] = b"@__content@";
-#[allow(dead_code)]
-const EXPIRE_AT_KEY_PREFIX: &[u8] = b"__expireat@";
-const EXPIRE_AT_KEY_SUFFIX_DB: &[u8] = b"@__db@";
-const EXPIRE_AT_KEY_SUFFIX_MAP: &[u8] = b"@__map@";
-const EXPIRE_AT_KEY_SUFFIX_LIST: &[u8] = b"@__list@";
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 enum KeyType {
-    DB,
+    KV,
     Map,
     List,
 }
 
+impl KeyType {
+    #[inline]
+    #[allow(dead_code)]
+    fn encode(&self) -> &[u8] {
+        match self {
+            KeyType::KV => &[1],
+            KeyType::Map => &[2],
+            KeyType::List => &[3],
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn decode(v: &[u8]) -> Result<Self> {
+        if v.is_empty() {
+            Err(anyhow!("invalid data"))
+        } else {
+            match v[0] {
+                1 => Ok(KeyType::KV),
+                2 => Ok(KeyType::Map),
+                3 => Ok(KeyType::List),
+                _ => Err(anyhow!("invalid data")),
+            }
+        }
+    }
+}
+
 enum Command {
-    DBInsert(Arc<Db>, Key, Vec<u8>, oneshot::Sender<Result<()>>),
+    DBInsert(SledStorageDB, Key, Vec<u8>, oneshot::Sender<Result<()>>),
     DBGet(SledStorageDB, IVec, oneshot::Sender<Result<Option<IVec>>>),
     DBRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
     DBMapNew(
@@ -99,6 +126,8 @@ enum Command {
     DBMapPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
     DBListPrefixIter(SledStorageDB, oneshot::Sender<sled::Iter>),
     DBScanIter(SledStorageDB, Vec<u8>, oneshot::Sender<sled::Iter>),
+    #[allow(dead_code)]
+    DBLen(SledStorageDB, oneshot::Sender<usize>),
     DBSize(SledStorageDB, oneshot::Sender<usize>),
 
     MapInsert(SledStorageMap, IVec, IVec, oneshot::Sender<Result<()>>),
@@ -403,8 +432,13 @@ impl BytesReplace for &[u8] {
 #[derive(Clone)]
 pub struct SledStorageDB {
     pub(crate) db: Arc<sled::Db>,
+    pub(crate) kv_tree: sled::Tree,
     pub(crate) map_tree: sled::Tree,
     pub(crate) list_tree: sled::Tree,
+    #[allow(dead_code)]
+    pub(crate) expire_key_tree: sled::Tree, //(key, val) => (expire_at, key)
+    #[allow(dead_code)]
+    pub(crate) key_expire_tree: sled::Tree, //(key, val) => (key, expire_at)
     cmd_tx: mpsc::Sender<Command>,
     active_count: Arc<AtomicIsize>, //Active Command Count
 }
@@ -413,13 +447,27 @@ impl SledStorageDB {
     #[inline]
     pub(crate) async fn new(cfg: SledConfig) -> Result<Self> {
         let sled_cfg = cfg.to_sled_config()?;
-        let (db, map_tree, list_tree) = sled_cfg.open().map(|db| {
-            let map_tree = db.open_tree(MAP_TREE);
-            let list_tree = db.open_tree(LIST_TREE);
-            (Arc::new(db), map_tree, list_tree)
-        })?;
+        let (db, kv_tree, map_tree, list_tree, expire_key_tree, key_expire_tree) =
+            sled_cfg.open().map(|db| {
+                let kv_tree = db.open_tree(KV_TREE);
+                let map_tree = db.open_tree(MAP_TREE);
+                let list_tree = db.open_tree(LIST_TREE);
+                let expire_key_tree = db.open_tree(EXPIRE_KEYS_TREE);
+                let key_expire_tree = db.open_tree(KEY_EXPIRE_TREE);
+                (
+                    Arc::new(db),
+                    kv_tree,
+                    map_tree,
+                    list_tree,
+                    expire_key_tree,
+                    key_expire_tree,
+                )
+            })?;
+        let kv_tree = kv_tree?;
         let map_tree = map_tree?;
         let list_tree = list_tree?;
+        let expire_key_tree = expire_key_tree?;
+        let key_expire_tree = key_expire_tree?;
         let active_count = Arc::new(AtomicIsize::new(0));
         let active_count1 = active_count.clone();
 
@@ -430,17 +478,13 @@ impl SledStorageDB {
                     let err = anyhow::Error::msg("send result fail");
                     let snd_res = match cmd {
                         Command::DBInsert(db, key, val, res_tx) => res_tx
-                            .send(SledStorageDB::_insert(
-                                db.as_ref(),
-                                key.as_slice(),
-                                val.as_slice(),
-                            ))
+                            .send(db._insert(key.as_slice(), val.as_slice()))
                             .map_err(|_| err),
                         Command::DBGet(db, key, res_tx) => {
                             res_tx.send(db._get(key.as_ref())).map_err(|_| err)
                         }
                         Command::DBRemove(db, key, res_tx) => {
-                            res_tx.send(db._db_remove(key.as_ref())).map_err(|_| err)
+                            res_tx.send(db._kv_remove(key.as_ref())).map_err(|_| err)
                         }
                         Command::DBMapNew(db, name, expire_ms, res_tx) => {
                             let map =
@@ -487,7 +531,7 @@ impl SledStorageDB {
                             .map_err(|_| err),
                         #[cfg(feature = "ttl")]
                         Command::DBExpireAt(db, key, at, res_tx) => res_tx
-                            .send(db._expire_at(key.as_ref(), at))
+                            .send(db._expire_at(key.as_ref(), at, KeyType::KV))
                             .map_err(|_| err),
                         #[cfg(feature = "ttl")]
                         Command::DBTtl(db, key, res_tx) => {
@@ -502,6 +546,7 @@ impl SledStorageDB {
                         Command::DBScanIter(db, pattern, res_tx) => {
                             res_tx.send(db._db_scan_prefix(pattern)).map_err(|_| err)
                         }
+                        Command::DBLen(db, res_tx) => res_tx.send(db._kv_len()).map_err(|_| err),
                         Command::DBSize(db, res_tx) => res_tx.send(db._db_size()).map_err(|_| err),
 
                         Command::MapInsert(map, key, val, res_tx) => {
@@ -602,8 +647,11 @@ impl SledStorageDB {
 
         let db = Self {
             db,
+            kv_tree,
             map_tree,
             list_tree,
+            expire_key_tree,
+            key_expire_tree,
             cmd_tx,
             active_count,
         };
@@ -616,98 +664,161 @@ impl SledStorageDB {
     #[cfg(feature = "ttl")]
     #[inline]
     pub fn cleanup(&self, limit: usize) -> usize {
+        let rmeove = |typ: &KeyType, key: &[u8]| -> Result<()> {
+            match typ {
+                KeyType::Map => {
+                    self._map(key.as_ref())._clear()?;
+                }
+                KeyType::List => {
+                    self._list(key.as_ref())._clear()?;
+                }
+                KeyType::KV => {
+                    self.kv_tree.remove(key.as_ref())?;
+                }
+            }
+            Ok(())
+        };
         let mut count = 0;
-        let mut expire_key_vals = Vec::new();
-        for item in self.db.scan_prefix(EXPIRE_AT_KEY_PREFIX) {
+        let mut expire_at_key_types = Vec::new();
+        for item in self.expire_key_tree.iter() {
             if count > limit {
                 break;
             }
-            match item {
-                Ok((expire_key, v)) => {
-                    if let Some((key, key_type)) = Self::_separate_expire_key(expire_key.as_ref()) {
-                        expire_key_vals.push((key, key_type, v));
-                    }
-                }
+            let (expire_at_key, key_type) = match item {
+                Ok(item) => item,
                 Err(e) => {
-                    log::warn!("{:?}", e);
+                    log::error!("{:?}", e);
+                    break;
                 }
+            };
+
+            let (expire_at_bytes, _) = expire_at_key.as_ref().split_at(8);
+
+            let expire_at = match expire_at_bytes.try_into() {
+                Ok(at) => i64::from_be_bytes(at),
+                Err(e) => {
+                    log::error!("{:?}", e);
+                    break;
+                }
+            };
+
+            if expire_at > timestamp_millis() {
+                break;
             }
-        }
-        for (key, key_type, v) in expire_key_vals {
-            match self._ttl3(key_type, key.as_slice(), v.as_ref()) {
-                Ok(None) => {
-                    match key_type {
-                        KeyType::Map => {
-                            if let Err(e) = self._map_remove(key) {
-                                log::warn!("{:?}", e);
-                            }
-                        }
-                        KeyType::List => {
-                            if let Err(e) = self._list_remove(key) {
-                                log::warn!("{:?}", e);
-                            }
-                        }
-                        KeyType::DB => {
-                            if let Err(e) = self._db_remove(key) {
-                                log::warn!("{:?}", e);
-                            }
-                        }
-                    }
-                    count += 1;
-                }
-                Ok(_) => {}
+
+            let key_type = match KeyType::decode(key_type.as_ref()) {
+                Ok(key_type) => key_type,
                 Err(e) => {
-                    log::warn!("{:?}", e);
+                    log::error!("{:?}", e);
+                    break;
                 }
+            };
+
+            expire_at_key_types.push((expire_at_key, key_type));
+            count += 1;
+        }
+
+        let mut key_expire_batch = sled::Batch::default();
+        let mut expire_key_batch = sled::Batch::default();
+        let keys: Vec<(&[u8], &KeyType)> = expire_at_key_types
+            .iter()
+            .map(|(expire_at_key, key_type)| {
+                let (_, key) = expire_at_key.as_ref().split_at(8);
+                key_expire_batch.remove(key);
+                expire_key_batch.remove(expire_at_key);
+                (key, key_type)
+            })
+            .collect();
+
+        for (key, key_type) in keys {
+            if let Err(e) = rmeove(key_type, key) {
+                log::error!("{:?}", e);
             }
         }
 
+        // if let Err(e) = self.key_expire_tree.apply_batch(key_expire_batch) {
+        //     log::error!("{:?}", e);
+        // }
+        // if let Err(e) = self.expire_key_tree.apply_batch(expire_key_batch) {
+        //     log::error!("{:?}", e);
+        // }
+
+        if let Err(e) = (&self.key_expire_tree, &self.expire_key_tree).transaction(
+            |(key_expire_tx, expire_key_tx)| {
+                key_expire_tx.apply_batch(&key_expire_batch)?;
+                expire_key_tx.apply_batch(&expire_key_batch)?;
+                Ok::<_, ConflictableTransactionError<()>>(())
+            },
+        ) {
+            log::error!("{:?}", e);
+        }
         count
     }
 
     #[cfg(feature = "ttl")]
     #[inline]
-    pub fn cleanup_old(&self, limit: usize) -> usize {
+    pub fn cleanup_kvs(&self, limit: usize) -> usize {
         let mut count = 0;
-        for item in self.db.scan_prefix(EXPIRE_AT_KEY_PREFIX) {
+        let mut expire_at_key_types = Vec::new();
+        for item in self.expire_key_tree.iter() {
             if count > limit {
                 break;
             }
-            match item {
-                Ok((expire_key, v)) => {
-                    if let Some((key, key_type)) = Self::_separate_expire_key(expire_key.as_ref()) {
-                        match self._ttl3(key_type, key.as_slice(), v.as_ref()) {
-                            Ok(None) => {
-                                match key_type {
-                                    KeyType::Map => {
-                                        if let Err(e) = self._map_remove(key) {
-                                            log::warn!("{:?}", e);
-                                        }
-                                    }
-                                    KeyType::List => {
-                                        if let Err(e) = self._list_remove(key) {
-                                            log::warn!("{:?}", e);
-                                        }
-                                    }
-                                    KeyType::DB => {
-                                        if let Err(e) = self._db_remove(key) {
-                                            log::warn!("{:?}", e);
-                                        }
-                                    }
-                                }
-                                count += 1;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                log::warn!("{:?}", e);
-                            }
-                        }
-                    }
-                }
+            let (expire_at_key, key_type) = match item {
+                Ok(item) => item,
                 Err(e) => {
-                    log::warn!("{:?}", e);
+                    log::error!("{:?}", e);
+                    break;
                 }
+            };
+
+            let (expire_at_bytes, _) = expire_at_key.as_ref().split_at(8);
+
+            let expire_at = match expire_at_bytes.try_into() {
+                Ok(at) => i64::from_be_bytes(at),
+                Err(e) => {
+                    log::error!("{:?}", e);
+                    break;
+                }
+            };
+
+            if expire_at > timestamp_millis() {
+                break;
             }
+
+            let key_type = match KeyType::decode(key_type.as_ref()) {
+                Ok(key_type) => key_type,
+                Err(e) => {
+                    log::error!("{:?}", e);
+                    break;
+                }
+            };
+
+            if matches!(key_type, KeyType::KV) {
+                expire_at_key_types.push(expire_at_key);
+                count += 1;
+            }
+        }
+
+        let mut key_expire_batch = sled::Batch::default();
+        let mut expire_key_batch = sled::Batch::default();
+        let mut keys = Batch::default();
+        for expire_at_key in expire_at_key_types {
+            let (_, key) = expire_at_key.as_ref().split_at(8);
+            key_expire_batch.remove(key);
+            expire_key_batch.remove(expire_at_key.as_ref());
+            keys.remove(key);
+        }
+
+        if let Err(e) = (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree).transaction(
+            |(kv_tx, key_expire_tx, expire_key_tx)| {
+                kv_tx.apply_batch(&keys)?;
+                key_expire_tx.apply_batch(&key_expire_batch)?;
+                expire_key_tx.apply_batch(&expire_key_batch)?;
+                Ok::<_, ConflictableTransactionError<()>>(())
+            },
+        ) {
+            log::error!("{:?}", e);
         }
         count
     }
@@ -717,59 +828,15 @@ impl SledStorageDB {
         self.active_count.load(Ordering::Relaxed)
     }
 
-    #[inline]
-    pub fn map_size(&self) -> usize {
-        self.map_tree.len()
-    }
-
-    #[inline]
-    pub fn list_size(&self) -> usize {
-        self.list_tree.len()
-    }
-
-    #[inline]
-    fn _make_expire_key<K>(key: K, suffix: &[u8]) -> Key
-    where
-        K: AsRef<[u8]>,
-    {
-        [EXPIRE_AT_KEY_PREFIX, key.as_ref(), suffix].concat()
-    }
-
-    #[inline]
-    fn is_db_expire_key(key: &[u8]) -> bool {
-        key.starts_with(EXPIRE_AT_KEY_PREFIX) && key.ends_with(EXPIRE_AT_KEY_SUFFIX_DB)
-    }
-
-    #[inline]
-    fn _separate_expire_key<K>(expire_key: K) -> Option<(Key, KeyType)>
-    where
-        K: AsRef<[u8]>,
-    {
-        let expire_key = expire_key.as_ref();
-
-        if expire_key.len() > (EXPIRE_AT_KEY_PREFIX.len() + EXPIRE_AT_KEY_SUFFIX_DB.len()) {
-            if expire_key.ends_with(EXPIRE_AT_KEY_SUFFIX_MAP) {
-                let key = expire_key[EXPIRE_AT_KEY_PREFIX.len()
-                    ..(expire_key.len() - EXPIRE_AT_KEY_SUFFIX_MAP.len())]
-                    .to_vec();
-                Some((key, KeyType::Map))
-            } else if expire_key.ends_with(EXPIRE_AT_KEY_SUFFIX_LIST) {
-                let key = expire_key[EXPIRE_AT_KEY_PREFIX.len()
-                    ..(expire_key.len() - EXPIRE_AT_KEY_SUFFIX_LIST.len())]
-                    .to_vec();
-                Some((key, KeyType::List))
-            } else if expire_key.ends_with(EXPIRE_AT_KEY_SUFFIX_DB) {
-                let key = expire_key[EXPIRE_AT_KEY_PREFIX.len()
-                    ..(expire_key.len() - EXPIRE_AT_KEY_SUFFIX_DB.len())]
-                    .to_vec();
-                Some((key, KeyType::DB))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
+    // #[inline]
+    // pub fn map_size(&self) -> usize {
+    //     self.map_tree.len()
+    // }
+    //
+    // #[inline]
+    // pub fn list_size(&self) -> usize {
+    //     self.list_tree.len()
+    // }
 
     #[inline]
     fn make_map_prefix_name<K>(name: K) -> Key
@@ -844,13 +911,21 @@ impl SledStorageDB {
     }
 
     #[inline]
-    fn _contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        Ok(self.db.contains_key(key.as_ref())?)
+    fn _contains_key<K: AsRef<[u8]> + Sync + Send>(
+        &self,
+        key: K,
+        key_type: KeyType,
+    ) -> Result<bool> {
+        match key_type {
+            KeyType::KV => Self::_kv_contains_key(&self.kv_tree, key),
+            KeyType::Map => Self::_map_contains_key(&self.map_tree, key),
+            KeyType::List => Self::_list_contains_key(&self.list_tree, key),
+        }
     }
 
     #[inline]
-    fn _db_contains_key<K: AsRef<[u8]> + Sync + Send>(db: &Db, key: K) -> Result<bool> {
-        Ok(db.contains_key(key.as_ref())?)
+    fn _kv_contains_key<K: AsRef<[u8]> + Sync + Send>(kv: &Tree, key: K) -> Result<bool> {
+        Ok(kv.contains_key(key.as_ref())?)
     }
 
     #[inline]
@@ -870,10 +945,20 @@ impl SledStorageDB {
     where
         K: AsRef<[u8]>,
     {
+        #[cfg(not(feature = "ttl"))]
         self._map(key.as_ref())._clear()?;
         #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(self.db.as_ref(), key.as_ref(), EXPIRE_AT_KEY_SUFFIX_MAP)
-            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        {
+            let map = self._map(key.as_ref());
+            let map_clear_batch = map._make_clear_batch();
+            (&self.map_tree, &self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(map_tx, key_expire_tx, expire_key_tx)| {
+                    map._tx_clear(map_tx, &map_clear_batch)?;
+                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key.as_ref())?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
         Ok(())
     }
 
@@ -882,59 +967,86 @@ impl SledStorageDB {
     where
         K: AsRef<[u8]>,
     {
+        #[cfg(not(feature = "ttl"))]
         self._list(key.as_ref())._clear()?;
         #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(self.db.as_ref(), key.as_ref(), EXPIRE_AT_KEY_SUFFIX_LIST)
-            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        {
+            let list = self._list(key.as_ref());
+            let list_clear_batch = list._make_clear_batch();
+            (
+                &self.list_tree,
+                &self.key_expire_tree,
+                &self.expire_key_tree,
+            )
+                .transaction(|(list_tx, key_expire_tx, expire_key_tx)| {
+                    SledStorageList::_tx_clear(list_tx, &list_clear_batch)?;
+                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key.as_ref())?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
         Ok(())
     }
 
     #[inline]
-    fn _db_remove<K>(&self, key: K) -> Result<()>
+    fn _kv_remove<K>(&self, key: K) -> Result<()>
     where
         K: AsRef<[u8]>,
     {
-        self.db.remove(key.as_ref())?;
+        #[cfg(not(feature = "ttl"))]
+        self.kv_tree.remove(key.as_ref())?;
         #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(self.db.as_ref(), key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB)
-            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        {
+            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
+                    kv_tx.remove(key.as_ref())?;
+                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key.as_ref())?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
         Ok(())
     }
 
     #[cfg(feature = "ttl")]
     #[inline]
-    fn _remove_expire_key<K>(db: &sled::Db, key: K, suffix: &[u8]) -> Result<()>
-    where
-        K: AsRef<[u8]>,
-    {
-        let expire_key = Self::_make_expire_key(key, suffix);
-        db.remove(expire_key)?;
+    fn _remove_expire_key(&self, key: &[u8]) -> Result<()> {
+        if let Some(expire_at_bytes) = self.key_expire_tree.get(key)? {
+            self.key_expire_tree.remove(key)?;
+            let expire_key = [expire_at_bytes.as_ref(), key].concat();
+            self.expire_key_tree.remove(expire_key.as_slice())?;
+        }
         Ok(())
     }
 
     #[cfg(feature = "ttl")]
     #[inline]
-    fn _batch_remove_expire_key<K>(b: &mut Batch, key: K, suffix: &[u8])
-    where
-        K: AsRef<[u8]>,
-    {
-        let expire_key = Self::_make_expire_key(key, suffix);
-        b.remove(expire_key);
+    fn _tx_remove_expire_key(
+        key_expire_tx: &TransactionalTree,
+        expire_key_tx: &TransactionalTree,
+        key: &[u8],
+    ) -> ConflictableTransactionResult<()> {
+        if let Some(expire_at_bytes) = key_expire_tx.get(key)? {
+            key_expire_tx.remove(key)?;
+            let expire_key = [expire_at_bytes.as_ref(), key].concat();
+            expire_key_tx.remove(expire_key.as_slice())?;
+        }
+        Ok(())
     }
 
     #[inline]
-    fn _is_expired<K, F>(&self, _key: K, _suffix: &[u8], _contains_key_f: F) -> Result<bool>
+    fn _is_expired<K, F>(&self, _key: K, _contains_key_f: F) -> Result<bool>
     where
         K: AsRef<[u8]> + Sync + Send,
         F: Fn(&[u8]) -> Result<bool>,
     {
         #[cfg(feature = "ttl")]
         {
-            let expire_key = Self::_make_expire_key(_key.as_ref(), _suffix);
-            let res = self
-                ._ttl2(_key.as_ref(), expire_key.as_slice(), _contains_key_f)?
-                .and_then(|ttl| if ttl > 0 { Some(()) } else { None });
-            Ok(res.is_none())
+            if let Some((expire_at, _)) = self._ttl_at(_key, _contains_key_f)? {
+                Ok(timestamp_millis() >= expire_at)
+            } else {
+                Ok(true)
+            }
         }
         #[cfg(not(feature = "ttl"))]
         Ok(false)
@@ -944,149 +1056,96 @@ impl SledStorageDB {
     fn _ttl<K, F>(
         &self,
         key: K,
-        suffix: &[u8],
         contains_key_f: F,
-    ) -> Result<Option<TimestampMillis>>
+    ) -> Result<Option<(TimestampMillis, Option<IVec>)>>
     where
         K: AsRef<[u8]> + Sync + Send,
         F: Fn(&[u8]) -> Result<bool>,
     {
-        let expire_key = Self::_make_expire_key(key.as_ref(), suffix);
-        self._ttl2(key.as_ref(), expire_key.as_slice(), contains_key_f)
+        Ok(self
+            ._ttl_at(key, contains_key_f)?
+            .map(|(expire_at, at_bytes)| (expire_at - timestamp_millis(), at_bytes)))
     }
 
     #[inline]
-    fn _ttl2<K, F>(
+    fn _ttl_at<K, F>(
         &self,
         c_key: K,
-        expire_key: K,
         contains_key_f: F,
-    ) -> Result<Option<TimestampMillis>>
+    ) -> Result<Option<(TimestampMillis, Option<IVec>)>>
     where
         K: AsRef<[u8]> + Sync + Send,
         F: Fn(&[u8]) -> Result<bool>,
     {
-        let ttl_res = match self.db.get(expire_key) {
-            Ok(Some(v)) => {
+        let ttl_res = match self.key_expire_tree.get(c_key.as_ref()) {
+            Ok(Some(at_bytes)) => {
                 if contains_key_f(c_key.as_ref())? {
-                    Ok(Some(TimestampMillis::from_be_bytes(v.as_ref().try_into()?)))
+                    Ok(Some((
+                        TimestampMillis::from_be_bytes(at_bytes.as_ref().try_into()?),
+                        Some(at_bytes),
+                    )))
                 } else {
                     Ok(None)
                 }
             }
             Ok(None) => {
                 if contains_key_f(c_key.as_ref())? {
-                    Ok(Some(TimestampMillis::MAX))
+                    Ok(Some((TimestampMillis::MAX, None)))
                 } else {
                     Ok(None)
                 }
             }
             Err(e) => Err(anyhow!(e)),
         }?;
-
-        let ttl_res = if let Some(at) = ttl_res {
-            let now = timestamp_millis();
-            if now > at {
-                //is expire
-                None
-            } else {
-                Some(at - now)
-            }
-        } else {
-            None
-        };
         Ok(ttl_res)
     }
 
     #[inline]
-    fn _ttl3<K>(
-        &self,
-        key_type: KeyType,
-        c_key: K,
-        ttl_val: &[u8],
-    ) -> Result<Option<TimestampMillis>>
-    where
-        K: AsRef<[u8]> + Sync + Send,
-    {
-        let ttl_at = match key_type {
-            KeyType::Map => {
-                if Self::_map_contains_key(&self.map_tree, c_key)? {
-                    Some(TimestampMillis::from_be_bytes(ttl_val.as_ref().try_into()?))
-                } else {
-                    None
-                }
-            }
-            KeyType::List => {
-                if Self::_list_contains_key(&self.list_tree, c_key)? {
-                    Some(TimestampMillis::from_be_bytes(ttl_val.as_ref().try_into()?))
-                } else {
-                    None
-                }
-            }
-            KeyType::DB => {
-                if self._contains_key(c_key)? {
-                    Some(TimestampMillis::from_be_bytes(ttl_val.as_ref().try_into()?))
-                } else {
-                    None
-                }
-            }
-        };
-
-        let ttl_millis = if let Some(at) = ttl_at {
-            let now = timestamp_millis() + (1000 * 10);
-            if now > at {
-                None
-            } else {
-                Some(at - now)
-            }
-        } else {
-            None
-        };
-        Ok(ttl_millis)
-    }
-
-    #[inline]
-    fn _insert(db: &Db, key: &[u8], val: &[u8]) -> Result<()> {
-        db.insert(key, val)?;
+    fn _insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        #[cfg(not(feature = "ttl"))]
+        self.kv_tree.insert(key, val)?;
         #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(db, key, EXPIRE_AT_KEY_SUFFIX_DB)?;
+        {
+            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(kv_tx, key_expire_tx, expire_keys_tx)| {
+                    kv_tx.insert(key, val)?;
+                    Self::_tx_remove_expire_key(key_expire_tx, expire_keys_tx, key)?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
         Ok(())
     }
 
     #[inline]
     fn _get(&self, key: &[u8]) -> Result<Option<IVec>> {
-        let this = self;
-        let res = if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-            Self::_db_contains_key(this.db.as_ref(), k)
-        })? {
+        let res = if self._is_expired(key.as_ref(), |k| Self::_kv_contains_key(&self.kv_tree, k))? {
             None
         } else {
-            this.db.get(key)?
+            self.kv_tree.get(key)?
         };
         Ok(res)
     }
 
     #[inline]
     fn _self_map_contains_key(&self, key: &[u8]) -> Result<bool> {
-        let this = self;
-        if this._is_expired(key.as_ref(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-            Self::_map_contains_key(&this.map_tree, k)
-        })? {
+        // let this = self;
+        if self._is_expired(key, |k| Self::_map_contains_key(&self.map_tree, k))? {
             Ok(false)
         } else {
-            Self::_map_contains_key(&this.map_tree, key)
+            //Self::_map_contains_key(&self.map_tree, key)
+            Ok(true)
         }
     }
 
     #[inline]
     fn _self_list_contains_key(&self, key: &[u8]) -> Result<bool> {
         let this = self;
-        if this._is_expired(key, EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-            Self::_list_contains_key(&this.list_tree, k)
-        })? {
+        if this._is_expired(key, |k| Self::_list_contains_key(&self.list_tree, k))? {
             Ok(false)
         } else {
-            Self::_list_contains_key(&this.list_tree, key)
+            // Self::_list_contains_key(&this.list_tree, key)
+            Ok(true)
         }
     }
 
@@ -1101,30 +1160,38 @@ impl SledStorageDB {
             batch.insert(k.as_slice(), v.as_ref());
         }
 
-        #[cfg(feature = "ttl")]
-        let keys = key_vals.into_iter().map(|(k, _)| k).collect::<Vec<Key>>();
-
         let this = self;
+        #[cfg(not(feature = "ttl"))]
+        this.kv_tree.apply_batch(batch)?;
 
         #[cfg(feature = "ttl")]
         {
-            let mut remove_expire_batch = Batch::default();
-            for k in keys {
-                if this._is_expired(k.as_slice(), EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-                    Self::_db_contains_key(this.db.as_ref(), k)
-                })? {
-                    SledStorageDB::_batch_remove_expire_key(
-                        &mut remove_expire_batch,
-                        k,
-                        EXPIRE_AT_KEY_SUFFIX_DB,
-                    );
+            let mut remove_key_expire_batch = Batch::default();
+            let mut remove_expire_key_batch = Batch::default();
+            for (k, _) in key_vals.iter() {
+                if let Some((expire_at, Some(expire_at_bytes))) =
+                    this._ttl(k.as_slice(), |k| Self::_kv_contains_key(&self.kv_tree, k))?
+                {
+                    if expire_at <= 0 {
+                        remove_key_expire_batch.remove(k.as_slice());
+                        let expire_key = [expire_at_bytes.as_ref(), k.as_slice()].concat();
+                        remove_expire_key_batch.remove(expire_key.as_slice())
+                    }
                 }
             }
-            this.db.apply_batch(remove_expire_batch)?;
+
+            // this.key_expire_tree.apply_batch(remove_key_expire_batch)?;
+            // this.expire_key_tree.apply_batch(remove_expire_key_batch)?;
+            // this.kv_tree.apply_batch(batch)?;
+            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
+                    key_expire_tx.apply_batch(&remove_key_expire_batch)?;
+                    expire_key_tx.apply_batch(&remove_expire_key_batch)?;
+                    kv_tx.apply_batch(&batch)?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
         }
-
-        this.db.apply_batch(batch)?;
-
         Ok(())
     }
 
@@ -1134,23 +1201,35 @@ impl SledStorageDB {
             return Ok(());
         }
 
-        let this = self;
         let mut batch = Batch::default();
         for k in keys.iter() {
             batch.remove(k.as_slice());
         }
-        this.db.apply_batch(batch)?;
+        #[cfg(not(feature = "ttl"))]
+        self.kv_tree.apply_batch(batch)?;
+
         #[cfg(feature = "ttl")]
         {
-            let mut remove_expire_batch = Batch::default();
+            let mut remove_key_expire_batch = Batch::default();
+            let mut remove_expire_key_batch = Batch::default();
             for k in keys.iter() {
-                SledStorageDB::_batch_remove_expire_key(
-                    &mut remove_expire_batch,
-                    k,
-                    EXPIRE_AT_KEY_SUFFIX_DB,
-                );
+                if let Some(expire_at_bytes) = self.key_expire_tree.get(k)? {
+                    remove_key_expire_batch.remove(k.as_slice());
+                    let expire_key = [expire_at_bytes.as_ref(), k.as_slice()].concat();
+                    remove_expire_key_batch.remove(expire_key.as_slice())
+                }
             }
-            this.db.apply_batch(remove_expire_batch)?;
+            // this.key_expire_tree.apply_batch(remove_key_expire_batch)?;
+            // this.expire_key_tree.apply_batch(remove_expire_key_batch)?;
+            // this.kv_tree.apply_batch(batch)?;
+            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
+                    key_expire_tx.apply_batch(&remove_key_expire_batch)?;
+                    expire_key_tx.apply_batch(&remove_expire_key_batch)?;
+                    kv_tx.apply_batch(&batch)?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
         }
 
         Ok(())
@@ -1158,7 +1237,7 @@ impl SledStorageDB {
 
     #[inline]
     fn _counter_incr(&self, key: &[u8], increment: isize) -> Result<()> {
-        self.db.fetch_and_update(key, |old: Option<&[u8]>| {
+        self.kv_tree.fetch_and_update(key, |old: Option<&[u8]>| {
             let number = match old {
                 Some(bytes) => {
                     if let Ok(array) = bytes.try_into() {
@@ -1177,7 +1256,7 @@ impl SledStorageDB {
 
     #[inline]
     fn _counter_decr(&self, key: &[u8], decrement: isize) -> Result<()> {
-        self.db.fetch_and_update(key, |old: Option<&[u8]>| {
+        self.kv_tree.fetch_and_update(key, |old: Option<&[u8]>| {
             let number = match old {
                 Some(bytes) => {
                     if let Ok(array) = bytes.try_into() {
@@ -1197,11 +1276,9 @@ impl SledStorageDB {
     #[inline]
     fn _counter_get(&self, key: &[u8]) -> Result<Option<isize>> {
         let this = self;
-        if this._is_expired(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-            Self::_db_contains_key(this.db.as_ref(), k)
-        })? {
+        if this._is_expired(key, |k| Self::_kv_contains_key(&self.kv_tree, k))? {
             Ok(None)
-        } else if let Some(v) = this.db.get(key)? {
+        } else if let Some(v) = this.kv_tree.get(key)? {
             Ok(Some(isize::from_be_bytes(v.as_ref().try_into()?)))
         } else {
             Ok(None)
@@ -1210,49 +1287,74 @@ impl SledStorageDB {
 
     #[inline]
     fn _counter_set(&self, key: &[u8], val: isize) -> Result<()> {
-        let db = self.db.as_ref();
         let val = val.to_be_bytes().to_vec();
 
-        db.insert(key, val.as_slice())?;
+        #[cfg(not(feature = "ttl"))]
+        self.kv_tree.insert(key, val.as_slice())?;
         #[cfg(feature = "ttl")]
-        Self::_remove_expire_key(db, key, EXPIRE_AT_KEY_SUFFIX_DB)?;
-
+        {
+            // self._remove_expire_key(key)?;
+            // kv_tree.insert(key, val.as_slice())?;
+            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
+                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key)?;
+                    kv_tx.insert(key, val.as_slice())?;
+                    Ok::<(), ConflictableTransactionError<()>>(())
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }
         Ok(())
     }
 
     #[inline]
     fn _self_contains_key(&self, key: &[u8]) -> Result<bool> {
         let this = self;
-        if this._is_expired(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-            Self::_db_contains_key(this.db.as_ref(), k)
-        })? {
+        if this._is_expired(key, |k| Self::_kv_contains_key(&self.kv_tree, k))? {
             Ok(false)
         } else {
-            this._contains_key(key)
+            // this._contains_key(key, KeyType::KV)
+            Ok(true)
         }
     }
 
     #[inline]
     #[cfg(feature = "ttl")]
-    fn _expire_at(&self, key: &[u8], at: TimestampMillis) -> Result<bool> {
-        let expire_key = Self::_make_expire_key(key, EXPIRE_AT_KEY_SUFFIX_DB);
-        if self._contains_key(key)? {
-            let at_bytes = at.to_be_bytes();
-            self.db
-                .insert(expire_key, at_bytes.as_slice())
-                .map_err(|e| anyhow!(e))
-                .map(|_| true)
+    fn _expire_at(&self, key: &[u8], at: TimestampMillis, key_type: KeyType) -> Result<bool> {
+        if self._contains_key(key, key_type)? {
+            let res = (&self.key_expire_tree, &self.expire_key_tree)
+                .transaction(|(key_expire_tx, expire_key_tx)| {
+                    Self::_tx_expire_at(key_expire_tx, expire_key_tx, key, at, key_type)
+                })
+                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            Ok(res)
         } else {
             Ok(false)
         }
+    }
+
+    #[inline]
+    #[cfg(feature = "ttl")]
+    fn _tx_expire_at(
+        key_expire_tx: &TransactionalTree,
+        expire_key_tx: &TransactionalTree,
+        key: &[u8],
+        at: TimestampMillis,
+        key_type: KeyType,
+    ) -> ConflictableTransactionResult<bool> {
+        let at_bytes = at.to_be_bytes();
+        key_expire_tx.insert(key, at_bytes.as_slice())?;
+        let res = expire_key_tx
+            .insert([at_bytes.as_ref(), key].concat(), key_type.encode())
+            .map(|_| true)?;
+        Ok(res)
     }
 
     #[inline]
     #[cfg(feature = "ttl")]
     fn _self_ttl(&self, key: &[u8]) -> Result<Option<TimestampMillis>> {
-        self._ttl(key, EXPIRE_AT_KEY_SUFFIX_DB, |k| {
-            Self::_db_contains_key(self.db.as_ref(), k)
-        })
+        Ok(self
+            ._ttl(key, |k| Self::_kv_contains_key(&self.kv_tree, k))?
+            .and_then(|(ttl, _)| if ttl > 0 { Some(ttl) } else { None }))
     }
 
     #[inline]
@@ -1295,16 +1397,30 @@ impl SledStorageDB {
             start_pattern.map(Cow::Borrowed)
         };
         let iter = if let Some(start_pattern) = start_pattern {
-            self.db.scan_prefix(start_pattern.as_ref())
+            self.kv_tree.scan_prefix(start_pattern.as_ref())
         } else {
-            self.db.iter()
+            self.kv_tree.iter()
         };
         iter
     }
 
     #[inline]
+    fn _kv_len(&self) -> usize {
+        #[cfg(feature = "ttl")]
+        {
+            let limit = 500;
+            loop {
+                if self.cleanup_kvs(limit) < limit {
+                    break;
+                }
+            }
+        }
+        self.kv_tree.len()
+    }
+
+    #[inline]
     fn _db_size(&self) -> usize {
-        self.db.len()
+        self.db.len() + self.kv_tree.len() + self.map_tree.len() + self.list_tree.len()
     }
 
     #[inline]
@@ -1413,7 +1529,7 @@ impl StorageDB for SledStorageDB {
         let val = bincode::serialize(val)?;
         let (tx, rx) = oneshot::channel();
         self.cmd_send(Command::DBInsert(
-            self.db.clone(),
+            self.clone(),
             key.as_ref().to_vec(),
             val,
             tx,
@@ -1560,8 +1676,9 @@ impl StorageDB for SledStorageDB {
     #[inline]
     #[cfg(feature = "len")]
     async fn len(&self) -> Result<usize> {
-        log::warn!("unimplemented!");
-        self.db_size().await
+        let (tx, rx) = oneshot::channel();
+        self.cmd_send(Command::DBLen(self.clone(), tx)).await?;
+        Ok(rx.await?)
     }
 
     #[inline]
@@ -1894,6 +2011,26 @@ impl SledStorageMap {
 
     #[inline]
     fn _clear(&self) -> Result<()> {
+        let batch = self._make_clear_batch();
+        self.tree()
+            .transaction(|tx| self._tx_clear(tx, &batch))
+            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn _tx_clear(
+        &self,
+        map_tree_tx: &TransactionalTree,
+        batch: &Batch,
+    ) -> ConflictableTransactionResult<()> {
+        map_tree_tx.apply_batch(batch)?;
+        self.empty.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[inline]
+    fn _make_clear_batch(&self) -> Batch {
         let mut batch = Batch::default();
         //clear key-value
         for item in self.tree().scan_prefix(self.map_prefix_name.as_slice()) {
@@ -1906,9 +2043,7 @@ impl SledStorageMap {
                 }
             }
         }
-        self.tree().apply_batch(batch)?;
-        self.empty.store(true, Ordering::SeqCst);
-        Ok(())
+        batch
     }
 
     #[inline]
@@ -1938,17 +2073,20 @@ impl SledStorageMap {
 
         #[cfg(feature = "ttl")]
         {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
-                SledStorageDB::_remove_expire_key(
-                    this.db.db.as_ref(),
-                    this.name.as_slice(),
-                    EXPIRE_AT_KEY_SUFFIX_MAP,
-                )?;
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(this.tree(), k)
+            })? {
+                // this.db._remove_expire_key(this.name.as_slice())?;
+                (&self.db.key_expire_tree, &self.db.expire_key_tree)
+                    .transaction(|(key_expire_tx, expire_key_tx)| {
+                        SledStorageDB::_tx_remove_expire_key(
+                            key_expire_tx,
+                            expire_key_tx,
+                            this.name.as_slice(),
+                        )?;
+                        Ok::<(), ConflictableTransactionError<()>>(())
+                    })
+                    .map_err(|e| anyhow!(format!("{:?}", e)))?;
             }
         }
 
@@ -1959,11 +2097,9 @@ impl SledStorageMap {
     fn _get(&self, key: IVec) -> Result<Option<IVec>> {
         let this = self;
         let item_key = self.make_map_item_key(key.as_ref());
-        let res = if !this
-            .db
-            ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                SledStorageDB::_map_contains_key(this.tree(), k)
-            })? {
+        let res = if !this.db._is_expired(this.name.as_slice(), |k| {
+            SledStorageDB::_map_contains_key(this.tree(), k)
+        })? {
             this.tree().get(item_key).map_err(|e| anyhow!(e))?
         } else {
             None
@@ -1975,11 +2111,10 @@ impl SledStorageMap {
     fn _remove(&self, key: IVec) -> Result<()> {
         let tree = self.tree();
         let key = self.make_map_item_key(key.as_ref());
-        #[cfg(feature = "map_len")]
-        let count_key = self.map_count_key_name.to_vec();
 
         #[cfg(feature = "map_len")]
         {
+            let count_key = self.map_count_key_name.to_vec();
             tree.transaction(move |tx| {
                 if tx.remove(key.as_slice())?.is_some() {
                     Self::_tx_counter_dec(tx, count_key.as_slice())?;
@@ -2008,18 +2143,14 @@ impl SledStorageMap {
     fn _len(&self) -> Result<usize> {
         let this = self;
         let len = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(this.tree(), k)
+            })? {
                 Ok(0)
             } else {
                 this._len_get()
             }
         }?;
-
         Ok(len as usize)
     }
 
@@ -2027,12 +2158,9 @@ impl SledStorageMap {
     fn _is_empty(&self) -> Result<bool> {
         let this = self;
         let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(this.tree(), k)
+            })? {
                 true
             } else {
                 self.tree()
@@ -2049,12 +2177,9 @@ impl SledStorageMap {
         let key = self.make_map_item_key(key.as_ref());
         let this = self;
         let removed = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                    SledStorageDB::_map_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
                 #[cfg(feature = "map_len")]
@@ -2150,35 +2275,26 @@ impl SledStorageMap {
     #[cfg(feature = "ttl")]
     #[inline]
     fn _expire_at(&self, at: TimestampMillis) -> Result<bool> {
-        let this = self;
-        let expire_key =
-            SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP);
-        let res = {
-            let at_bytes = at.to_be_bytes();
-            this.db
-                .db
-                .insert(expire_key, at_bytes.as_slice())
-                .map_err(|e| anyhow!(e))
-                .map(|_| true)
-        }?;
-        Ok(res)
+        self.db._expire_at(self.name.as_slice(), at, KeyType::Map)
     }
 
     #[cfg(feature = "ttl")]
     #[inline]
     fn _ttl(&self) -> Result<Option<TimestampMillis>> {
-        let res = self.db._ttl(self.name(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-            SledStorageDB::_map_contains_key(self.tree(), k)
-        })?;
+        let res = self
+            .db
+            ._ttl(self.name(), |k| {
+                SledStorageDB::_map_contains_key(self.tree(), k)
+            })?
+            .and_then(|(at, _)| if at > 0 { Some(at) } else { None });
         Ok(res)
     }
 
     #[inline]
     fn _is_expired(&self) -> Result<bool> {
-        self.db
-            ._is_expired(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_MAP, |k| {
-                SledStorageDB::_map_contains_key(self.tree(), k)
-            })
+        self.db._is_expired(self.name.as_slice(), |k| {
+            SledStorageDB::_map_contains_key(self.tree(), k)
+        })
     }
 
     #[inline]
@@ -2664,14 +2780,46 @@ impl SledStorageList {
                 }
             }
         }
-        self.tree().apply_batch(batch)?;
+        self.tree()
+            .transaction(|tx| {
+                tx.apply_batch(&batch)?;
+                Ok::<_, ConflictableTransactionError<()>>(())
+            })
+            .map_err(|e| anyhow!(format!("{:?}", e)))?;
         Ok(())
+    }
+
+    #[inline]
+    fn _tx_clear(
+        list_tree_tx: &TransactionalTree,
+        batch: &Batch,
+    ) -> ConflictableTransactionResult<()> {
+        list_tree_tx.apply_batch(batch)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn _make_clear_batch(&self) -> Batch {
+        let mut batch = Batch::default();
+        let list_count_key = self.make_list_count_key();
+        batch.remove(list_count_key);
+        let list_content_prefix = Self::make_list_content_prefix(self.prefix_name.as_slice(), None);
+        for item in self.tree().scan_prefix(list_content_prefix).keys() {
+            match item {
+                Ok(k) => {
+                    batch.remove(k);
+                }
+                Err(e) => {
+                    log::warn!("{:?}", e);
+                }
+            }
+        }
+        batch
     }
 
     #[inline]
     fn _push(&self, data: IVec) -> Result<()> {
         let this = self;
-
         this.tree().transaction(move |tx| {
             let list_count_key = this.make_list_count_key();
             let (start, mut end) = Self::tx_list_count_get::<
@@ -2688,17 +2836,20 @@ impl SledStorageList {
 
         #[cfg(feature = "ttl")]
         {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
-                SledStorageDB::_remove_expire_key(
-                    this.db.db.as_ref(),
-                    this.name.as_slice(),
-                    EXPIRE_AT_KEY_SUFFIX_LIST,
-                )?;
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
+                // this.db._remove_expire_key(this.name.as_slice())?;
+                (&self.db.key_expire_tree, &self.db.expire_key_tree)
+                    .transaction(|(key_expire_tx, expire_key_tx)| {
+                        SledStorageDB::_tx_remove_expire_key(
+                            key_expire_tx,
+                            expire_key_tx,
+                            this.name.as_slice(),
+                        )?;
+                        Ok::<(), ConflictableTransactionError<()>>(())
+                    })
+                    .map_err(|e| anyhow!(format!("{:?}", e)))?;
             }
         }
 
@@ -2710,7 +2861,6 @@ impl SledStorageList {
         if vals.is_empty() {
             return Ok(());
         }
-
         let tree = self.tree();
         let this = self;
 
@@ -2736,17 +2886,20 @@ impl SledStorageList {
 
         #[cfg(feature = "ttl")]
         {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
-                SledStorageDB::_remove_expire_key(
-                    this.db.db.as_ref(),
-                    this.name.as_slice(),
-                    EXPIRE_AT_KEY_SUFFIX_LIST,
-                )?;
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
+                // this.db._remove_expire_key(this.name.as_slice())?;
+                (&self.db.key_expire_tree, &self.db.expire_key_tree)
+                    .transaction(|(key_expire_tx, expire_key_tx)| {
+                        SledStorageDB::_tx_remove_expire_key(
+                            key_expire_tx,
+                            expire_key_tx,
+                            this.name.as_slice(),
+                        )?;
+                        Ok::<(), ConflictableTransactionError<()>>(())
+                    })
+                    .map_err(|e| anyhow!(format!("{:?}", e)))?;
             }
         }
         Ok(())
@@ -2761,7 +2914,6 @@ impl SledStorageList {
     ) -> Result<Option<IVec>> {
         let tree = self.tree();
         let this = self;
-
         let removed = {
             let res = tree.transaction(move |tx| {
                 let list_count_key = this.make_list_count_key();
@@ -2798,17 +2950,20 @@ impl SledStorageList {
 
             #[cfg(feature = "ttl")]
             {
-                if this
-                    .db
-                    ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                        SledStorageDB::_list_contains_key(this.tree(), k)
-                    })?
-                {
-                    SledStorageDB::_remove_expire_key(
-                        this.db.db.as_ref(),
-                        this.name.as_slice(),
-                        EXPIRE_AT_KEY_SUFFIX_LIST,
-                    )?;
+                if this.db._is_expired(this.name.as_slice(), |k| {
+                    SledStorageDB::_list_contains_key(this.tree(), k)
+                })? {
+                    // this.db._remove_expire_key(this.name.as_slice())?;
+                    (&self.db.key_expire_tree, &self.db.expire_key_tree)
+                        .transaction(|(key_expire_tx, expire_key_tx)| {
+                            SledStorageDB::_tx_remove_expire_key(
+                                key_expire_tx,
+                                expire_key_tx,
+                                this.name.as_slice(),
+                            )?;
+                            Ok::<(), ConflictableTransactionError<()>>(())
+                        })
+                        .map_err(|e| anyhow!(format!("{:?}", e)))?;
                 }
             }
 
@@ -2823,12 +2978,9 @@ impl SledStorageList {
     fn _pop(&self) -> Result<Option<IVec>> {
         let this = self;
         let removed = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
                 let removed = this.tree().transaction(move |tx| {
@@ -2856,12 +3008,9 @@ impl SledStorageList {
     fn _all(&self) -> Result<Vec<IVec>> {
         let this = self;
         let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok(vec![])
             } else {
                 let key_content_prefix =
@@ -2880,12 +3029,9 @@ impl SledStorageList {
     fn _get_index(&self, idx: usize) -> Result<Option<IVec>> {
         let this = self;
         let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok(None)
             } else {
                 this.tree().transaction(move |tx| {
@@ -2914,12 +3060,9 @@ impl SledStorageList {
     fn _len(&self) -> Result<usize> {
         let this = self;
         let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok::<usize, anyhow::Error>(0)
             } else {
                 let list_count_key = this.make_list_count_key();
@@ -2938,12 +3081,9 @@ impl SledStorageList {
     fn _is_empty(&self) -> Result<bool> {
         let this = self;
         let res = {
-            if this
-                .db
-                ._is_expired(this.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })?
-            {
+            if this.db._is_expired(this.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(this.tree(), k)
+            })? {
                 Ok::<bool, anyhow::Error>(true)
             } else {
                 let list_content_prefix =
@@ -2962,34 +3102,25 @@ impl SledStorageList {
     #[cfg(feature = "ttl")]
     #[inline]
     fn _expire_at(&self, at: TimestampMillis) -> Result<bool> {
-        let this = self;
-        let expire_key =
-            SledStorageDB::_make_expire_key(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST);
-        let res = {
-            let at_bytes = at.to_be_bytes();
-            this.db
-                .db
-                .insert(expire_key, at_bytes.as_slice())
-                .map_err(|e| anyhow!(e))
-                .map(|_| true)
-        }?;
-        Ok(res)
+        self.db._expire_at(self.name.as_slice(), at, KeyType::List)
     }
 
     #[cfg(feature = "ttl")]
     #[inline]
     fn _ttl(&self) -> Result<Option<TimestampMillis>> {
-        self.db._ttl(self.name(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-            SledStorageDB::_list_contains_key(self.tree(), k)
-        })
+        Ok(self
+            .db
+            ._ttl(self.name(), |k| {
+                SledStorageDB::_list_contains_key(self.tree(), k)
+            })?
+            .and_then(|(at, _)| if at > 0 { Some(at) } else { None }))
     }
 
     #[inline]
     fn _is_expired(&self) -> Result<bool> {
-        self.db
-            ._is_expired(self.name.as_slice(), EXPIRE_AT_KEY_SUFFIX_LIST, |k| {
-                SledStorageDB::_list_contains_key(self.tree(), k)
-            })
+        self.db._is_expired(self.name.as_slice(), |k| {
+            SledStorageDB::_list_contains_key(self.tree(), k)
+        })
     }
 
     #[inline]
@@ -3532,10 +3663,6 @@ impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
                 None => None,
                 Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
                 Some(Ok((k, _))) => {
-                    if SledStorageDB::is_db_expire_key(k.as_ref()) {
-                        continue;
-                    }
-
                     if !is_match(self.pattern.clone(), k.as_ref()) {
                         continue;
                     }
