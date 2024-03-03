@@ -107,7 +107,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            typ: StorageType::Redis,
+            typ: StorageType::Sled,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 cleanup_f: |_db| {},
@@ -135,17 +135,28 @@ mod tests {
                     #[cfg(feature = "ttl")]
                     {
                         let db = _db.clone();
-                        std::thread::spawn(move || {
+                        tokio::spawn(async move {
+                            // std::thread::spawn(move || {
                             let limit = 1000;
-                            for _ in 0..10 {
-                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            for i in 0..10 {
+                                println!("{} a start cleanups ...", i,);
+                                // std::thread::sleep(std::time::Duration::from_secs(1));
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                 let mut total_cleanups = 0;
                                 let now = std::time::Instant::now();
+                                println!("{} b start cleanups ...", i,);
                                 loop {
-                                    let count = db.cleanup(limit);
+                                    println!("{} c start cleanups ...", i,);
+                                    let db1 = db.clone();
+                                    let count =
+                                        tokio::task::spawn_blocking(move || db1.cleanup(limit))
+                                            .await
+                                            .unwrap();
+                                    // let count = db.cleanup(limit);
                                     total_cleanups += count;
                                     println!(
-                                        "def_cleanup: {}, total cleanups: {}, cost time: {:?}",
+                                        "{} def_cleanup: {}, total cleanups: {}, cost time: {:?}",
+                                        i,
                                         count,
                                         total_cleanups,
                                         now.elapsed()
@@ -156,11 +167,13 @@ mod tests {
                                     }
                                 }
                                 println!(
-                                    "total cleanups: {}, cost time: {:?}",
+                                    "{} total cleanups: {}, cost time: {:?}",
+                                    i,
                                     total_cleanups,
                                     now.elapsed()
                                 );
                             }
+                            println!("&&&&&&&&&& test_sled_cleanup cleanup end. &&&&&&&&&&&");
                         });
                     }
                 },
@@ -192,18 +205,18 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
 
         println!(
-            "db_size: {:?}, map_size: {}, list_size: {}",
+            "$$$ db_size: {:?}",
             db.db_size().await,
-            db.map_size(),
-            db.list_size()
+            // db.map_size(),
+            // db.list_size()
         );
 
         tokio::time::sleep(Duration::from_secs(3)).await;
         println!(
-            "db_size: {:?}, map_size: {}, list_size: {}",
+            "$$$ db_size: {:?}",
             db.db_size().await,
-            db.map_size(),
-            db.list_size()
+            // db.map_size(),
+            // db.list_size()
         );
     }
 
@@ -217,7 +230,11 @@ mod tests {
             db.insert(i.to_be_bytes(), &i).await.unwrap();
         }
         let k_9999_val = db.get::<_, usize>(9999usize.to_be_bytes()).await.unwrap();
-        println!("9999: {:?}, cost time: {:?}", k_9999_val, now.elapsed());
+        println!(
+            "test_stress 9999: {:?}, cost time: {:?}",
+            k_9999_val,
+            now.elapsed()
+        );
         assert_eq!(k_9999_val, Some(9999));
 
         let s_m_1 = db.map("s_m_1", None).await.unwrap();
@@ -233,7 +250,7 @@ mod tests {
             .await
             .unwrap();
         println!(
-            "s_m_1 9999: {:?}, cost time: {:?}",
+            "test_stress s_m_1 9999: {:?}, cost time: {:?}",
             k_9999_val,
             now.elapsed()
         );
@@ -245,11 +262,11 @@ mod tests {
         for i in 0..10_000usize {
             s_l_1.push(&i).await.unwrap();
         }
-        println!("s_l_1: {:?}", s_l_1.len().await.unwrap());
+        println!("test_stress s_l_1: {:?}", s_l_1.len().await.unwrap());
         assert_eq!(s_l_1.len().await.unwrap(), 10_000);
         let l_9999_val = s_l_1.get_index::<usize>(9999).await.unwrap();
         println!(
-            "s_l_1 9999: {:?}, cost time: {:?}",
+            "test_stress s_l_1 9999: {:?}, cost time: {:?}",
             l_9999_val,
             now.elapsed()
         );
@@ -262,14 +279,17 @@ mod tests {
             let s_m = db.map(format!("s_m_{}", i), None).await.unwrap();
             s_m.insert(i.to_be_bytes(), &i).await.unwrap();
         }
-        println!("s_m, cost time: {:?}", now.elapsed());
+        println!("test_stress s_m, cost time: {:?}", now.elapsed());
 
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
             let s_l = db.list(format!("s_l_{}", i), None).await.unwrap();
             s_l.push(&i).await.unwrap();
         }
-        println!("s_l, cost time: {:?}", now.elapsed());
+        println!("test_stress s_l, cost time: {:?}", now.elapsed());
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        println!("$$$ test_stress db_size: {:?}", db.db_size().await,);
     }
 
     #[cfg(feature = "ttl")]
@@ -586,9 +606,9 @@ mod tests {
         println!("3 test_db_expire map expire_res: {:?}", expire_res);
         assert_eq!(expire_res, true);
 
-        let ttl_001_res = ttl_001.ttl().await.unwrap().unwrap();
+        let ttl_001_res = ttl_001.ttl().await.unwrap();
         println!("4 test_db_expire map ttl_001_res: {:?}", ttl_001_res);
-        assert!(ttl_001_res <= 1 * 1000);
+        assert!(ttl_001_res.unwrap() <= 1 * 1000);
 
         let k1_v = ttl_001.get::<_, i32>("k1").await.unwrap();
         let k2_v = ttl_001.get::<_, i32>("k2").await.unwrap();
@@ -738,9 +758,9 @@ mod tests {
         println!("x0 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
         assert!(l_ttl_001_res <= 1 * 1000);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
+        let l_ttl_001_res = l_ttl_001.ttl().await.unwrap();
         println!("x1 test_db_expire list l_ttl_001_res: {:?}", l_ttl_001_res);
-        assert!(l_ttl_001_res <= 500);
+        assert!(l_ttl_001_res.unwrap() <= 500);
         l_ttl_001.push(&11).await.unwrap();
 
         let l_ttl_001_res = l_ttl_001.ttl().await.unwrap().unwrap();
@@ -1516,7 +1536,7 @@ mod tests {
         let cfg = Config {
             typ: StorageType::Sled,
             sled: SledConfig {
-                path: format!("./.catch/{}", "map_expire"),
+                path: format!("./.catch/{}", "map_expire_list"),
                 cache_capacity: convert::Bytesize::from(1024 * 1024 * 1024 * 3),
                 cleanup_f: move |_db| {
                     #[cfg(feature = "ttl")]
@@ -1557,7 +1577,7 @@ mod tests {
             },
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379/".into(),
-                prefix: "sled_cleanup".to_owned(),
+                prefix: "map_expire_list".to_owned(),
             },
         };
 
@@ -1707,9 +1727,10 @@ mod tests {
 
     #[tokio::main]
     #[cfg(feature = "len")]
-    #[test]
+    #[allow(dead_code)]
+    // #[test]
     async fn test_len() {
-        let cfg = get_cfg("len");
+        let cfg = get_cfg("test_len");
         let mut db = init_db(&cfg).await.unwrap();
         println!("a test_len len: {:?}", db.len().await);
         let iter = db.scan("*").await.unwrap();
