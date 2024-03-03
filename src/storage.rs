@@ -35,6 +35,7 @@ impl SplitSubslice for [u8] {
 }
 
 #[async_trait]
+#[allow(clippy::len_without_is_empty)]
 pub trait StorageDB: Send + Sync {
     type MapType: Map;
     type ListType: List;

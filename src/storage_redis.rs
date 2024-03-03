@@ -253,20 +253,19 @@ impl RedisStorageDB {
 
         #[cfg(feature = "len")]
         {
-            let (full_key_vals, expire_keys): (Vec<(Key, &Vec<u8>)>, Vec<(TimestampMillis, &Key)>) =
-                key_val_expires
-                    .iter()
-                    .map(|(key_ref, value, timestamp)| {
-                        let full_key_vals = (self.make_full_key(key_ref), value);
-                        let expire_keys = (
-                            timestamp
-                                .map(|t| timestamp_millis() + t)
-                                .unwrap_or(i64::MAX),
-                            key_ref,
-                        );
-                        (full_key_vals, expire_keys)
-                    })
-                    .unzip();
+            let (full_key_vals, expire_keys): (Vec<_>, Vec<_>) = key_val_expires
+                .iter()
+                .map(|(key_ref, value, timestamp)| {
+                    let full_key_vals = (self.make_full_key(key_ref), value);
+                    let expire_keys = (
+                        timestamp
+                            .map(|t| timestamp_millis() + t)
+                            .unwrap_or(i64::MAX),
+                        key_ref,
+                    );
+                    (full_key_vals, expire_keys)
+                })
+                .unzip();
 
             let db_zkey = self.make_len_sortedset_key();
             let mut async_conn = self.async_conn();
@@ -1331,7 +1330,7 @@ impl RedisStorageList {
                         .query_async(&mut conn)
                         .await?;
 
-                    Ok(if let Some(v) = poped { Some(v) } else { None })
+                    Ok(poped)
                 } else {
                     Err(anyhow::Error::msg("Is full"))
                 };
