@@ -75,18 +75,18 @@ impl RedisStorageDB {
 
     fn cleanup(self) -> Self {
         let db = self.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(30));
-            let mut async_conn = db.async_conn();
-            let db_zkey = db.make_len_sortedset_key();
-            futures::executor::block_on(async move {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let mut async_conn = db.async_conn();
+                let db_zkey = db.make_len_sortedset_key();
                 if let Err(e) = async_conn
                     .zrembyscore::<'_, _, _, _, ()>(db_zkey.as_slice(), 0, timestamp_millis())
                     .await
                 {
                     log::error!("{:?}", e);
                 }
-            });
+            }
         });
         self
     }
