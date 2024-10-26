@@ -1,12 +1,13 @@
 use anyhow::anyhow;
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{pipe, AsyncCommands};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 use crate::{Result, StorageList, StorageMap};
@@ -54,15 +55,13 @@ impl RedisStorageDB {
                 return Err(anyhow!(e));
             }
         };
-        let async_conn = match client
-            .get_connection_manager_with_backoff(
-                2, 100,
-                2,
-                // Duration::from_secs(5),
-                // Duration::from_secs(8),
-            )
-            .await
-        {
+        let mgr_cfg = ConnectionManagerConfig::default()
+            .set_exponent_base(100)
+            .set_factor(2)
+            .set_number_of_retries(2)
+            .set_connection_timeout(Duration::from_secs(15))
+            .set_response_timeout(Duration::from_secs(10));
+        let async_conn = match client.get_connection_manager_with_config(mgr_cfg).await {
             Ok(conn) => conn,
             Err(e) => {
                 log::error!("get redis connection error, config is {:?}, {:?}", cfg, e);
@@ -194,10 +193,11 @@ impl RedisStorageDB {
                     .atomic()
                     .set(full_key.as_slice(), bincode::serialize(val)?)
                     .pexpire(full_key.as_slice(), expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
-                self.async_conn()
+                let _: () = self
+                    .async_conn()
                     .set(full_key, bincode::serialize(val)?)
                     .await?;
             }
@@ -212,14 +212,14 @@ impl RedisStorageDB {
                     .set(full_key.as_slice(), bincode::serialize(val)?)
                     .pexpire(full_key.as_slice(), expire_interval)
                     .zadd(db_zkey, key.as_ref(), timestamp_millis() + expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
                 pipe()
                     .atomic()
                     .set(full_key.as_slice(), bincode::serialize(val)?)
                     .zadd(db_zkey, key.as_ref(), i64::MAX)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             }
         }
@@ -248,7 +248,7 @@ impl RedisStorageDB {
                     rpipe = rpipe.expire(k, at);
                 }
             }
-            rpipe.query_async::<_, ()>(&mut async_conn).await?;
+            rpipe.query_async::<()>(&mut async_conn).await?;
         }
 
         #[cfg(feature = "len")]
@@ -279,7 +279,7 @@ impl RedisStorageDB {
                     rpipe = rpipe.expire(k, at);
                 }
             }
-            rpipe.query_async::<_, ((), ())>(&mut async_conn).await?;
+            rpipe.query_async::<((), ())>(&mut async_conn).await?;
         }
         Ok(())
     }
@@ -292,7 +292,7 @@ impl RedisStorageDB {
             .collect::<Vec<_>>();
         #[cfg(not(feature = "len"))]
         {
-            self.async_conn().del(full_keys).await?;
+            let _: () = self.async_conn().del(full_keys).await?;
         }
         #[cfg(feature = "len")]
         {
@@ -302,7 +302,7 @@ impl RedisStorageDB {
                 .atomic()
                 .del(full_keys.as_slice())
                 .zrem(db_zkey, keys)
-                .query_async::<_, ()>(&mut async_conn)
+                .query_async::<()>(&mut async_conn)
                 .await?;
         }
         Ok(())
@@ -327,10 +327,10 @@ impl RedisStorageDB {
                     .atomic()
                     .incr(full_key.as_slice(), increment)
                     .pexpire(full_key.as_slice(), expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
-                self.async_conn().incr(full_key, increment).await?;
+                let _: () = self.async_conn().incr(full_key, increment).await?;
             }
         }
         #[cfg(feature = "len")]
@@ -343,14 +343,14 @@ impl RedisStorageDB {
                     .incr(full_key.as_slice(), increment)
                     .pexpire(full_key.as_slice(), expire_interval)
                     .zadd(db_zkey, key.as_ref(), timestamp_millis() + expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
                 pipe()
                     .atomic()
                     .incr(full_key.as_slice(), increment)
                     .zadd(db_zkey, key.as_ref(), i64::MAX)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             }
         }
@@ -377,10 +377,10 @@ impl RedisStorageDB {
                     .atomic()
                     .decr(full_key.as_slice(), decrement)
                     .pexpire(full_key.as_slice(), expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
-                self.async_conn().decr(full_key, decrement).await?;
+                let _: () = self.async_conn().decr(full_key, decrement).await?;
             }
         }
         #[cfg(feature = "len")]
@@ -393,14 +393,14 @@ impl RedisStorageDB {
                     .decr(full_key.as_slice(), decrement)
                     .pexpire(full_key.as_slice(), expire_interval)
                     .zadd(db_zkey, key.as_ref(), timestamp_millis() + expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
                 pipe()
                     .atomic()
                     .decr(full_key.as_slice(), decrement)
                     .zadd(db_zkey, key.as_ref(), i64::MAX)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             }
         }
@@ -426,10 +426,10 @@ impl RedisStorageDB {
                     .atomic()
                     .set(full_key.as_slice(), val)
                     .pexpire(full_key.as_slice(), expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
-                self.async_conn().set(full_key, val).await?;
+                let _: () = self.async_conn().set(full_key, val).await?;
             }
         }
         #[cfg(feature = "len")]
@@ -442,14 +442,14 @@ impl RedisStorageDB {
                     .set(full_key.as_slice(), val)
                     .pexpire(full_key.as_slice(), expire_interval)
                     .zadd(db_zkey, key.as_ref(), timestamp_millis() + expire_interval)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
                 pipe()
                     .atomic()
                     .set(full_key.as_slice(), val)
                     .zadd(db_zkey, key.as_ref(), i64::MAX)
-                    .query_async::<_, ()>(&mut async_conn)
+                    .query_async::<()>(&mut async_conn)
                     .await?;
             }
         }
@@ -466,7 +466,7 @@ impl RedisStorageDB {
 
         #[cfg(not(feature = "len"))]
         {
-            self.async_conn().del(full_key).await?;
+            let _: () = self.async_conn().del(full_key).await?;
         }
         #[cfg(feature = "len")]
         {
@@ -476,7 +476,7 @@ impl RedisStorageDB {
                 .atomic()
                 .del(full_key.as_slice())
                 .zrem(db_zkey, key.as_ref())
-                .query_async::<_, ()>(&mut async_conn)
+                .query_async::<()>(&mut async_conn)
                 .await?;
         }
         Ok(())
@@ -507,7 +507,7 @@ impl StorageDB for RedisStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let map_full_name = self.make_map_full_name(name.as_ref());
-        self.async_conn().del(map_full_name).await?;
+        let _: () = self.async_conn().del(map_full_name).await?;
         Ok(())
     }
 
@@ -536,7 +536,7 @@ impl StorageDB for RedisStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         let list_full_name = self.make_list_full_name(name.as_ref());
-        self.async_conn().del(list_full_name).await?;
+        let _: () = self.async_conn().del(list_full_name).await?;
         Ok(())
     }
 
@@ -656,7 +656,7 @@ impl StorageDB for RedisStorageDB {
         let (_, count) = pipe()
             .zrembyscore(db_zkey.as_slice(), 0, timestamp_millis())
             .zcard(db_zkey.as_slice())
-            .query_async::<_, (i64, usize)>(&mut async_conn)
+            .query_async::<(i64, usize)>(&mut async_conn)
             .await?;
         Ok(count)
     }
@@ -667,7 +667,7 @@ impl StorageDB for RedisStorageDB {
         //DBSIZE
         let dbsize = redis::pipe()
             .cmd("DBSIZE")
-            .query_async::<_, redis::Value>(&mut async_conn)
+            .query_async::<redis::Value>(&mut async_conn)
             .await?;
         let dbsize = dbsize.as_sequence().and_then(|vs| {
             vs.iter().next().and_then(|v| {
@@ -704,7 +704,7 @@ impl StorageDB for RedisStorageDB {
                 .atomic()
                 .zadd(db_zkey, key.as_ref(), at)
                 .pexpire_at(full_name.as_slice(), at)
-                .query_async::<_, (i64, bool)>(&mut async_conn)
+                .query_async::<(i64, bool)>(&mut async_conn)
                 .await?;
             Ok(res)
         }
@@ -731,7 +731,7 @@ impl StorageDB for RedisStorageDB {
                 .atomic()
                 .zadd(db_zkey, key.as_ref(), timestamp_millis() + dur)
                 .pexpire(full_name.as_slice(), dur)
-                .query_async::<_, (i64, bool)>(&mut async_conn)
+                .query_async::<(i64, bool)>(&mut async_conn)
                 .await?;
             Ok(res)
         }
@@ -801,7 +801,7 @@ impl StorageDB for RedisStorageDB {
         let mut conn = self.async_conn();
         let dbsize = redis::pipe()
             .cmd("dbsize")
-            .query_async::<_, redis::Value>(&mut conn)
+            .query_async::<redis::Value>(&mut conn)
             .await?;
         let dbsize = dbsize.as_sequence().and_then(|vs| {
             vs.iter().next().and_then(|v| {
@@ -895,7 +895,7 @@ impl RedisStorageMap {
             if let Some(expire) = self.expire.as_ref() {
                 //HSET key field value
                 //PEXPIRE key ms
-                redis::pipe()
+                let _: () = redis::pipe()
                     .atomic()
                     .hset(name, key, val)
                     .pexpire(name, *expire)
@@ -907,7 +907,7 @@ impl RedisStorageMap {
         }
 
         //HSET key field value
-        async_conn.hset(name, key.as_ref(), val).await?;
+        let _: () = async_conn.hset(name, key.as_ref(), val).await?;
         Ok(())
     }
 
@@ -921,7 +921,7 @@ impl RedisStorageMap {
             if let Some(expire) = self.expire.as_ref() {
                 //HMSET key field value
                 //PEXPIRE key ms
-                redis::pipe()
+                let _: () = redis::pipe()
                     .atomic()
                     .hset_multiple(name, key_vals.as_slice())
                     .pexpire(name, *expire)
@@ -934,7 +934,7 @@ impl RedisStorageMap {
         }
 
         //HSET key field value
-        async_conn.hset_multiple(name, key_vals.as_slice()).await?;
+        let _: () = async_conn.hset_multiple(name, key_vals.as_slice()).await?;
         Ok(())
     }
 }
@@ -980,7 +980,8 @@ impl Map for RedisStorageMap {
         K: AsRef<[u8]> + Sync + Send,
     {
         //HDEL key field [field ...]
-        self.async_conn()
+        let _: () = self
+            .async_conn()
             .hdel(self.full_name.as_slice(), key.as_ref())
             .await?;
         Ok(())
@@ -1019,7 +1020,7 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn clear(&self) -> Result<()> {
         //DEL key [key ...]
-        self.async_conn().del(self.full_name.as_slice()).await?;
+        let _: () = self.async_conn().del(self.full_name.as_slice()).await?;
         self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1067,12 +1068,12 @@ impl Map for RedisStorageMap {
         {
             removeds.push(key);
             if removeds.len() > 20 {
-                conn2.hdel(name, removeds.as_slice()).await?;
+                let _: () = conn2.hdel(name, removeds.as_slice()).await?;
                 removeds.clear();
             }
         }
         if !removeds.is_empty() {
-            conn.hdel(name, removeds).await?;
+            let _: () = conn.hdel(name, removeds).await?;
         }
         Ok(())
     }
@@ -1100,7 +1101,8 @@ impl Map for RedisStorageMap {
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if !keys.is_empty() {
-            self.async_conn()
+            let _: () = self
+                .async_conn()
                 .hdel(self.full_name.as_slice(), keys)
                 .await?;
         }
@@ -1257,7 +1259,7 @@ impl RedisStorageList {
             if let Some(expire) = self.expire.as_ref() {
                 //RPUSH key value [value ...]
                 //PEXPIRE key ms
-                redis::pipe()
+                let _: () = redis::pipe()
                     .atomic()
                     .rpush(name, val)
                     .pexpire(name, *expire)
@@ -1269,7 +1271,7 @@ impl RedisStorageList {
         }
 
         //RPUSH key value [value ...]
-        async_conn.rpush(name, val).await?;
+        let _: () = async_conn.rpush(name, val).await?;
         Ok(())
     }
 
@@ -1283,7 +1285,7 @@ impl RedisStorageList {
                 let name = self.full_name.as_slice();
                 //RPUSH key value [value ...]
                 //PEXPIRE key ms
-                redis::pipe()
+                let _: () = redis::pipe()
                     .atomic()
                     .rpush(name, vals)
                     .pexpire(name, *expire)
@@ -1295,7 +1297,7 @@ impl RedisStorageList {
         }
 
         //RPUSH key value [value ...]
-        async_conn.rpush(self.full_name.as_slice(), vals).await?;
+        let _: () = async_conn.rpush(self.full_name.as_slice(), vals).await?;
         Ok(())
     }
 
@@ -1314,7 +1316,7 @@ impl RedisStorageList {
                 let name = self.full_name.as_slice();
                 let count = conn.llen::<_, usize>(name).await?;
                 let res = if count < limit {
-                    redis::pipe()
+                    let _: () = redis::pipe()
                         .atomic()
                         .rpush(name, val)
                         .pexpire(name, *expire)
@@ -1355,7 +1357,7 @@ impl RedisStorageList {
 
         let count = async_conn.llen::<_, usize>(name).await?;
         if count < limit {
-            async_conn.rpush(name, val).await?;
+            let _: () = async_conn.rpush(name, val).await?;
             Ok(None)
         } else if pop_front_if_limited {
             let (poped, _): (Option<Vec<u8>>, Option<()>) = redis::pipe()
@@ -1490,7 +1492,7 @@ impl List for RedisStorageList {
 
     #[inline]
     async fn clear(&self) -> Result<()> {
-        self.async_conn().del(self.full_name.as_slice()).await?;
+        let _: () = self.async_conn().del(self.full_name.as_slice()).await?;
         self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
