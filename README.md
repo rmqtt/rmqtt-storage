@@ -14,7 +14,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rmqtt-storage = "0.5"
+rmqtt-storage = "0.6"
 ```
 
 ## Features
@@ -25,3 +25,4 @@ rmqtt-storage = "0.5"
 - Supports key expiration.
 - Provides an implementation for 'sled'.
 - Provides an implementation for 'redis'.
+- Provides an implementation for 'redis cluster'. Note: the 'len' feature is not supported yet.

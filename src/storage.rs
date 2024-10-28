@@ -5,6 +5,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::storage_redis::{RedisStorageDB, RedisStorageList, RedisStorageMap};
+use crate::storage_redis_cluster::{
+    RedisStorageDB as RedisClusterStorageDB, RedisStorageList as RedisClusterStorageList,
+    RedisStorageMap as RedisClusterStorageMap,
+};
 use crate::storage_sled::SledStorageDB;
 use crate::storage_sled::{SledStorageList, SledStorageMap};
 use crate::Result;
@@ -271,6 +275,7 @@ pub trait List: Sync + Send {
 pub enum DefaultStorageDB {
     Sled(SledStorageDB),
     Redis(RedisStorageDB),
+    RedisCluster(RedisClusterStorageDB),
 }
 
 impl DefaultStorageDB {
@@ -283,6 +288,9 @@ impl DefaultStorageDB {
         Ok(match self {
             DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name, expire).await?),
             DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name, expire).await?),
+            DefaultStorageDB::RedisCluster(db) => {
+                StorageMap::RedisCluster(db.map(name, expire).await?)
+            }
         })
     }
 
@@ -294,6 +302,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.map_remove(name).await,
             DefaultStorageDB::Redis(db) => db.map_remove(name).await,
+            DefaultStorageDB::RedisCluster(db) => db.map_remove(name).await,
         }
     }
 
@@ -302,6 +311,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.map_contains_key(key).await,
             DefaultStorageDB::Redis(db) => db.map_contains_key(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.map_contains_key(key).await,
         }
     }
 
@@ -314,6 +324,9 @@ impl DefaultStorageDB {
         Ok(match self {
             DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name, expire).await?),
             DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name, expire).await?),
+            DefaultStorageDB::RedisCluster(db) => {
+                StorageList::RedisCluster(db.list(name, expire).await?)
+            }
         })
     }
 
@@ -325,6 +338,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.list_remove(name).await,
             DefaultStorageDB::Redis(db) => db.list_remove(name).await,
+            DefaultStorageDB::RedisCluster(db) => db.list_remove(name).await,
         }
     }
 
@@ -333,6 +347,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.list_contains_key(key).await,
             DefaultStorageDB::Redis(db) => db.list_contains_key(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.list_contains_key(key).await,
         }
     }
 
@@ -345,6 +360,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.insert(key, val).await,
             DefaultStorageDB::Redis(db) => db.insert(key, val).await,
+            DefaultStorageDB::RedisCluster(db) => db.insert(key, val).await,
         }
     }
 
@@ -357,6 +373,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.get(key).await,
             DefaultStorageDB::Redis(db) => db.get(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.get(key).await,
         }
     }
 
@@ -368,6 +385,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.remove(key).await,
             DefaultStorageDB::Redis(db) => db.remove(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.remove(key).await,
         }
     }
 
@@ -379,6 +397,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.batch_insert(key_vals).await,
             DefaultStorageDB::Redis(db) => db.batch_insert(key_vals).await,
+            DefaultStorageDB::RedisCluster(db) => db.batch_insert(key_vals).await,
         }
     }
 
@@ -387,6 +406,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.batch_remove(keys).await,
             DefaultStorageDB::Redis(db) => db.batch_remove(keys).await,
+            DefaultStorageDB::RedisCluster(db) => db.batch_remove(keys).await,
         }
     }
 
@@ -398,6 +418,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.counter_incr(key, increment).await,
             DefaultStorageDB::Redis(db) => db.counter_incr(key, increment).await,
+            DefaultStorageDB::RedisCluster(db) => db.counter_incr(key, increment).await,
         }
     }
 
@@ -409,6 +430,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.counter_decr(key, decrement).await,
             DefaultStorageDB::Redis(db) => db.counter_decr(key, decrement).await,
+            DefaultStorageDB::RedisCluster(db) => db.counter_decr(key, decrement).await,
         }
     }
 
@@ -420,6 +442,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.counter_get(key).await,
             DefaultStorageDB::Redis(db) => db.counter_get(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.counter_get(key).await,
         }
     }
 
@@ -431,6 +454,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.counter_set(key, val).await,
             DefaultStorageDB::Redis(db) => db.counter_set(key, val).await,
+            DefaultStorageDB::RedisCluster(db) => db.counter_set(key, val).await,
         }
     }
 
@@ -440,6 +464,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.len().await,
             DefaultStorageDB::Redis(db) => db.len().await,
+            DefaultStorageDB::RedisCluster(db) => db.len().await,
         }
     }
 
@@ -448,6 +473,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.db_size().await,
             DefaultStorageDB::Redis(db) => db.db_size().await,
+            DefaultStorageDB::RedisCluster(db) => db.db_size().await,
         }
     }
 
@@ -456,6 +482,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.contains_key(key).await,
             DefaultStorageDB::Redis(db) => db.contains_key(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.contains_key(key).await,
         }
     }
 
@@ -468,6 +495,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.expire_at(key, at).await,
             DefaultStorageDB::Redis(db) => db.expire_at(key, at).await,
+            DefaultStorageDB::RedisCluster(db) => db.expire_at(key, at).await,
         }
     }
 
@@ -480,6 +508,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.expire(key, dur).await,
             DefaultStorageDB::Redis(db) => db.expire(key, dur).await,
+            DefaultStorageDB::RedisCluster(db) => db.expire(key, dur).await,
         }
     }
 
@@ -492,6 +521,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.ttl(key).await,
             DefaultStorageDB::Redis(db) => db.ttl(key).await,
+            DefaultStorageDB::RedisCluster(db) => db.ttl(key).await,
         }
     }
 
@@ -502,6 +532,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.map_iter().await,
             DefaultStorageDB::Redis(db) => db.map_iter().await,
+            DefaultStorageDB::RedisCluster(db) => db.map_iter().await,
         }
     }
 
@@ -512,6 +543,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.list_iter().await,
             DefaultStorageDB::Redis(db) => db.list_iter().await,
+            DefaultStorageDB::RedisCluster(db) => db.list_iter().await,
         }
     }
 
@@ -526,6 +558,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.scan(pattern).await,
             DefaultStorageDB::Redis(db) => db.scan(pattern).await,
+            DefaultStorageDB::RedisCluster(db) => db.scan(pattern).await,
         }
     }
 
@@ -534,6 +567,7 @@ impl DefaultStorageDB {
         match self {
             DefaultStorageDB::Sled(db) => db.info().await,
             DefaultStorageDB::Redis(db) => db.info().await,
+            DefaultStorageDB::RedisCluster(db) => db.info().await,
         }
     }
 }
@@ -542,6 +576,7 @@ impl DefaultStorageDB {
 pub enum StorageMap {
     Sled(SledStorageMap),
     Redis(RedisStorageMap),
+    RedisCluster(RedisClusterStorageMap),
 }
 
 #[async_trait]
@@ -550,6 +585,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.name(),
             StorageMap::Redis(m) => m.name(),
+            StorageMap::RedisCluster(m) => m.name(),
         }
     }
 
@@ -561,6 +597,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.insert(key, val).await,
             StorageMap::Redis(m) => m.insert(key, val).await,
+            StorageMap::RedisCluster(m) => m.insert(key, val).await,
         }
     }
 
@@ -572,6 +609,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.get(key).await,
             StorageMap::Redis(m) => m.get(key).await,
+            StorageMap::RedisCluster(m) => m.get(key).await,
         }
     }
 
@@ -582,6 +620,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.remove(key).await,
             StorageMap::Redis(m) => m.remove(key).await,
+            StorageMap::RedisCluster(m) => m.remove(key).await,
         }
     }
 
@@ -589,6 +628,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.contains_key(key).await,
             StorageMap::Redis(m) => m.contains_key(key).await,
+            StorageMap::RedisCluster(m) => m.contains_key(key).await,
         }
     }
 
@@ -597,6 +637,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.len().await,
             StorageMap::Redis(m) => m.len().await,
+            StorageMap::RedisCluster(m) => m.len().await,
         }
     }
 
@@ -604,6 +645,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.is_empty().await,
             StorageMap::Redis(m) => m.is_empty().await,
+            StorageMap::RedisCluster(m) => m.is_empty().await,
         }
     }
 
@@ -611,6 +653,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.clear().await,
             StorageMap::Redis(m) => m.clear().await,
+            StorageMap::RedisCluster(m) => m.clear().await,
         }
     }
 
@@ -622,6 +665,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.remove_and_fetch(key).await,
             StorageMap::Redis(m) => m.remove_and_fetch(key).await,
+            StorageMap::RedisCluster(m) => m.remove_and_fetch(key).await,
         }
     }
 
@@ -632,6 +676,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.remove_with_prefix(prefix).await,
             StorageMap::Redis(m) => m.remove_with_prefix(prefix).await,
+            StorageMap::RedisCluster(m) => m.remove_with_prefix(prefix).await,
         }
     }
 
@@ -642,6 +687,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.batch_insert(key_vals).await,
             StorageMap::Redis(m) => m.batch_insert(key_vals).await,
+            StorageMap::RedisCluster(m) => m.batch_insert(key_vals).await,
         }
     }
 
@@ -649,6 +695,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.batch_remove(keys).await,
             StorageMap::Redis(m) => m.batch_remove(keys).await,
+            StorageMap::RedisCluster(m) => m.batch_remove(keys).await,
         }
     }
 
@@ -661,6 +708,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.iter().await,
             StorageMap::Redis(m) => m.iter().await,
+            StorageMap::RedisCluster(m) => m.iter().await,
         }
     }
 
@@ -670,6 +718,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.key_iter().await,
             StorageMap::Redis(m) => m.key_iter().await,
+            StorageMap::RedisCluster(m) => m.key_iter().await,
         }
     }
 
@@ -684,6 +733,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.prefix_iter(prefix).await,
             StorageMap::Redis(m) => m.prefix_iter(prefix).await,
+            StorageMap::RedisCluster(m) => m.prefix_iter(prefix).await,
         }
     }
 
@@ -692,6 +742,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.expire_at(at).await,
             StorageMap::Redis(m) => m.expire_at(at).await,
+            StorageMap::RedisCluster(m) => m.expire_at(at).await,
         }
     }
 
@@ -700,6 +751,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.expire(dur).await,
             StorageMap::Redis(m) => m.expire(dur).await,
+            StorageMap::RedisCluster(m) => m.expire(dur).await,
         }
     }
 
@@ -708,6 +760,7 @@ impl Map for StorageMap {
         match self {
             StorageMap::Sled(m) => m.ttl().await,
             StorageMap::Redis(m) => m.ttl().await,
+            StorageMap::RedisCluster(m) => m.ttl().await,
         }
     }
 }
@@ -716,6 +769,7 @@ impl Map for StorageMap {
 pub enum StorageList {
     Sled(SledStorageList),
     Redis(RedisStorageList),
+    RedisCluster(RedisClusterStorageList),
 }
 
 impl fmt::Debug for StorageList {
@@ -723,6 +777,7 @@ impl fmt::Debug for StorageList {
         let name = match self {
             StorageList::Sled(list) => list.name(),
             StorageList::Redis(list) => list.name(),
+            StorageList::RedisCluster(list) => list.name(),
         };
 
         f.debug_tuple(&format!("StorageList({:?})", String::from_utf8_lossy(name)))
@@ -736,6 +791,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(m) => m.name(),
             StorageList::Redis(m) => m.name(),
+            StorageList::RedisCluster(m) => m.name(),
         }
     }
 
@@ -746,6 +802,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.push(val).await,
             StorageList::Redis(list) => list.push(val).await,
+            StorageList::RedisCluster(list) => list.push(val).await,
         }
     }
 
@@ -756,6 +813,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.pushs(vals).await,
             StorageList::Redis(list) => list.pushs(vals).await,
+            StorageList::RedisCluster(list) => list.pushs(vals).await,
         }
     }
 
@@ -772,6 +830,9 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.push_limit(val, limit, pop_front_if_limited).await,
             StorageList::Redis(list) => list.push_limit(val, limit, pop_front_if_limited).await,
+            StorageList::RedisCluster(list) => {
+                list.push_limit(val, limit, pop_front_if_limited).await
+            }
         }
     }
 
@@ -782,6 +843,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.pop().await,
             StorageList::Redis(list) => list.pop().await,
+            StorageList::RedisCluster(list) => list.pop().await,
         }
     }
 
@@ -792,6 +854,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.all().await,
             StorageList::Redis(list) => list.all().await,
+            StorageList::RedisCluster(list) => list.all().await,
         }
     }
 
@@ -802,6 +865,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.get_index(idx).await,
             StorageList::Redis(list) => list.get_index(idx).await,
+            StorageList::RedisCluster(list) => list.get_index(idx).await,
         }
     }
 
@@ -809,6 +873,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.len().await,
             StorageList::Redis(list) => list.len().await,
+            StorageList::RedisCluster(list) => list.len().await,
         }
     }
 
@@ -816,6 +881,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.is_empty().await,
             StorageList::Redis(list) => list.is_empty().await,
+            StorageList::RedisCluster(list) => list.is_empty().await,
         }
     }
 
@@ -823,6 +889,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.clear().await,
             StorageList::Redis(list) => list.clear().await,
+            StorageList::RedisCluster(list) => list.clear().await,
         }
     }
 
@@ -835,6 +902,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(list) => list.iter().await,
             StorageList::Redis(list) => list.iter().await,
+            StorageList::RedisCluster(list) => list.iter().await,
         }
     }
 
@@ -843,6 +911,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(l) => l.expire_at(at).await,
             StorageList::Redis(l) => l.expire_at(at).await,
+            StorageList::RedisCluster(l) => l.expire_at(at).await,
         }
     }
 
@@ -851,6 +920,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(l) => l.expire(dur).await,
             StorageList::Redis(l) => l.expire(dur).await,
+            StorageList::RedisCluster(l) => l.expire(dur).await,
         }
     }
 
@@ -859,6 +929,7 @@ impl List for StorageList {
         match self {
             StorageList::Sled(l) => l.ttl().await,
             StorageList::Redis(l) => l.ttl().await,
+            StorageList::RedisCluster(l) => l.ttl().await,
         }
     }
 }
