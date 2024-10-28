@@ -4,14 +4,16 @@ extern crate serde;
 use anyhow::Error;
 use serde::de;
 
-use storage_redis::RedisStorageDB;
-
 mod storage;
 mod storage_redis;
+mod storage_redis_cluster;
 mod storage_sled;
 
 pub use storage::{DefaultStorageDB, List, Map, StorageDB, StorageList, StorageMap};
-pub use storage_redis::RedisConfig;
+pub use storage_redis::{RedisConfig, RedisStorageDB};
+pub use storage_redis_cluster::{
+    RedisConfig as RedisClusterConfig, RedisStorageDB as RedisClusterStorageDB,
+};
 pub use storage_sled::{SledConfig, SledStorageDB};
 
 pub type Result<T> = anyhow::Result<T>;
@@ -26,6 +28,10 @@ pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
             let db = RedisStorageDB::new(cfg.redis.clone()).await?;
             Ok(DefaultStorageDB::Redis(db))
         }
+        StorageType::RedisCluster => {
+            let db = RedisClusterStorageDB::new(cfg.redis_cluster.clone()).await?;
+            Ok(DefaultStorageDB::RedisCluster(db))
+        }
     }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,6 +43,8 @@ pub struct Config {
     pub sled: SledConfig,
     #[serde(default)]
     pub redis: RedisConfig,
+    #[serde(default, rename = "redis-cluster")]
+    pub redis_cluster: RedisClusterConfig,
 }
 
 impl Default for Config {
@@ -45,6 +53,7 @@ impl Default for Config {
             typ: Config::storage_type_default(),
             sled: SledConfig::default(),
             redis: RedisConfig::default(),
+            redis_cluster: RedisClusterConfig::default(),
         }
     }
 }
@@ -61,6 +70,8 @@ pub enum StorageType {
     Sled,
     //redis:
     Redis,
+    //redis cluster:
+    RedisCluster,
 }
 
 impl<'de> de::Deserialize<'de> for StorageType {
@@ -75,6 +86,7 @@ impl<'de> de::Deserialize<'de> for StorageType {
         {
             "sled" => StorageType::Sled,
             "redis" => StorageType::Redis,
+            "redis-cluster" => StorageType::RedisCluster,
             _ => StorageType::Sled,
         };
         Ok(t)
@@ -107,7 +119,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            typ: StorageType::Sled,
+            typ: StorageType::RedisCluster,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 cleanup_f: |_db| {},
@@ -115,6 +127,15 @@ mod tests {
             },
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379/".into(),
+                prefix: name.to_owned(),
+            },
+            redis_cluster: RedisClusterConfig {
+                urls: [
+                    "redis://127.0.0.1:6380/".into(),
+                    "redis://127.0.0.1:6381/".into(),
+                    "redis://127.0.0.1:6382/".into(),
+                ]
+                .into(),
                 prefix: name.to_owned(),
             },
         };
@@ -181,6 +202,15 @@ mod tests {
             },
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379/".into(),
+                prefix: "sled_cleanup".to_owned(),
+            },
+            redis_cluster: RedisClusterConfig {
+                urls: [
+                    "redis://127.0.0.1:6380/".into(),
+                    "redis://127.0.0.1:6381/".into(),
+                    "redis://127.0.0.1:6382/".into(),
+                ]
+                .into(),
                 prefix: "sled_cleanup".to_owned(),
             },
         };
@@ -483,6 +513,31 @@ mod tests {
         let c_res = db.list_contains_key("list_002").await.unwrap();
         assert!(!c_res);
         assert_eq!(list_002.is_empty().await.unwrap(), true);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_db_contains_key2() {
+        let cfg = get_cfg("db_contains_key2");
+        let db = init_db(&cfg).await.unwrap();
+        let max = 10;
+        for i in 0..max {
+            db.insert(format!("key_{}", i), &1).await.unwrap();
+        }
+
+        for i in 0..max {
+            let c_res = db.contains_key(format!("key_{}", i)).await.unwrap();
+            assert!(c_res);
+        }
+
+        for i in 0..max {
+            db.remove(format!("key_{}", i)).await.unwrap();
+        }
+
+        for i in 0..max {
+            let c_res = db.contains_key(format!("key_{}", i)).await.unwrap();
+            assert!(!c_res);
+        }
     }
 
     #[cfg(feature = "ttl")]
@@ -896,6 +951,45 @@ mod tests {
         assert_eq!(kv001.is_empty().await.unwrap(), true);
     }
 
+    #[tokio::main]
+    #[test]
+    async fn test_map_iter2() {
+        let cfg = get_cfg("map_iter2");
+        let mut db = init_db(&cfg).await.unwrap();
+
+        let mut map_iter = db.map_iter().await.unwrap();
+        while let Some(map) = map_iter.next().await {
+            let map = map.unwrap();
+            map.clear().await.unwrap();
+        }
+
+        drop(map_iter);
+
+        let max = 10;
+
+        for i in 0..max {
+            let map1 = db.map(format!("map-{}", i), None).await.unwrap();
+            map1.insert(format!("map-{}-data", i), &i).await.unwrap();
+        }
+
+        let mut map_iter = db.map_iter().await.unwrap();
+
+        // let aa = collect(map_iter).await;
+        let mut count = 0;
+        while let Some(map) = map_iter.next().await {
+            let mut map = map.unwrap();
+            let mut iter = map.iter::<i32>().await.unwrap();
+            while let Some(item) = iter.next().await {
+                let (key, val) = item.unwrap();
+                println!("key: {:?}, val: {:?}", String::from_utf8_lossy(&key), val);
+            }
+            count += 1;
+        }
+
+        println!("max: {:?}, count: {:?}", max, count);
+        assert_eq!(max, count);
+    }
+
     // #[tokio::main]
     // #[test]
     // async fn test_map_retain() {
@@ -1226,6 +1320,44 @@ mod tests {
             let len = l.len().await.unwrap();
             assert!(len == 1 || len == 2 || len == 3);
         }
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_iter2() {
+        let cfg = get_cfg("list_iter2");
+        let mut db = init_db(&cfg).await.unwrap();
+
+        let mut list_iter = db.list_iter().await.unwrap();
+        while let Some(list) = list_iter.next().await {
+            let list = list.unwrap();
+            list.clear().await.unwrap();
+        }
+
+        drop(list_iter);
+
+        let max = 10;
+
+        for i in 0..max {
+            let list1 = db.list(format!("list-{}", i), None).await.unwrap();
+            list1.push(&i).await.unwrap();
+        }
+
+        let mut list_iter = db.list_iter().await.unwrap();
+
+        let mut count = 0;
+        while let Some(list) = list_iter.next().await {
+            let mut list = list.unwrap();
+            let mut iter = list.iter::<i32>().await.unwrap();
+            while let Some(item) = iter.next().await {
+                let val = item.unwrap();
+                println!("val: {:?}", val);
+            }
+            count += 1;
+        }
+
+        println!("max: {:?}, count: {:?}", max, count);
+        assert_eq!(max, count);
     }
 
     #[tokio::main]
@@ -1579,6 +1711,15 @@ mod tests {
                 url: "redis://127.0.0.1:6379/".into(),
                 prefix: "map_expire_list".to_owned(),
             },
+            redis_cluster: RedisClusterConfig {
+                urls: [
+                    "redis://127.0.0.1:6380/".into(),
+                    "redis://127.0.0.1:6381/".into(),
+                    "redis://127.0.0.1:6382/".into(),
+                ]
+                .into(),
+                prefix: "map_expire_list".to_owned(),
+            },
         };
 
         let mut db = SledStorageDB::new(cfg.sled.clone()).await.unwrap();
@@ -1620,7 +1761,7 @@ mod tests {
         for item in collect(iter).await {
             db.remove(item).await.unwrap();
         }
-
+        println!("test_db_size db_size: {:?}", db.db_size().await);
         db.insert("k1", &1).await.unwrap();
         db.insert("k2", &2).await.unwrap();
         db.insert("k3", &3).await.unwrap();
@@ -1655,6 +1796,7 @@ mod tests {
         let mut db = init_db(&cfg).await.unwrap();
         let iter = db.scan("*").await.unwrap();
         for item in collect(iter).await {
+            println!("removed item: {:?}", String::from_utf8_lossy(&item));
             db.remove(item).await.unwrap();
         }
         println!("test_scan db_size: {:?}", db.db_size().await);
@@ -1692,7 +1834,11 @@ mod tests {
         let topic = format_topic("foo/abcd/#");
         println!("topic: {}", topic);
         let iter = db.scan(topic.as_bytes()).await.unwrap();
-        assert_eq!(collect(iter).await.len(), 6);
+        let items = collect(iter).await;
+        for item in items.iter() {
+            println!("item: {:?}", String::from_utf8_lossy(&item));
+        }
+        assert_eq!(items.len(), 6);
 
         //"foo/abcd/\\**"
         let topic = format_topic("foo/abcd/*/#");
