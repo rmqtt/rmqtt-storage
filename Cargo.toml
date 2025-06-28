@@ -8,7 +8,7 @@ repository = "https://github.com/rmqtt/rmqtt-storage"
 homepage = "https://github.com/rmqtt/rmqtt-storage"
 description = "rmqtt-storage -  Is a simple wrapper around some key-value storages"
 keywords = ["storage", "async"]
-categories = ["Database interfaces"]
+categories = ["database"]
 exclude = ["examples", ".gitignore", ".cargo/config"]
 
 
