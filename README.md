@@ -14,7 +14,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rmqtt-storage = "0.4"
+rmqtt-storage = "0.5"
 ```
 
 ## Features
