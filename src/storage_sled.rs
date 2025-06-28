@@ -1129,24 +1129,35 @@ impl SledStorageDB {
 
     #[inline]
     fn _self_map_contains_key(&self, key: &[u8]) -> Result<bool> {
-        // let this = self;
-        if self._is_expired(key, |k| Self::_map_contains_key(&self.map_tree, k))? {
-            Ok(false)
-        } else {
-            //Self::_map_contains_key(&self.map_tree, key)
-            Ok(true)
+        #[cfg(feature = "ttl")]
+        {
+            if self._is_expired(key, |k| Self::_map_contains_key(&self.map_tree, k))? {
+                Ok(false)
+            } else {
+                //Self::_map_contains_key(&self.map_tree, key)
+                Ok(true)
+            }
         }
+
+        #[cfg(not(feature = "ttl"))]
+        Self::_map_contains_key(&self.map_tree, key)
     }
 
     #[inline]
     fn _self_list_contains_key(&self, key: &[u8]) -> Result<bool> {
-        let this = self;
-        if this._is_expired(key, |k| Self::_list_contains_key(&self.list_tree, k))? {
-            Ok(false)
-        } else {
-            // Self::_list_contains_key(&this.list_tree, key)
-            Ok(true)
+        #[cfg(feature = "ttl")]
+        {
+            let this = self;
+            if this._is_expired(key, |k| Self::_list_contains_key(&self.list_tree, k))? {
+                Ok(false)
+            } else {
+                // Self::_list_contains_key(&this.list_tree, key)
+                Ok(true)
+            }
         }
+
+        #[cfg(not(feature = "ttl"))]
+        Self::_list_contains_key(&self.list_tree, key)
     }
 
     #[inline]
@@ -1308,13 +1319,18 @@ impl SledStorageDB {
 
     #[inline]
     fn _self_contains_key(&self, key: &[u8]) -> Result<bool> {
-        let this = self;
-        if this._is_expired(key, |k| Self::_kv_contains_key(&self.kv_tree, k))? {
-            Ok(false)
-        } else {
-            // this._contains_key(key, KeyType::KV)
-            Ok(true)
+        #[cfg(feature = "ttl")]
+        {
+            let this = self;
+            if this._is_expired(key, |k| Self::_kv_contains_key(&self.kv_tree, k))? {
+                Ok(false)
+            } else {
+                // this._contains_key(key, KeyType::KV)
+                Ok(true)
+            }
         }
+        #[cfg(not(feature = "ttl"))]
+        Self::_kv_contains_key(&self.kv_tree, key)
     }
 
     #[inline]
