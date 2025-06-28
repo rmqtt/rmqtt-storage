@@ -119,7 +119,7 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            typ: StorageType::RedisCluster,
+            typ: StorageType::Sled,
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 cleanup_f: |_db| {},
