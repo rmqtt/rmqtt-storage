@@ -3380,14 +3380,14 @@ pub struct AsyncIter<'a, V> {
     _m: std::marker::PhantomData<V>,
 }
 
-impl<'a, V> Debug for AsyncIter<'a, V> {
+impl<V> Debug for AsyncIter<'_, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a, V> AsyncIterator for AsyncIter<'a, V>
+impl<V> AsyncIterator for AsyncIter<'_, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -3432,14 +3432,14 @@ pub struct AsyncKeyIter<'a> {
     iter: Option<sled::Iter>,
 }
 
-impl<'a> Debug for AsyncKeyIter<'a> {
+impl Debug for AsyncKeyIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncKeyIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncKeyIter<'a> {
+impl AsyncIterator for AsyncKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
@@ -3476,14 +3476,14 @@ pub struct AsyncListValIter<'a, V> {
     _m: std::marker::PhantomData<V>,
 }
 
-impl<'a, V> Debug for AsyncListValIter<'a, V> {
+impl<V> Debug for AsyncListValIter<'_, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncListValIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a, V> AsyncIterator for AsyncListValIter<'a, V>
+impl<V> AsyncIterator for AsyncListValIter<'_, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -3552,14 +3552,14 @@ impl<'a> AsyncMapIter<'a> {
     }
 }
 
-impl<'a> Debug for AsyncMapIter<'a> {
+impl Debug for AsyncMapIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncMapIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncMapIter<'a> {
+impl AsyncIterator for AsyncMapIter<'_> {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
@@ -3600,14 +3600,14 @@ pub struct AsyncListIter<'a> {
     iter: Option<sled::Iter>,
 }
 
-impl<'a> Debug for AsyncListIter<'a> {
+impl Debug for AsyncListIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncListIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncListIter<'a> {
+impl AsyncIterator for AsyncListIter<'_> {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
@@ -3648,14 +3648,14 @@ pub struct AsyncDbKeyIter<'a> {
     iter: Option<sled::Iter>,
 }
 
-impl<'a> Debug for AsyncDbKeyIter<'a> {
+impl Debug for AsyncDbKeyIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncDbKeyIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
+impl AsyncIterator for AsyncDbKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {

@@ -1066,7 +1066,7 @@ impl Map for RedisStorageMap {
             .next_item()
             .await
         {
-            removeds.push(key);
+            removeds.push(key?);
             if removeds.len() > 20 {
                 let _: () = conn2.hdel(name, removeds.as_slice()).await?;
                 removeds.clear();
@@ -1567,7 +1567,7 @@ impl<'a, V> AsyncListValIter<'a, V> {
 }
 
 #[async_trait]
-impl<'a, V> AsyncIterator for AsyncListValIter<'a, V>
+impl<V> AsyncIterator for AsyncListValIter<'_, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -1614,11 +1614,14 @@ where
     type Item = IterItem<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let item = self.iter.next_item().await;
-        item.map(|(key, v)| match bincode::deserialize::<V>(v.as_ref()) {
-            Ok(v) => Ok((key, v)),
-            Err(e) => Err(anyhow::Error::new(e)),
-        })
+        match self.iter.next_item().await {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok((key, v))) => match bincode::deserialize::<V>(v.as_ref()) {
+                Ok(v) => Some(Ok((key, v))),
+                Err(e) => Some(Err(anyhow::Error::new(e))),
+            },
+        }
     }
 }
 
@@ -1628,14 +1631,15 @@ pub struct AsyncDbKeyIter<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
+impl AsyncIterator for AsyncDbKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next_item()
-            .await
-            .map(|key| Ok(key[self.prefix_len..].to_vec()))
+        match self.iter.next_item().await {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok(key)) => Some(Ok(key[self.prefix_len..].to_vec())),
+        }
     }
 }
 
@@ -1644,11 +1648,15 @@ pub struct AsyncKeyIter<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncKeyIter<'a> {
+impl AsyncIterator for AsyncKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next_item().await.map(|(key, _)| Ok(key))
+        match self.iter.next_item().await {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok((key, _))) => Some(Ok(key)),
+        }
     }
 }
 
@@ -1658,18 +1666,19 @@ pub struct AsyncMapIter<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncMapIter<'a> {
+impl AsyncIterator for AsyncMapIter<'_> {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let full_name = self.iter.next_item().await;
-        if let Some(full_name) = full_name {
-            let name = self.db.map_full_name_to_key(full_name.as_slice()).to_vec();
-            let m = RedisStorageMap::new(name, full_name, self.db.clone());
-            Some(Ok(StorageMap::Redis(m)))
-        } else {
-            None
-        }
+        let full_name = match self.iter.next_item().await {
+            None => return None,
+            Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+            Some(Ok(key)) => key,
+        };
+
+        let name = self.db.map_full_name_to_key(full_name.as_slice()).to_vec();
+        let m = RedisStorageMap::new(name, full_name, self.db.clone());
+        Some(Ok(StorageMap::Redis(m)))
     }
 }
 
@@ -1679,17 +1688,18 @@ pub struct AsyncListIter<'a> {
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncListIter<'a> {
+impl AsyncIterator for AsyncListIter<'_> {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let full_name = self.iter.next_item().await;
-        if let Some(full_name) = full_name {
-            let name = self.db.list_full_name_to_key(full_name.as_slice()).to_vec();
-            let l = RedisStorageList::new(name, full_name, self.db.clone());
-            Some(Ok(StorageList::Redis(l)))
-        } else {
-            None
-        }
+        let full_name = match self.iter.next_item().await {
+            None => return None,
+            Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+            Some(Ok(key)) => key,
+        };
+
+        let name = self.db.list_full_name_to_key(full_name.as_slice()).to_vec();
+        let l = RedisStorageList::new(name, full_name, self.db.clone());
+        Some(Ok(StorageList::Redis(l)))
     }
 }
