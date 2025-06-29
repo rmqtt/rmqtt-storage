@@ -2090,9 +2090,3 @@ fn transform_by_slot<T>(input: Vec<(u16, T)>) -> Vec<Vec<T>> {
 
     grouped_data.into_values().collect()
 }
-
-const _: () = {
-    if cfg!(feature = "len") {
-        panic!("The `len` feature is not allowed in this file.");
-    }
-};
