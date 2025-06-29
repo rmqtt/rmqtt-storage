@@ -1,8 +1,15 @@
+//! Provides a unified storage abstraction with multiple backend implementations (sled, redis, redis-cluster).
+//!
+//! This module defines generic storage interfaces (`StorageDB`, `Map`, `List`) and implements them
+//! for different storage backends. It includes configuration handling, initialization functions,
+//! and common storage operations with support for expiration and batch operations.
+
 #![deny(unsafe_code)]
 
 #[allow(unused_imports)]
 use serde::{de, Deserialize, Serialize};
 
+// Conditionally include storage modules based on enabled features
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 mod storage;
 #[cfg(feature = "redis")]
@@ -12,6 +19,7 @@ mod storage_redis_cluster;
 #[cfg(feature = "sled")]
 mod storage_sled;
 
+// Re-export public storage interfaces and implementations
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub use storage::{DefaultStorageDB, List, Map, StorageDB, StorageList, StorageMap};
 #[cfg(feature = "redis")]
@@ -23,8 +31,16 @@ pub use storage_redis_cluster::{
 #[cfg(feature = "sled")]
 pub use storage_sled::{SledConfig, SledStorageDB};
 
+/// Custom result type for storage operations
 pub type Result<T> = anyhow::Result<T>;
 
+/// Initializes the database based on provided configuration
+///
+/// # Arguments
+/// * `cfg` - Storage configuration specifying backend type and parameters
+///
+/// # Returns
+/// Instance of `DefaultStorageDB` configured with the selected backend
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
     match cfg.typ {
@@ -45,37 +61,53 @@ pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
         }
     }
 }
+
+/// Configuration structure for storage system
+///
+/// Contains backend-specific configurations and is conditionally compiled
+/// based on enabled storage features.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub struct Config {
+    /// Storage backend type (Sled, Redis, or RedisCluster)
     // #[serde(default = "Config::storage_type_default")]
     #[serde(alias = "type")]
     pub typ: StorageType,
+
+    /// Configuration for Sled backend (feature-gated)
     #[serde(default)]
     #[cfg(feature = "sled")]
     pub sled: SledConfig,
+
+    /// Configuration for Redis backend (feature-gated)
     #[serde(default)]
     #[cfg(feature = "redis")]
     pub redis: RedisConfig,
+
+    /// Configuration for Redis Cluster backend (feature-gated)
     #[serde(default, rename = "redis-cluster")]
     #[cfg(feature = "redis-cluster")]
     pub redis_cluster: RedisClusterConfig,
 }
 
+/// Enum representing available storage backend types
+///
+/// Variants are conditionally included based on enabled features
 #[derive(Debug, Clone, Serialize)]
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub enum StorageType {
-    //sled: high-performance embedded database with BTreeMap-like API for stateful systems.
+    /// Embedded database with BTreeMap-like API
     #[cfg(feature = "sled")]
     Sled,
-    //redis:
+    /// Single-node Redis storage
     #[cfg(feature = "redis")]
     Redis,
-    //redis cluster:
+    /// Redis Cluster distributed storage
     #[cfg(feature = "redis-cluster")]
     RedisCluster,
 }
 
+/// Deserialization implementation for StorageType
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 impl<'de> de::Deserialize<'de> for StorageType {
     #[inline]
@@ -103,9 +135,13 @@ impl<'de> de::Deserialize<'de> for StorageType {
     }
 }
 
+/// Timestamp type in milliseconds
 #[allow(dead_code)]
 pub(crate) type TimestampMillis = i64;
 
+/// Gets current timestamp in milliseconds
+///
+/// Uses system time if available, falls back to chrono if system time is before UNIX_EPOCH
 #[allow(dead_code)]
 #[inline]
 pub(crate) fn timestamp_millis() -> TimestampMillis {
