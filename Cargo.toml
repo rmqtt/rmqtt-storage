@@ -1,6 +1,6 @@
 [package]
 name = "rmqtt-storage"
-version = "0.7.1"
+version = "0.7.2"
 authors = ["rmqtt <rmqttd@126.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -13,6 +13,9 @@ exclude = ["examples", ".gitignore", ".cargo/config"]
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.docs.rs]
+features = ["sled", "redis", "redis-cluster", "ttl", "map_len", "len"]
 
 [features]
 default = []
