@@ -1,33 +1,44 @@
-#[macro_use]
-extern crate serde;
+#![deny(unsafe_code)]
 
-use anyhow::Error;
-use serde::de;
+#[allow(unused_imports)]
+use serde::{de, Deserialize, Serialize};
 
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 mod storage;
+#[cfg(feature = "redis")]
 mod storage_redis;
+#[cfg(feature = "redis-cluster")]
 mod storage_redis_cluster;
+#[cfg(feature = "sled")]
 mod storage_sled;
 
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub use storage::{DefaultStorageDB, List, Map, StorageDB, StorageList, StorageMap};
+#[cfg(feature = "redis")]
 pub use storage_redis::{RedisConfig, RedisStorageDB};
+#[cfg(feature = "redis-cluster")]
 pub use storage_redis_cluster::{
     RedisConfig as RedisClusterConfig, RedisStorageDB as RedisClusterStorageDB,
 };
+#[cfg(feature = "sled")]
 pub use storage_sled::{SledConfig, SledStorageDB};
 
 pub type Result<T> = anyhow::Result<T>;
 
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
     match cfg.typ {
+        #[cfg(feature = "sled")]
         StorageType::Sled => {
             let db = SledStorageDB::new(cfg.sled.clone()).await?;
             Ok(DefaultStorageDB::Sled(db))
         }
+        #[cfg(feature = "redis")]
         StorageType::Redis => {
             let db = RedisStorageDB::new(cfg.redis.clone()).await?;
             Ok(DefaultStorageDB::Redis(db))
         }
+        #[cfg(feature = "redis-cluster")]
         StorageType::RedisCluster => {
             let db = RedisClusterStorageDB::new(cfg.redis_cluster.clone()).await?;
             Ok(DefaultStorageDB::RedisCluster(db))
@@ -35,45 +46,37 @@ pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
     }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub struct Config {
-    #[serde(default = "Config::storage_type_default")]
+    // #[serde(default = "Config::storage_type_default")]
     #[serde(alias = "type")]
     pub typ: StorageType,
     #[serde(default)]
+    #[cfg(feature = "sled")]
     pub sled: SledConfig,
     #[serde(default)]
+    #[cfg(feature = "redis")]
     pub redis: RedisConfig,
     #[serde(default, rename = "redis-cluster")]
+    #[cfg(feature = "redis-cluster")]
     pub redis_cluster: RedisClusterConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            typ: Config::storage_type_default(),
-            sled: SledConfig::default(),
-            redis: RedisConfig::default(),
-            redis_cluster: RedisClusterConfig::default(),
-        }
-    }
-}
-
-impl Config {
-    fn storage_type_default() -> StorageType {
-        StorageType::Sled
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub enum StorageType {
     //sled: high-performance embedded database with BTreeMap-like API for stateful systems.
+    #[cfg(feature = "sled")]
     Sled,
     //redis:
+    #[cfg(feature = "redis")]
     Redis,
     //redis cluster:
+    #[cfg(feature = "redis-cluster")]
     RedisCluster,
 }
 
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 impl<'de> de::Deserialize<'de> for StorageType {
     #[inline]
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
@@ -84,10 +87,17 @@ impl<'de> de::Deserialize<'de> for StorageType {
             .to_ascii_lowercase()
             .as_str()
         {
+            #[cfg(feature = "sled")]
             "sled" => StorageType::Sled,
+            #[cfg(feature = "redis")]
             "redis" => StorageType::Redis,
+            #[cfg(feature = "redis-cluster")]
             "redis-cluster" => StorageType::RedisCluster,
-            _ => StorageType::Sled,
+            _ => {
+                return Err(de::Error::custom(
+                    "invalid storage type, expected one of: 'sled', 'redis', 'redis-cluster'",
+                ))
+            }
         };
         Ok(t)
     }
@@ -110,6 +120,7 @@ pub(crate) fn timestamp_millis() -> TimestampMillis {
 }
 
 #[cfg(test)]
+#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 mod tests {
     use super::storage::*;
     use super::*;
@@ -119,16 +130,31 @@ mod tests {
 
     fn get_cfg(name: &str) -> Config {
         let cfg = Config {
-            typ: StorageType::Sled,
+            typ: {
+                cfg_if::cfg_if! {
+                    if #[cfg(feature = "sled")] {
+                        StorageType::Sled
+                    } else if #[cfg(feature = "redis-cluster")] {
+                        StorageType::RedisCluster
+                    } else if #[cfg(feature = "redis")] {
+                        StorageType::Redis
+                    } else {
+                        compile_error!("No storage backend feature enabled!");
+                    }
+                }
+            },
+            #[cfg(feature = "sled")]
             sled: SledConfig {
                 path: format!("./.catch/{}", name),
                 cleanup_f: |_db| {},
                 ..Default::default()
             },
+            #[cfg(feature = "redis")]
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379/".into(),
                 prefix: name.to_owned(),
             },
+            #[cfg(feature = "redis-cluster")]
             redis_cluster: RedisClusterConfig {
                 urls: [
                     "redis://127.0.0.1:6380/".into(),
@@ -1662,6 +1688,7 @@ mod tests {
 
     #[tokio::main]
     #[allow(dead_code)]
+    #[cfg(feature = "sled")]
     // #[test]
     async fn test_map_expire_list() {
         use super::{SledStorageDB, StorageDB};
@@ -1707,10 +1734,12 @@ mod tests {
                 },
                 ..Default::default()
             },
+            #[cfg(feature = "redis")]
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379/".into(),
                 prefix: "map_expire_list".to_owned(),
             },
+            #[cfg(feature = "redis-cluster")]
             redis_cluster: RedisClusterConfig {
                 urls: [
                     "redis://127.0.0.1:6380/".into(),

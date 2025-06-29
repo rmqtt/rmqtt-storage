@@ -4,17 +4,30 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+#[cfg(feature = "redis")]
 use crate::storage_redis::{RedisStorageDB, RedisStorageList, RedisStorageMap};
+#[cfg(feature = "redis-cluster")]
 use crate::storage_redis_cluster::{
     RedisStorageDB as RedisClusterStorageDB, RedisStorageList as RedisClusterStorageList,
     RedisStorageMap as RedisClusterStorageMap,
 };
-use crate::storage_sled::SledStorageDB;
-use crate::storage_sled::{SledStorageList, SledStorageMap};
+#[cfg(feature = "sled")]
+use crate::storage_sled::{SledStorageDB, SledStorageList, SledStorageMap};
 use crate::Result;
 
 #[allow(unused_imports)]
 use crate::TimestampMillis;
+
+#[allow(unused)]
+pub(crate) const SEPARATOR: &[u8] = b"@";
+#[allow(unused)]
+pub(crate) const KEY_PREFIX: &[u8] = b"__rmqtt@";
+#[allow(unused)]
+pub(crate) const KEY_PREFIX_LEN: &[u8] = b"__rmqtt_len@";
+#[allow(unused)]
+pub(crate) const MAP_NAME_PREFIX: &[u8] = b"__rmqtt_map@";
+#[allow(unused)]
+pub(crate) const LIST_NAME_PREFIX: &[u8] = b"__rmqtt_list@";
 
 pub type Key = Vec<u8>;
 
@@ -26,10 +39,12 @@ pub trait AsyncIterator {
     async fn next(&mut self) -> Option<Self::Item>;
 }
 
+#[cfg(feature = "sled")]
 pub trait SplitSubslice {
     fn split_subslice(&self, subslice: &[u8]) -> Option<(&[u8], &[u8])>;
 }
 
+#[cfg(feature = "sled")]
 impl SplitSubslice for [u8] {
     fn split_subslice(&self, subslice: &[u8]) -> Option<(&[u8], &[u8])> {
         self.windows(subslice.len())
@@ -273,8 +288,11 @@ pub trait List: Sync + Send {
 
 #[derive(Clone)]
 pub enum DefaultStorageDB {
+    #[cfg(feature = "sled")]
     Sled(SledStorageDB),
+    #[cfg(feature = "redis")]
     Redis(RedisStorageDB),
+    #[cfg(feature = "redis-cluster")]
     RedisCluster(RedisClusterStorageDB),
 }
 
@@ -286,8 +304,11 @@ impl DefaultStorageDB {
         expire: Option<TimestampMillis>,
     ) -> Result<StorageMap> {
         Ok(match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name, expire).await?),
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name, expire).await?),
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => {
                 StorageMap::RedisCluster(db.map(name, expire).await?)
             }
@@ -300,8 +321,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.map_remove(name).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.map_remove(name).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.map_remove(name).await,
         }
     }
@@ -309,8 +333,11 @@ impl DefaultStorageDB {
     #[inline]
     pub async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.map_contains_key(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.map_contains_key(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.map_contains_key(key).await,
         }
     }
@@ -322,8 +349,11 @@ impl DefaultStorageDB {
         expire: Option<TimestampMillis>,
     ) -> Result<StorageList> {
         Ok(match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name, expire).await?),
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name, expire).await?),
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => {
                 StorageList::RedisCluster(db.list(name, expire).await?)
             }
@@ -336,8 +366,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.list_remove(name).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.list_remove(name).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.list_remove(name).await,
         }
     }
@@ -345,8 +378,11 @@ impl DefaultStorageDB {
     #[inline]
     pub async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.list_contains_key(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.list_contains_key(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.list_contains_key(key).await,
         }
     }
@@ -358,8 +394,11 @@ impl DefaultStorageDB {
         V: Serialize + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.insert(key, val).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.insert(key, val).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.insert(key, val).await,
         }
     }
@@ -371,8 +410,11 @@ impl DefaultStorageDB {
         V: DeserializeOwned + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.get(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.get(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.get(key).await,
         }
     }
@@ -383,8 +425,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.remove(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.remove(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.remove(key).await,
         }
     }
@@ -395,8 +440,11 @@ impl DefaultStorageDB {
         V: serde::ser::Serialize + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.batch_insert(key_vals).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.batch_insert(key_vals).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.batch_insert(key_vals).await,
         }
     }
@@ -404,8 +452,11 @@ impl DefaultStorageDB {
     #[inline]
     pub async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.batch_remove(keys).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.batch_remove(keys).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.batch_remove(keys).await,
         }
     }
@@ -416,8 +467,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.counter_incr(key, increment).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.counter_incr(key, increment).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_incr(key, increment).await,
         }
     }
@@ -428,8 +482,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.counter_decr(key, decrement).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.counter_decr(key, decrement).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_decr(key, decrement).await,
         }
     }
@@ -440,8 +497,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.counter_get(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.counter_get(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_get(key).await,
         }
     }
@@ -452,8 +512,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.counter_set(key, val).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.counter_set(key, val).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_set(key, val).await,
         }
     }
@@ -462,8 +525,11 @@ impl DefaultStorageDB {
     #[cfg(feature = "len")]
     pub async fn len(&self) -> Result<usize> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.len().await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.len().await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.len().await,
         }
     }
@@ -471,8 +537,11 @@ impl DefaultStorageDB {
     #[inline]
     pub async fn db_size(&self) -> Result<usize> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.db_size().await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.db_size().await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.db_size().await,
         }
     }
@@ -480,8 +549,11 @@ impl DefaultStorageDB {
     #[inline]
     pub async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.contains_key(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.contains_key(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.contains_key(key).await,
         }
     }
@@ -493,8 +565,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.expire_at(key, at).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.expire_at(key, at).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.expire_at(key, at).await,
         }
     }
@@ -506,8 +581,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.expire(key, dur).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.expire(key, dur).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.expire(key, dur).await,
         }
     }
@@ -519,8 +597,11 @@ impl DefaultStorageDB {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.ttl(key).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.ttl(key).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.ttl(key).await,
         }
     }
@@ -530,8 +611,11 @@ impl DefaultStorageDB {
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageMap>> + Send + 'a>> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.map_iter().await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.map_iter().await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.map_iter().await,
         }
     }
@@ -541,8 +625,11 @@ impl DefaultStorageDB {
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<StorageList>> + Send + 'a>> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.list_iter().await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.list_iter().await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.list_iter().await,
         }
     }
@@ -556,8 +643,11 @@ impl DefaultStorageDB {
         P: AsRef<[u8]> + Send + Sync,
     {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.scan(pattern).await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.scan(pattern).await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.scan(pattern).await,
         }
     }
@@ -565,8 +655,11 @@ impl DefaultStorageDB {
     #[inline]
     pub async fn info(&self) -> Result<serde_json::Value> {
         match self {
+            #[cfg(feature = "sled")]
             DefaultStorageDB::Sled(db) => db.info().await,
+            #[cfg(feature = "redis")]
             DefaultStorageDB::Redis(db) => db.info().await,
+            #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.info().await,
         }
     }
@@ -574,8 +667,11 @@ impl DefaultStorageDB {
 
 #[derive(Clone)]
 pub enum StorageMap {
+    #[cfg(feature = "sled")]
     Sled(SledStorageMap),
+    #[cfg(feature = "redis")]
     Redis(RedisStorageMap),
+    #[cfg(feature = "redis-cluster")]
     RedisCluster(RedisClusterStorageMap),
 }
 
@@ -583,8 +679,11 @@ pub enum StorageMap {
 impl Map for StorageMap {
     fn name(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.name(),
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.name(),
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.name(),
         }
     }
@@ -595,8 +694,11 @@ impl Map for StorageMap {
         V: Serialize + Sync + Send + ?Sized,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.insert(key, val).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.insert(key, val).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.insert(key, val).await,
         }
     }
@@ -607,8 +709,11 @@ impl Map for StorageMap {
         V: DeserializeOwned + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.get(key).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.get(key).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.get(key).await,
         }
     }
@@ -618,16 +723,22 @@ impl Map for StorageMap {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.remove(key).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.remove(key).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove(key).await,
         }
     }
 
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.contains_key(key).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.contains_key(key).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.contains_key(key).await,
         }
     }
@@ -635,24 +746,33 @@ impl Map for StorageMap {
     #[cfg(feature = "map_len")]
     async fn len(&self) -> Result<usize> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.len().await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.len().await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.len().await,
         }
     }
 
     async fn is_empty(&self) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.is_empty().await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.is_empty().await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.is_empty().await,
         }
     }
 
     async fn clear(&self) -> Result<()> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.clear().await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.clear().await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.clear().await,
         }
     }
@@ -663,8 +783,11 @@ impl Map for StorageMap {
         V: DeserializeOwned + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.remove_and_fetch(key).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.remove_and_fetch(key).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove_and_fetch(key).await,
         }
     }
@@ -674,8 +797,11 @@ impl Map for StorageMap {
         K: AsRef<[u8]> + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.remove_with_prefix(prefix).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.remove_with_prefix(prefix).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove_with_prefix(prefix).await,
         }
     }
@@ -685,16 +811,22 @@ impl Map for StorageMap {
         V: Serialize + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.batch_insert(key_vals).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.batch_insert(key_vals).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.batch_insert(key_vals).await,
         }
     }
 
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.batch_remove(keys).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.batch_remove(keys).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.batch_remove(keys).await,
         }
     }
@@ -706,8 +838,11 @@ impl Map for StorageMap {
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.iter().await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.iter().await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.iter().await,
         }
     }
@@ -716,8 +851,11 @@ impl Map for StorageMap {
         &'a mut self,
     ) -> Result<Box<dyn AsyncIterator<Item = Result<Key>> + Send + 'a>> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.key_iter().await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.key_iter().await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.key_iter().await,
         }
     }
@@ -731,8 +869,11 @@ impl Map for StorageMap {
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.prefix_iter(prefix).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.prefix_iter(prefix).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.prefix_iter(prefix).await,
         }
     }
@@ -740,8 +881,11 @@ impl Map for StorageMap {
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.expire_at(at).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.expire_at(at).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.expire_at(at).await,
         }
     }
@@ -749,8 +893,11 @@ impl Map for StorageMap {
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.expire(dur).await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.expire(dur).await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.expire(dur).await,
         }
     }
@@ -758,8 +905,11 @@ impl Map for StorageMap {
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         match self {
+            #[cfg(feature = "sled")]
             StorageMap::Sled(m) => m.ttl().await,
+            #[cfg(feature = "redis")]
             StorageMap::Redis(m) => m.ttl().await,
+            #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.ttl().await,
         }
     }
@@ -767,16 +917,22 @@ impl Map for StorageMap {
 
 #[derive(Clone)]
 pub enum StorageList {
+    #[cfg(feature = "sled")]
     Sled(SledStorageList),
+    #[cfg(feature = "redis")]
     Redis(RedisStorageList),
+    #[cfg(feature = "redis-cluster")]
     RedisCluster(RedisClusterStorageList),
 }
 
 impl fmt::Debug for StorageList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.name(),
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.name(),
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.name(),
         };
 
@@ -789,8 +945,11 @@ impl fmt::Debug for StorageList {
 impl List for StorageList {
     fn name(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(m) => m.name(),
+            #[cfg(feature = "redis")]
             StorageList::Redis(m) => m.name(),
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(m) => m.name(),
         }
     }
@@ -800,8 +959,11 @@ impl List for StorageList {
         V: Serialize + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.push(val).await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.push(val).await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.push(val).await,
         }
     }
@@ -811,8 +973,11 @@ impl List for StorageList {
         V: serde::ser::Serialize + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.pushs(vals).await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.pushs(vals).await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.pushs(vals).await,
         }
     }
@@ -828,8 +993,11 @@ impl List for StorageList {
         V: DeserializeOwned,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.push_limit(val, limit, pop_front_if_limited).await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.push_limit(val, limit, pop_front_if_limited).await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => {
                 list.push_limit(val, limit, pop_front_if_limited).await
             }
@@ -841,8 +1009,11 @@ impl List for StorageList {
         V: DeserializeOwned + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.pop().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.pop().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.pop().await,
         }
     }
@@ -852,8 +1023,11 @@ impl List for StorageList {
         V: DeserializeOwned + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.all().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.all().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.all().await,
         }
     }
@@ -863,32 +1037,44 @@ impl List for StorageList {
         V: DeserializeOwned + Sync + Send,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.get_index(idx).await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.get_index(idx).await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.get_index(idx).await,
         }
     }
 
     async fn len(&self) -> Result<usize> {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.len().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.len().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.len().await,
         }
     }
 
     async fn is_empty(&self) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.is_empty().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.is_empty().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.is_empty().await,
         }
     }
 
     async fn clear(&self) -> Result<()> {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.clear().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.clear().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.clear().await,
         }
     }
@@ -900,8 +1086,11 @@ impl List for StorageList {
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(list) => list.iter().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(list) => list.iter().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.iter().await,
         }
     }
@@ -909,8 +1098,11 @@ impl List for StorageList {
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(l) => l.expire_at(at).await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(l) => l.expire_at(at).await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.expire_at(at).await,
         }
     }
@@ -918,8 +1110,11 @@ impl List for StorageList {
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(l) => l.expire(dur).await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(l) => l.expire(dur).await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.expire(dur).await,
         }
     }
@@ -927,8 +1122,11 @@ impl List for StorageList {
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         match self {
+            #[cfg(feature = "sled")]
             StorageList::Sled(l) => l.ttl().await,
+            #[cfg(feature = "redis")]
             StorageList::Redis(l) => l.ttl().await,
+            #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.ttl().await,
         }
     }

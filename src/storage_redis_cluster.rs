@@ -5,12 +5,15 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use redis::aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig};
-use redis::cluster::ClusterClient;
-use redis::cluster_async::ClusterConnection;
-use redis::cluster_routing::get_slot;
-use redis::{pipe, AsyncCommands, Cmd};
+use redis::{
+    aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig},
+    cluster::ClusterClient,
+    cluster_async::ClusterConnection,
+    cluster_routing::get_slot,
+    pipe, AsyncCommands, Cmd,
+};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -20,9 +23,7 @@ use crate::{Result, StorageList, StorageMap};
 #[allow(unused_imports)]
 use crate::{timestamp_millis, TimestampMillis};
 
-use crate::storage_redis::{
-    KEY_PREFIX, KEY_PREFIX_LEN, LIST_NAME_PREFIX, MAP_NAME_PREFIX, SEPARATOR,
-};
+use crate::storage::{KEY_PREFIX, KEY_PREFIX_LEN, LIST_NAME_PREFIX, MAP_NAME_PREFIX, SEPARATOR};
 
 type RedisConnection = ClusterConnection;
 
@@ -1955,3 +1956,9 @@ fn transform_by_slot<T>(input: Vec<(u16, T)>) -> Vec<Vec<T>> {
 
     grouped_data.into_values().collect()
 }
+
+const _: () = {
+    if cfg!(feature = "len") {
+        panic!("The `len` feature is not allowed in this file.");
+    }
+};

@@ -7,10 +7,11 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Error};
 use async_trait::async_trait;
 use convert::Bytesize;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -31,7 +32,7 @@ use tokio::task::spawn_blocking;
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 #[allow(unused_imports)]
 use crate::{timestamp_millis, TimestampMillis};
-use crate::{Error, Result, StorageList, StorageMap};
+use crate::{Result, StorageList, StorageMap};
 
 const SEPARATOR: &[u8] = b"@";
 const KV_TREE: &[u8] = b"__kv_tree@";

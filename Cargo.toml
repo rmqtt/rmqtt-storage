@@ -19,12 +19,13 @@ default = []
 ttl = []
 map_len = []
 len = []
+redis-cluster = ["redis", "redis/cluster", "redis/cluster-async"]
 
 [dependencies]
-sled = "0.34"
-tokio = { version = "1", features = ["sync", "rt"] }
-redis = { version = "0.32", features = [ "tokio-comp", "safe_iterators", "connection-manager", "cluster", "cluster-async" ] }
+sled = { version = "0.34", optional = true }
+redis = { version = "0.32", features = [ "tokio-comp", "safe_iterators", "connection-manager"], optional = true }
 
+tokio = { version = "1", features = ["sync", "rt"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -39,7 +40,7 @@ convert = { package = "box-convert", version = "0.1", features = ["bytesize"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
-
+cfg-if = "1"
 
 
 
