@@ -1,13 +1,25 @@
+//! Redis storage implementation for key-value, map, and list data structures
+//!
+//! This module provides a Redis-backed storage system with support for:
+//! - Key-value storage with expiration
+//! - Map (hash) data structures
+//! - List data structures
+//! - Counters with atomic operations
+//! - Iteration and scanning capabilities
+//! - Standalone Redis connection support
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::anyhow;
 use async_trait::async_trait;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{pipe, AsyncCommands};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 use crate::{Result, StorageList, StorageMap};
@@ -15,17 +27,17 @@ use crate::{Result, StorageList, StorageMap};
 #[allow(unused_imports)]
 use crate::{timestamp_millis, TimestampMillis};
 
-pub(crate) const SEPARATOR: &[u8] = b"@";
-pub(crate) const KEY_PREFIX: &[u8] = b"__rmqtt@";
-pub(crate) const KEY_PREFIX_LEN: &[u8] = b"__rmqtt_len@";
-pub(crate) const MAP_NAME_PREFIX: &[u8] = b"__rmqtt_map@";
-pub(crate) const LIST_NAME_PREFIX: &[u8] = b"__rmqtt_list@";
+use crate::storage::{KEY_PREFIX, KEY_PREFIX_LEN, LIST_NAME_PREFIX, MAP_NAME_PREFIX, SEPARATOR};
 
+/// Type alias for Redis connection manager
 type RedisConnection = ConnectionManager;
 
+/// Configuration for Redis storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
+    /// Redis server URL
     pub url: String,
+    /// Key prefix for all storage operations
     pub prefix: String,
 }
 
@@ -38,13 +50,17 @@ impl Default for RedisConfig {
     }
 }
 
+/// Redis storage database implementation
 #[derive(Clone)]
 pub struct RedisStorageDB {
+    /// Prefix for all keys
     prefix: Key,
+    /// Asynchronous connection manager
     async_conn: RedisConnection,
 }
 
 impl RedisStorageDB {
+    /// Creates a new Redis storage instance
     #[inline]
     pub(crate) async fn new(cfg: RedisConfig) -> Result<Self> {
         let prefix = [cfg.prefix.as_bytes(), SEPARATOR].concat();
@@ -55,12 +71,16 @@ impl RedisStorageDB {
                 return Err(anyhow!(e));
             }
         };
+
+        // Configure connection manager with retry settings
         let mgr_cfg = ConnectionManagerConfig::default()
             .set_exponent_base(100)
             .set_factor(2)
             .set_number_of_retries(2)
             .set_connection_timeout(Duration::from_secs(15))
             .set_response_timeout(Duration::from_secs(10));
+
+        // Create connection manager
         let async_conn = match client.get_connection_manager_with_config(mgr_cfg).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -68,10 +88,13 @@ impl RedisStorageDB {
                 return Err(anyhow!(e));
             }
         };
+
+        // Create database instance and start cleanup task
         let db = Self { prefix, async_conn }.cleanup();
         Ok(db)
     }
 
+    /// Starts background cleanup task
     fn cleanup(self) -> Self {
         let db = self.clone();
         tokio::spawn(async move {
@@ -90,22 +113,26 @@ impl RedisStorageDB {
         self
     }
 
+    /// Gets a clone of the async connection
     #[inline]
     fn async_conn(&self) -> RedisConnection {
         self.async_conn.clone()
     }
 
+    /// Gets a mutable reference to the async connection
     #[inline]
     fn async_conn_mut(&mut self) -> &mut RedisConnection {
         &mut self.async_conn
     }
 
+    /// Creates key for length tracking sorted set
     #[inline]
     #[allow(dead_code)]
     fn make_len_sortedset_key(&self) -> Key {
         [KEY_PREFIX_LEN, self.prefix.as_slice()].concat()
     }
 
+    /// Creates full key with prefix
     #[inline]
     fn make_full_key<K>(&self, key: K) -> Key
     where
@@ -114,11 +141,13 @@ impl RedisStorageDB {
         [KEY_PREFIX, self.prefix.as_slice(), key.as_ref()].concat()
     }
 
+    /// Creates scan pattern with prefix
     #[inline]
     fn make_scan_pattern_match<P: AsRef<[u8]>>(&self, pattern: P) -> Key {
         [KEY_PREFIX, self.prefix.as_slice(), pattern.as_ref()].concat()
     }
 
+    /// Creates full map name with prefix
     #[inline]
     fn make_map_full_name<K>(&self, name: K) -> Key
     where
@@ -127,6 +156,7 @@ impl RedisStorageDB {
         [MAP_NAME_PREFIX, self.prefix.as_slice(), name.as_ref()].concat()
     }
 
+    /// Creates full list name with prefix
     #[inline]
     fn make_list_full_name<K>(&self, name: K) -> Key
     where
@@ -135,26 +165,31 @@ impl RedisStorageDB {
         [LIST_NAME_PREFIX, self.prefix.as_slice(), name.as_ref()].concat()
     }
 
+    /// Creates map prefix pattern for scanning
     #[inline]
     fn make_map_prefix_match(&self) -> Key {
         [MAP_NAME_PREFIX, self.prefix.as_slice(), b"*"].concat()
     }
 
+    /// Creates list prefix pattern for scanning
     #[inline]
     fn make_list_prefix_match(&self) -> Key {
         [LIST_NAME_PREFIX, self.prefix.as_slice(), b"*"].concat()
     }
 
+    /// Extracts map key from full name
     #[inline]
     fn map_full_name_to_key<'a>(&self, full_name: &'a [u8]) -> &'a [u8] {
         full_name[MAP_NAME_PREFIX.len() + self.prefix.len()..].as_ref()
     }
 
+    /// Extracts list key from full name
     #[inline]
     fn list_full_name_to_key<'a>(&self, full_name: &'a [u8]) -> &'a [u8] {
         full_name[LIST_NAME_PREFIX.len() + self.prefix.len()..].as_ref()
     }
 
+    /// Gets full key name for a given key
     #[inline]
     async fn _get_full_name(&self, key: &[u8]) -> Result<Key> {
         let map_full_name = self.make_map_full_name(key);
@@ -172,6 +207,7 @@ impl RedisStorageDB {
         Ok(full_name)
     }
 
+    /// Internal method to insert a key-value pair
     #[inline]
     async fn _insert<K, V>(
         &self,
@@ -227,12 +263,12 @@ impl RedisStorageDB {
         Ok(())
     }
 
+    /// Internal method for batch insertion
     #[inline]
     async fn _batch_insert(
         &self,
         key_val_expires: Vec<(Key, Vec<u8>, Option<TimestampMillis>)>,
     ) -> Result<()> {
-        // let full_key = self.make_full_key(k);
         #[cfg(not(feature = "len"))]
         {
             let keys_vals: Vec<(Key, &Vec<u8>)> = key_val_expires
@@ -284,6 +320,7 @@ impl RedisStorageDB {
         Ok(())
     }
 
+    /// Internal method for batch removal
     #[inline]
     async fn _batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         let full_keys = keys
@@ -308,6 +345,7 @@ impl RedisStorageDB {
         Ok(())
     }
 
+    /// Internal method to increment a counter
     #[inline]
     async fn _counter_incr<K>(
         &self,
@@ -357,6 +395,7 @@ impl RedisStorageDB {
         Ok(())
     }
 
+    /// Internal method to decrement a counter
     #[inline]
     async fn _counter_decr<K>(
         &self,
@@ -407,6 +446,7 @@ impl RedisStorageDB {
         Ok(())
     }
 
+    /// Internal method to set a counter value
     #[inline]
     async fn _counter_set<K>(
         &self,
@@ -457,6 +497,7 @@ impl RedisStorageDB {
         Ok(())
     }
 
+    /// Internal method to remove a key
     #[inline]
     async fn _remove<K>(&self, key: K) -> Result<()>
     where
@@ -488,6 +529,7 @@ impl StorageDB for RedisStorageDB {
     type MapType = RedisStorageMap;
     type ListType = RedisStorageList;
 
+    /// Creates a new map with optional expiration
     #[inline]
     async fn map<V: AsRef<[u8]> + Sync + Send>(
         &self,
@@ -501,6 +543,7 @@ impl StorageDB for RedisStorageDB {
         )
     }
 
+    /// Removes a map
     #[inline]
     async fn map_remove<K>(&self, name: K) -> Result<()>
     where
@@ -511,12 +554,14 @@ impl StorageDB for RedisStorageDB {
         Ok(())
     }
 
+    /// Checks if a map exists
     #[inline]
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let map_full_name = self.make_map_full_name(key.as_ref());
         Ok(self.async_conn().exists(map_full_name).await?)
     }
 
+    /// Creates a new list with optional expiration
     #[inline]
     async fn list<V: AsRef<[u8]> + Sync + Send>(
         &self,
@@ -530,6 +575,7 @@ impl StorageDB for RedisStorageDB {
         )
     }
 
+    /// Removes a list
     #[inline]
     async fn list_remove<K>(&self, name: K) -> Result<()>
     where
@@ -540,12 +586,14 @@ impl StorageDB for RedisStorageDB {
         Ok(())
     }
 
+    /// Checks if a list exists
     #[inline]
     async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let list_full_name = self.make_list_full_name(key.as_ref());
         Ok(self.async_conn().exists(list_full_name).await?)
     }
 
+    /// Inserts a key-value pair
     #[inline]
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -555,6 +603,7 @@ impl StorageDB for RedisStorageDB {
         self._insert(key, val, None).await
     }
 
+    /// Gets a value by key
     #[inline]
     async fn get<K, V>(&self, key: K) -> Result<Option<V>>
     where
@@ -573,6 +622,7 @@ impl StorageDB for RedisStorageDB {
         }
     }
 
+    /// Removes a key
     #[inline]
     async fn remove<K>(&self, key: K) -> Result<()>
     where
@@ -581,6 +631,7 @@ impl StorageDB for RedisStorageDB {
         self._remove(key).await
     }
 
+    /// Batch insertion of key-value pairs
     #[inline]
     async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
@@ -600,6 +651,7 @@ impl StorageDB for RedisStorageDB {
         Ok(())
     }
 
+    /// Batch removal of keys
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if !keys.is_empty() {
@@ -608,6 +660,7 @@ impl StorageDB for RedisStorageDB {
         Ok(())
     }
 
+    /// Increments a counter
     #[inline]
     async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
     where
@@ -616,6 +669,7 @@ impl StorageDB for RedisStorageDB {
         self._counter_incr(key, increment, None).await
     }
 
+    /// Decrements a counter
     #[inline]
     async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
     where
@@ -624,6 +678,7 @@ impl StorageDB for RedisStorageDB {
         self._counter_decr(key, decrement, None).await
     }
 
+    /// Gets a counter value
     #[inline]
     async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
     where
@@ -633,6 +688,7 @@ impl StorageDB for RedisStorageDB {
         Ok(self.async_conn().get::<_, Option<isize>>(full_key).await?)
     }
 
+    /// Sets a counter value
     #[inline]
     async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
     where
@@ -641,13 +697,14 @@ impl StorageDB for RedisStorageDB {
         self._counter_set(key, val, None).await
     }
 
+    /// Checks if a key exists
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        //HEXISTS key field
         let full_key = self.make_full_key(key.as_ref());
         Ok(self.async_conn().exists(full_key).await?)
     }
 
+    /// Gets the number of keys in the database
     #[inline]
     #[cfg(feature = "len")]
     async fn len(&self) -> Result<usize> {
@@ -661,6 +718,7 @@ impl StorageDB for RedisStorageDB {
         Ok(count)
     }
 
+    /// Gets the total database size
     #[inline]
     async fn db_size(&self) -> Result<usize> {
         let mut async_conn = self.async_conn();
@@ -681,6 +739,7 @@ impl StorageDB for RedisStorageDB {
         Ok(dbsize.unwrap_or(0) as usize)
     }
 
+    /// Sets expiration time for a key
     #[inline]
     #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
@@ -710,6 +769,7 @@ impl StorageDB for RedisStorageDB {
         }
     }
 
+    /// Sets expiration duration for a key
     #[inline]
     #[cfg(feature = "ttl")]
     async fn expire<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
@@ -737,6 +797,7 @@ impl StorageDB for RedisStorageDB {
         }
     }
 
+    /// Gets time-to-live for a key
     #[inline]
     #[cfg(feature = "ttl")]
     async fn ttl<K>(&self, key: K) -> Result<Option<TimestampMillis>>
@@ -753,6 +814,7 @@ impl StorageDB for RedisStorageDB {
         }
     }
 
+    /// Creates an iterator for all maps
     #[inline]
     async fn map_iter<'a>(
         &'a mut self,
@@ -765,6 +827,7 @@ impl StorageDB for RedisStorageDB {
         Ok(Box::new(iter))
     }
 
+    /// Creates an iterator for all lists
     #[inline]
     async fn list_iter<'a>(
         &'a mut self,
@@ -777,6 +840,7 @@ impl StorageDB for RedisStorageDB {
         Ok(Box::new(iter))
     }
 
+    /// Creates an iterator for keys matching a pattern
     async fn scan<'a, P>(
         &'a mut self,
         pattern: P,
@@ -796,6 +860,7 @@ impl StorageDB for RedisStorageDB {
         Ok(Box::new(iter))
     }
 
+    /// Gets database information
     #[inline]
     async fn info(&self) -> Result<Value> {
         let mut conn = self.async_conn();
@@ -819,17 +884,24 @@ impl StorageDB for RedisStorageDB {
     }
 }
 
+/// Redis-backed map storage implementation
 #[derive(Clone)]
 pub struct RedisStorageMap {
+    /// Name of the map
     name: Key,
+    /// Full key name with prefix
     full_name: Key,
+    /// Optional expiration time in milliseconds
     #[allow(dead_code)]
     expire: Option<TimestampMillis>,
+    /// Flag indicating if the map is empty
     empty: Arc<AtomicBool>,
+    /// Reference to the parent database
     pub(crate) db: RedisStorageDB,
 }
 
 impl RedisStorageMap {
+    /// Creates a new map without expiration
     #[inline]
     pub(crate) fn new(name: Key, full_name: Key, db: RedisStorageDB) -> Self {
         Self {
@@ -841,6 +913,7 @@ impl RedisStorageMap {
         }
     }
 
+    /// Creates a new map with expiration
     #[inline]
     pub(crate) async fn new_expire(
         name: Key,
@@ -863,19 +936,21 @@ impl RedisStorageMap {
         })
     }
 
+    /// Gets a clone of the async connection
     #[inline]
     fn async_conn(&self) -> RedisConnection {
         self.db.async_conn()
     }
 
+    /// Gets a mutable reference to the async connection
     #[inline]
     fn async_conn_mut(&mut self) -> &mut RedisConnection {
         self.db.async_conn_mut()
     }
 
+    /// Checks if the map is empty
     #[inline]
     async fn _is_empty(async_conn: &mut RedisConnection, full_name: &[u8]) -> Result<bool> {
-        //HSCAN key cursor [MATCH pattern] [COUNT count]
         let res = async_conn
             .hscan::<_, Vec<u8>>(full_name)
             .await?
@@ -885,6 +960,7 @@ impl RedisStorageMap {
         Ok(res)
     }
 
+    /// Internal method to insert with expiration handling
     #[inline]
     async fn _insert_expire(&self, key: &[u8], val: Vec<u8>) -> Result<()> {
         let mut async_conn = self.async_conn();
@@ -893,8 +969,6 @@ impl RedisStorageMap {
         #[cfg(feature = "ttl")]
         if self.empty.load(Ordering::SeqCst) {
             if let Some(expire) = self.expire.as_ref() {
-                //HSET key field value
-                //PEXPIRE key ms
                 let _: () = redis::pipe()
                     .atomic()
                     .hset(name, key, val)
@@ -906,11 +980,11 @@ impl RedisStorageMap {
             }
         }
 
-        //HSET key field value
         let _: () = async_conn.hset(name, key.as_ref(), val).await?;
         Ok(())
     }
 
+    /// Internal method for batch insertion with expiration
     #[inline]
     async fn _batch_insert_expire(&self, key_vals: Vec<(Key, Vec<u8>)>) -> Result<()> {
         let mut async_conn = self.async_conn();
@@ -919,8 +993,6 @@ impl RedisStorageMap {
         #[cfg(feature = "ttl")]
         if self.empty.load(Ordering::SeqCst) {
             if let Some(expire) = self.expire.as_ref() {
-                //HMSET key field value
-                //PEXPIRE key ms
                 let _: () = redis::pipe()
                     .atomic()
                     .hset_multiple(name, key_vals.as_slice())
@@ -933,7 +1005,6 @@ impl RedisStorageMap {
             }
         }
 
-        //HSET key field value
         let _: () = async_conn.hset_multiple(name, key_vals.as_slice()).await?;
         Ok(())
     }
@@ -941,11 +1012,13 @@ impl RedisStorageMap {
 
 #[async_trait]
 impl Map for RedisStorageMap {
+    /// Gets the map name
     #[inline]
     fn name(&self) -> &[u8] {
         self.name.as_slice()
     }
 
+    /// Inserts a key-value pair into the map
     #[inline]
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -956,13 +1029,13 @@ impl Map for RedisStorageMap {
             .await
     }
 
+    /// Gets a value from the map
     #[inline]
     async fn get<K, V>(&self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        //HSET key field value
         let res: Option<Vec<u8>> = self
             .async_conn()
             .hget(self.full_name.as_slice(), key.as_ref())
@@ -974,12 +1047,12 @@ impl Map for RedisStorageMap {
         }
     }
 
+    /// Removes a key from the map
     #[inline]
     async fn remove<K>(&self, key: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        //HDEL key field [field ...]
         let _: () = self
             .async_conn()
             .hdel(self.full_name.as_slice(), key.as_ref())
@@ -987,9 +1060,9 @@ impl Map for RedisStorageMap {
         Ok(())
     }
 
+    /// Checks if a key exists in the map
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        //HEXISTS key field
         let res = self
             .async_conn()
             .hexists(self.full_name.as_slice(), key.as_ref())
@@ -997,16 +1070,16 @@ impl Map for RedisStorageMap {
         Ok(res)
     }
 
+    /// Gets the number of elements in the map
     #[cfg(feature = "map_len")]
     #[inline]
     async fn len(&self) -> Result<usize> {
-        //HLEN key
         Ok(self.async_conn().hlen(self.full_name.as_slice()).await?)
     }
 
+    /// Checks if the map is empty
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
-        //HSCAN key cursor [MATCH pattern] [COUNT count]
         let res = self
             .async_conn()
             .hscan::<_, Vec<u8>>(self.full_name.as_slice())
@@ -1017,22 +1090,21 @@ impl Map for RedisStorageMap {
         Ok(res)
     }
 
+    /// Clears all elements from the map
     #[inline]
     async fn clear(&self) -> Result<()> {
-        //DEL key [key ...]
         let _: () = self.async_conn().del(self.full_name.as_slice()).await?;
         self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
 
+    /// Removes and returns a value from the map
     #[inline]
     async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
     where
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        //HSET key field value
-        //HDEL key field [field ...]
         let name = self.full_name.as_slice();
         let mut conn = self.async_conn();
         let (res, _): (Option<Vec<u8>>, isize) = redis::pipe()
@@ -1049,6 +1121,7 @@ impl Map for RedisStorageMap {
         }
     }
 
+    /// Removes all keys with a given prefix
     #[inline]
     async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
     where
@@ -1066,7 +1139,7 @@ impl Map for RedisStorageMap {
             .next_item()
             .await
         {
-            removeds.push(key);
+            removeds.push(key?);
             if removeds.len() > 20 {
                 let _: () = conn2.hdel(name, removeds.as_slice()).await?;
                 removeds.clear();
@@ -1078,6 +1151,7 @@ impl Map for RedisStorageMap {
         Ok(())
     }
 
+    /// Batch insertion of key-value pairs
     #[inline]
     async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
@@ -1098,6 +1172,7 @@ impl Map for RedisStorageMap {
         Ok(())
     }
 
+    /// Batch removal of keys
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if !keys.is_empty() {
@@ -1109,6 +1184,7 @@ impl Map for RedisStorageMap {
         Ok(())
     }
 
+    /// Creates an iterator over key-value pairs
     #[inline]
     async fn iter<'a, V>(
         &'a mut self,
@@ -1127,6 +1203,7 @@ impl Map for RedisStorageMap {
         Ok(Box::new(iter))
     }
 
+    /// Creates an iterator over keys
     #[inline]
     async fn key_iter<'a>(
         &'a mut self,
@@ -1141,6 +1218,7 @@ impl Map for RedisStorageMap {
         Ok(Box::new(iter))
     }
 
+    /// Creates an iterator over key-value pairs with a prefix
     #[inline]
     async fn prefix_iter<'a, P, V>(
         &'a mut self,
@@ -1163,6 +1241,7 @@ impl Map for RedisStorageMap {
         Ok(Box::new(iter))
     }
 
+    /// Sets expiration time for the map
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let res = self
@@ -1172,6 +1251,7 @@ impl Map for RedisStorageMap {
         Ok(res)
     }
 
+    /// Sets expiration duration for the map
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         let res = self
@@ -1181,6 +1261,7 @@ impl Map for RedisStorageMap {
         Ok(res)
     }
 
+    /// Gets time-to-live for the map
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         let mut async_conn = self.async_conn();
@@ -1195,17 +1276,24 @@ impl Map for RedisStorageMap {
     }
 }
 
+/// Redis-backed list storage implementation
 #[derive(Clone)]
 pub struct RedisStorageList {
+    /// Name of the list
     name: Key,
+    /// Full key name with prefix
     full_name: Key,
+    /// Optional expiration time in milliseconds
     #[allow(dead_code)]
     expire: Option<TimestampMillis>,
+    /// Flag indicating if the list is empty
     empty: Arc<AtomicBool>,
+    /// Reference to the parent database
     pub(crate) db: RedisStorageDB,
 }
 
 impl RedisStorageList {
+    /// Creates a new list without expiration
     #[inline]
     pub(crate) fn new(name: Key, full_name: Key, db: RedisStorageDB) -> Self {
         Self {
@@ -1217,6 +1305,7 @@ impl RedisStorageList {
         }
     }
 
+    /// Creates a new list with expiration
     #[inline]
     pub(crate) async fn new_expire(
         name: Key,
@@ -1239,16 +1328,19 @@ impl RedisStorageList {
         })
     }
 
+    /// Gets a clone of the async connection
     #[inline]
     pub(crate) fn async_conn(&self) -> RedisConnection {
         self.db.async_conn()
     }
 
+    /// Checks if the list is empty
     #[inline]
     async fn _is_empty(async_conn: &mut RedisConnection, full_name: &[u8]) -> Result<bool> {
         Ok(async_conn.llen::<_, usize>(full_name).await? == 0)
     }
 
+    /// Internal method to push with expiration handling
     #[inline]
     async fn _push_expire(&self, val: Vec<u8>) -> Result<()> {
         let mut async_conn = self.async_conn();
@@ -1257,8 +1349,6 @@ impl RedisStorageList {
         #[cfg(feature = "ttl")]
         if self.empty.load(Ordering::SeqCst) {
             if let Some(expire) = self.expire.as_ref() {
-                //RPUSH key value [value ...]
-                //PEXPIRE key ms
                 let _: () = redis::pipe()
                     .atomic()
                     .rpush(name, val)
@@ -1270,11 +1360,11 @@ impl RedisStorageList {
             }
         }
 
-        //RPUSH key value [value ...]
         let _: () = async_conn.rpush(name, val).await?;
         Ok(())
     }
 
+    /// Internal method for batch push with expiration
     #[inline]
     async fn _pushs_expire(&self, vals: Vec<Vec<u8>>) -> Result<()> {
         let mut async_conn = self.async_conn();
@@ -1283,8 +1373,6 @@ impl RedisStorageList {
         if self.empty.load(Ordering::SeqCst) {
             if let Some(expire) = self.expire.as_ref() {
                 let name = self.full_name.as_slice();
-                //RPUSH key value [value ...]
-                //PEXPIRE key ms
                 let _: () = redis::pipe()
                     .atomic()
                     .rpush(name, vals)
@@ -1296,11 +1384,11 @@ impl RedisStorageList {
             }
         }
 
-        //RPUSH key value [value ...]
         let _: () = async_conn.rpush(self.full_name.as_slice(), vals).await?;
         Ok(())
     }
 
+    /// Internal method for push with limit and expiration
     #[inline]
     async fn _push_limit_expire(
         &self,
@@ -1345,6 +1433,7 @@ impl RedisStorageList {
             .await
     }
 
+    /// Internal method for push with limit
     #[inline]
     async fn _push_limit(
         &self,
@@ -1375,11 +1464,13 @@ impl RedisStorageList {
 
 #[async_trait]
 impl List for RedisStorageList {
+    /// Gets the list name
     #[inline]
     fn name(&self) -> &[u8] {
         self.name.as_slice()
     }
 
+    /// Pushes a value to the end of the list
     #[inline]
     async fn push<V>(&self, val: &V) -> Result<()>
     where
@@ -1388,12 +1479,12 @@ impl List for RedisStorageList {
         self._push_expire(bincode::serialize(val)?).await
     }
 
+    /// Pushes multiple values to the end of the list
     #[inline]
     async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
     where
         V: Serialize + Sync + Send,
     {
-        //RPUSH key value [value ...]
         let vals = vals
             .into_iter()
             .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
@@ -1401,6 +1492,7 @@ impl List for RedisStorageList {
         self._pushs_expire(vals).await
     }
 
+    /// Pushes a value with size limit handling
     #[inline]
     async fn push_limit<V>(
         &self,
@@ -1426,12 +1518,12 @@ impl List for RedisStorageList {
         }
     }
 
+    /// Pops a value from the front of the list
     #[inline]
     async fn pop<V>(&self) -> Result<Option<V>>
     where
         V: DeserializeOwned + Sync + Send,
     {
-        //LPOP key
         let removed = self
             .async_conn()
             .lpop::<_, Option<Vec<u8>>>(self.full_name.as_slice(), None)
@@ -1446,12 +1538,12 @@ impl List for RedisStorageList {
         Ok(removed)
     }
 
+    /// Gets all values in the list
     #[inline]
     async fn all<V>(&self) -> Result<Vec<V>>
     where
         V: DeserializeOwned + Sync + Send,
     {
-        //LRANGE key 0 -1
         let all = self
             .async_conn()
             .lrange::<_, Vec<Vec<u8>>>(self.full_name.as_slice(), 0, -1)
@@ -1461,12 +1553,12 @@ impl List for RedisStorageList {
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Gets a value by index
     #[inline]
     async fn get_index<V>(&self, idx: usize) -> Result<Option<V>>
     where
         V: DeserializeOwned + Sync + Send,
     {
-        //LINDEX key index
         let val = self
             .async_conn()
             .lindex::<_, Option<Vec<u8>>>(self.full_name.as_slice(), idx as isize)
@@ -1479,17 +1571,19 @@ impl List for RedisStorageList {
         })
     }
 
+    /// Gets the length of the list
     #[inline]
     async fn len(&self) -> Result<usize> {
-        //LLEN key
         Ok(self.async_conn().llen(self.full_name.as_slice()).await?)
     }
 
+    /// Checks if the list is empty
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
         Ok(self.len().await? == 0)
     }
 
+    /// Clears the list
     #[inline]
     async fn clear(&self) -> Result<()> {
         let _: () = self.async_conn().del(self.full_name.as_slice()).await?;
@@ -1497,6 +1591,7 @@ impl List for RedisStorageList {
         Ok(())
     }
 
+    /// Creates an iterator over list values
     #[inline]
     async fn iter<'a, V>(
         &'a mut self,
@@ -1510,6 +1605,7 @@ impl List for RedisStorageList {
         )))
     }
 
+    /// Sets expiration time for the list
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let res = self
@@ -1519,6 +1615,7 @@ impl List for RedisStorageList {
         Ok(res)
     }
 
+    /// Sets expiration duration for the list
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         let res = self
@@ -1528,6 +1625,7 @@ impl List for RedisStorageList {
         Ok(res)
     }
 
+    /// Gets time-to-live for the list
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         let mut async_conn = self.async_conn();
@@ -1542,6 +1640,7 @@ impl List for RedisStorageList {
     }
 }
 
+/// Iterator for list values
 pub struct AsyncListValIter<'a, V> {
     name: &'a [u8],
     conn: RedisConnection,
@@ -1552,6 +1651,7 @@ pub struct AsyncListValIter<'a, V> {
 }
 
 impl<'a, V> AsyncListValIter<'a, V> {
+    /// Creates a new list value iterator
     fn new(name: &'a [u8], conn: RedisConnection) -> Self {
         let start = 0;
         let limit = 20;
@@ -1567,7 +1667,7 @@ impl<'a, V> AsyncListValIter<'a, V> {
 }
 
 #[async_trait]
-impl<'a, V> AsyncIterator for AsyncListValIter<'a, V>
+impl<V> AsyncIterator for AsyncListValIter<'_, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -1601,6 +1701,7 @@ where
     }
 }
 
+/// Iterator for map entries
 pub struct AsyncIter<'a, V> {
     iter: redis::AsyncIter<'a, (Key, Vec<u8>)>,
     _m: std::marker::PhantomData<V>,
@@ -1614,82 +1715,96 @@ where
     type Item = IterItem<V>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let item = self.iter.next_item().await;
-        item.map(|(key, v)| match bincode::deserialize::<V>(v.as_ref()) {
-            Ok(v) => Ok((key, v)),
-            Err(e) => Err(anyhow::Error::new(e)),
-        })
+        match self.iter.next_item().await {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok((key, v))) => match bincode::deserialize::<V>(v.as_ref()) {
+                Ok(v) => Some(Ok((key, v))),
+                Err(e) => Some(Err(anyhow::Error::new(e))),
+            },
+        }
     }
 }
 
+/// Iterator for database keys
 pub struct AsyncDbKeyIter<'a> {
     prefix_len: usize,
     iter: redis::AsyncIter<'a, Key>,
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
+impl AsyncIterator for AsyncDbKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next_item()
-            .await
-            .map(|key| Ok(key[self.prefix_len..].to_vec()))
+        match self.iter.next_item().await {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok(key)) => Some(Ok(key[self.prefix_len..].to_vec())),
+        }
     }
 }
 
+/// Iterator for map keys
 pub struct AsyncKeyIter<'a> {
     iter: redis::AsyncIter<'a, (Key, ())>,
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncKeyIter<'a> {
+impl AsyncIterator for AsyncKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next_item().await.map(|(key, _)| Ok(key))
+        match self.iter.next_item().await {
+            None => None,
+            Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
+            Some(Ok((key, _))) => Some(Ok(key)),
+        }
     }
 }
 
+/// Iterator for maps
 pub struct AsyncMapIter<'a> {
     db: RedisStorageDB,
     iter: redis::AsyncIter<'a, Key>,
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncMapIter<'a> {
+impl AsyncIterator for AsyncMapIter<'_> {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let full_name = self.iter.next_item().await;
-        if let Some(full_name) = full_name {
-            let name = self.db.map_full_name_to_key(full_name.as_slice()).to_vec();
-            let m = RedisStorageMap::new(name, full_name, self.db.clone());
-            Some(Ok(StorageMap::Redis(m)))
-        } else {
-            None
-        }
+        let full_name = match self.iter.next_item().await {
+            None => return None,
+            Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+            Some(Ok(key)) => key,
+        };
+
+        let name = self.db.map_full_name_to_key(full_name.as_slice()).to_vec();
+        let m = RedisStorageMap::new(name, full_name, self.db.clone());
+        Some(Ok(StorageMap::Redis(m)))
     }
 }
 
+/// Iterator for lists
 pub struct AsyncListIter<'a> {
     db: RedisStorageDB,
     iter: redis::AsyncIter<'a, Key>,
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncListIter<'a> {
+impl AsyncIterator for AsyncListIter<'_> {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
-        let full_name = self.iter.next_item().await;
-        if let Some(full_name) = full_name {
-            let name = self.db.list_full_name_to_key(full_name.as_slice()).to_vec();
-            let l = RedisStorageList::new(name, full_name, self.db.clone());
-            Some(Ok(StorageList::Redis(l)))
-        } else {
-            None
-        }
+        let full_name = match self.iter.next_item().await {
+            None => return None,
+            Some(Err(e)) => return Some(Err(anyhow::Error::new(e))),
+            Some(Ok(key)) => key,
+        };
+
+        let name = self.db.list_full_name_to_key(full_name.as_slice()).to_vec();
+        let l = RedisStorageList::new(name, full_name, self.db.clone());
+        Some(Ok(StorageList::Redis(l)))
     }
 }

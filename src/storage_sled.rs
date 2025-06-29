@@ -1,3 +1,17 @@
+//! Sled-based persistent storage implementation
+//!
+//! This module provides a persistent storage solution backed by Sled (an embedded database).
+//! It implements key-value storage, maps (dictionaries), and lists (queues) with support for:
+//! - Atomic operations and transactions
+//! - Asynchronous API
+//! - TTL/expiration (optional feature)
+//! - Counters
+//! - Batch operations
+//! - Iterators
+//!
+//! The implementation uses multiple sled trees for different data types and provides
+//! a command-based interface with background processing for concurrent operations.
+
 use core::fmt;
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -7,10 +21,11 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Error};
 use async_trait::async_trait;
 use convert::Bytesize;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -31,32 +46,49 @@ use tokio::task::spawn_blocking;
 use crate::storage::{AsyncIterator, IterItem, Key, List, Map, StorageDB};
 #[allow(unused_imports)]
 use crate::{timestamp_millis, TimestampMillis};
-use crate::{Error, Result, StorageList, StorageMap};
+use crate::{Result, StorageList, StorageMap};
 
+/// Byte separator used in composite keys
 const SEPARATOR: &[u8] = b"@";
+/// Tree name for key-value storage
 const KV_TREE: &[u8] = b"__kv_tree@";
+/// Tree name for map metadata
 const MAP_TREE: &[u8] = b"__map_tree@";
+/// Tree name for list metadata
 const LIST_TREE: &[u8] = b"__list_tree@";
+/// Tree for tracking expiration times (expire_at => key)
 const EXPIRE_KEYS_TREE: &[u8] = b"__expire_key_tree@";
+/// Tree for tracking key expiration (key => expire_at)
 const KEY_EXPIRE_TREE: &[u8] = b"__key_expire_tree@";
+/// Prefix for map keys
 const MAP_NAME_PREFIX: &[u8] = b"__map@";
+/// Separator between map name and item key
 const MAP_KEY_SEPARATOR: &[u8] = b"@__item@";
 #[allow(dead_code)]
+/// Suffix for map count keys
 const MAP_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
 
+/// Prefix for list keys
 const LIST_NAME_PREFIX: &[u8] = b"__list@";
+/// Suffix for list count keys
 const LIST_KEY_COUNT_SUFFIX: &[u8] = b"@__count@";
+/// Suffix for list content keys
 const LIST_KEY_CONTENT_SUFFIX: &[u8] = b"@__content@";
 
+/// Enum representing different key types in storage
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 enum KeyType {
+    /// Key-value pair
     KV,
+    /// Map structure
     Map,
+    /// List structure
     List,
 }
 
 impl KeyType {
+    /// Encodes key type to a single byte
     #[inline]
     #[allow(dead_code)]
     fn encode(&self) -> &[u8] {
@@ -67,6 +99,7 @@ impl KeyType {
         }
     }
 
+    /// Decodes key type from byte representation
     #[inline]
     #[allow(dead_code)]
     fn decode(v: &[u8]) -> Result<Self> {
@@ -83,7 +116,9 @@ impl KeyType {
     }
 }
 
+/// Enum representing all possible storage operations
 enum Command {
+    // Database operations
     DBInsert(SledStorageDB, Key, Vec<u8>, oneshot::Sender<Result<()>>),
     DBGet(SledStorageDB, IVec, oneshot::Sender<Result<Option<IVec>>>),
     DBRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
@@ -130,6 +165,7 @@ enum Command {
     DBLen(SledStorageDB, oneshot::Sender<usize>),
     DBSize(SledStorageDB, oneshot::Sender<usize>),
 
+    // Map operations
     MapInsert(SledStorageMap, IVec, IVec, oneshot::Sender<Result<()>>),
     MapGet(SledStorageMap, IVec, oneshot::Sender<Result<Option<IVec>>>),
     MapRemove(SledStorageMap, IVec, oneshot::Sender<Result<()>>),
@@ -160,6 +196,7 @@ enum Command {
     MapIsExpired(SledStorageMap, oneshot::Sender<Result<bool>>),
     MapPrefixIter(SledStorageMap, Option<IVec>, oneshot::Sender<sled::Iter>),
 
+    // List operations
     ListPush(SledStorageList, IVec, oneshot::Sender<Result<()>>),
     ListPushs(SledStorageList, Vec<IVec>, oneshot::Sender<Result<()>>),
     ListPushLimit(
@@ -193,6 +230,7 @@ enum Command {
     ListIsExpired(SledStorageList, oneshot::Sender<Result<bool>>),
     ListPrefixIter(SledStorageList, oneshot::Sender<sled::Iter>),
 
+    // Iterator operation
     #[allow(clippy::type_complexity)]
     IterNext(
         sled::Iter,
@@ -200,8 +238,10 @@ enum Command {
     ),
 }
 
+/// Type alias for cleanup function signature
 pub type CleanupFun = fn(&SledStorageDB);
 
+/// Default cleanup function that runs in background thread
 fn def_cleanup(_db: &SledStorageDB) {
     #[cfg(feature = "ttl")]
     {
@@ -246,10 +286,14 @@ fn def_cleanup(_db: &SledStorageDB) {
     }
 }
 
+/// Configuration for Sled storage backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SledConfig {
+    /// Path to database directory
     pub path: String,
+    /// Cache capacity in bytes
     pub cache_capacity: Bytesize,
+    /// Cleanup function for expired keys
     #[serde(skip, default = "SledConfig::cleanup_f_default")]
     pub cleanup_f: CleanupFun,
 }
@@ -265,6 +309,7 @@ impl Default for SledConfig {
 }
 
 impl SledConfig {
+    /// Converts to Sled's native configuration
     #[inline]
     pub fn to_sled_config(&self) -> Result<sled::Config> {
         if self.path.trim().is_empty() {
@@ -277,12 +322,14 @@ impl SledConfig {
         Ok(sled_cfg)
     }
 
+    /// Returns default cleanup function
     #[inline]
     fn cleanup_f_default() -> CleanupFun {
         def_cleanup
     }
 }
 
+/// Increments a counter value stored in bytes
 fn _increment(old: Option<&[u8]>) -> Option<Vec<u8>> {
     let number = match old {
         Some(bytes) => {
@@ -299,6 +346,7 @@ fn _increment(old: Option<&[u8]>) -> Option<Vec<u8>> {
     Some(number.to_be_bytes().to_vec())
 }
 
+/// Decrements a counter value stored in bytes
 fn _decrement(old: Option<&[u8]>) -> Option<Vec<u8>> {
     let number = match old {
         Some(bytes) => {
@@ -315,6 +363,7 @@ fn _decrement(old: Option<&[u8]>) -> Option<Vec<u8>> {
     Some(number.to_be_bytes().to_vec())
 }
 
+/// Pattern for matching keys with wildcards
 #[derive(Clone)]
 pub struct Pattern(Arc<Vec<PatternChar>>);
 
@@ -338,14 +387,19 @@ impl From<&[u8]> for Pattern {
     }
 }
 
+/// Represents a single character in a pattern
 #[derive(Clone)]
 pub enum PatternChar {
+    /// Literal byte
     Literal(u8),
+    /// Wildcard matching zero or more characters
     Wildcard,
+    /// Matches any single character
     AnyChar,
 }
 
 impl Pattern {
+    /// Parses a byte pattern into PatternChar sequence
     pub fn parse(pattern: &[u8]) -> Self {
         let mut parsed_pattern = Vec::new();
         let mut chars = pattern.bytes().peekable();
@@ -375,6 +429,7 @@ impl Pattern {
     }
 }
 
+/// Checks if text matches the given pattern
 fn is_match<P: Into<Pattern>>(pattern: P, text: &[u8]) -> bool {
     let pattern = pattern.into();
     let text_chars = text;
@@ -407,7 +462,9 @@ fn is_match<P: Into<Pattern>>(pattern: P, text: &[u8]) -> bool {
     dp[pattern_len][text_len]
 }
 
+/// Trait for byte replacement
 pub trait BytesReplace {
+    /// Replaces all occurrences of `from` with `to` in the byte slice
     fn replace(self, from: &[u8], to: &[u8]) -> Vec<u8>;
 }
 
@@ -429,21 +486,31 @@ impl BytesReplace for &[u8] {
     }
 }
 
+/// Main database handle for Sled storage
 #[derive(Clone)]
 pub struct SledStorageDB {
+    /// Underlying sled database
     pub(crate) db: Arc<sled::Db>,
+    /// Tree for key-value storage
     pub(crate) kv_tree: sled::Tree,
+    /// Tree for map metadata
     pub(crate) map_tree: sled::Tree,
+    /// Tree for list metadata
     pub(crate) list_tree: sled::Tree,
+    /// Tree for tracking expiration times
     #[allow(dead_code)]
-    pub(crate) expire_key_tree: sled::Tree, //(key, val) => (expire_at, key)
+    pub(crate) expire_key_tree: sled::Tree,
+    /// Tree for tracking key expiration
     #[allow(dead_code)]
-    pub(crate) key_expire_tree: sled::Tree, //(key, val) => (key, expire_at)
+    pub(crate) key_expire_tree: sled::Tree,
+    /// Channel sender for commands
     cmd_tx: mpsc::Sender<Command>,
-    active_count: Arc<AtomicIsize>, //Active Command Count
+    /// Count of active commands
+    active_count: Arc<AtomicIsize>,
 }
 
 impl SledStorageDB {
+    /// Creates a new SledStorageDB instance
     #[inline]
     pub(crate) async fn new(cfg: SledConfig) -> Result<Self> {
         let sled_cfg = cfg.to_sled_config()?;
@@ -661,6 +728,7 @@ impl SledStorageDB {
         Ok(db)
     }
 
+    /// Cleans up expired keys (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     pub fn cleanup(&self, limit: usize) -> usize {
@@ -755,6 +823,7 @@ impl SledStorageDB {
         count
     }
 
+    /// Cleans up expired key-value pairs (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     pub fn cleanup_kvs(&self, limit: usize) -> usize {
@@ -823,6 +892,7 @@ impl SledStorageDB {
         count
     }
 
+    /// Returns the count of active commands
     #[inline]
     pub fn active_count(&self) -> isize {
         self.active_count.load(Ordering::Relaxed)
@@ -838,6 +908,7 @@ impl SledStorageDB {
     //     self.list_tree.len()
     // }
 
+    /// Creates a map prefix name
     #[inline]
     fn make_map_prefix_name<K>(name: K) -> Key
     where
@@ -846,6 +917,7 @@ impl SledStorageDB {
         [MAP_NAME_PREFIX, name.as_ref(), SEPARATOR].concat()
     }
 
+    /// Creates a map item prefix name
     #[inline]
     fn make_map_item_prefix_name<K>(name: K) -> Key
     where
@@ -854,6 +926,7 @@ impl SledStorageDB {
         [MAP_NAME_PREFIX, name.as_ref(), MAP_KEY_SEPARATOR].concat()
     }
 
+    /// Creates a map count key name
     #[inline]
     fn make_map_count_key_name<K>(name: K) -> Key
     where
@@ -862,16 +935,19 @@ impl SledStorageDB {
         [MAP_NAME_PREFIX, name.as_ref(), MAP_KEY_COUNT_SUFFIX].concat()
     }
 
+    /// Extracts map name from count key
     #[inline]
     fn map_count_key_to_name(key: &[u8]) -> &[u8] {
         key[MAP_NAME_PREFIX.len()..key.as_ref().len() - MAP_KEY_COUNT_SUFFIX.len()].as_ref()
     }
 
+    /// Checks if a key is a map count key
     #[inline]
     fn is_map_count_key(key: &[u8]) -> bool {
         key.starts_with(MAP_NAME_PREFIX) && key.ends_with(MAP_KEY_COUNT_SUFFIX)
     }
 
+    /// Extracts map name from item key
     #[allow(dead_code)]
     #[inline]
     fn map_item_key_to_name(key: &[u8]) -> Option<&[u8]> {
@@ -887,6 +963,7 @@ impl SledStorageDB {
         None
     }
 
+    /// Creates a list prefix
     #[inline]
     fn make_list_prefix<K>(name: K) -> Key
     where
@@ -895,21 +972,25 @@ impl SledStorageDB {
         [LIST_NAME_PREFIX, name.as_ref()].concat()
     }
 
+    /// Creates a list count key
     #[inline]
     fn make_list_count_key(name: &[u8]) -> Vec<u8> {
         [LIST_NAME_PREFIX, name, LIST_KEY_COUNT_SUFFIX].concat()
     }
 
+    /// Extracts list name from count key
     #[inline]
     fn list_count_key_to_name(key: &[u8]) -> &[u8] {
         key[LIST_NAME_PREFIX.len()..key.as_ref().len() - LIST_KEY_COUNT_SUFFIX.len()].as_ref()
     }
 
+    /// Checks if a key is a list count key
     #[inline]
     fn is_list_count_key(key: &[u8]) -> bool {
         key.starts_with(LIST_NAME_PREFIX) && key.ends_with(LIST_KEY_COUNT_SUFFIX)
     }
 
+    /// Checks if a key exists for a specific key type
     #[inline]
     fn _contains_key<K: AsRef<[u8]> + Sync + Send>(
         &self,
@@ -923,23 +1004,27 @@ impl SledStorageDB {
         }
     }
 
+    /// Checks if a key exists in key-value store
     #[inline]
     fn _kv_contains_key<K: AsRef<[u8]> + Sync + Send>(kv: &Tree, key: K) -> Result<bool> {
         Ok(kv.contains_key(key.as_ref())?)
     }
 
+    /// Checks if a map exists
     #[inline]
     fn _map_contains_key<K: AsRef<[u8]> + Sync + Send>(tree: &Tree, key: K) -> Result<bool> {
         let count_key = SledStorageDB::make_map_count_key_name(key.as_ref());
         Ok(tree.contains_key(count_key)?)
     }
 
+    /// Checks if a list exists
     #[inline]
     fn _list_contains_key<K: AsRef<[u8]> + Sync + Send>(tree: &Tree, name: K) -> Result<bool> {
         let count_key = SledStorageDB::make_list_count_key(name.as_ref());
         Ok(tree.contains_key(count_key)?)
     }
 
+    /// Removes a map
     #[inline]
     fn _map_remove<K>(&self, key: K) -> Result<()>
     where
@@ -962,6 +1047,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Removes a list
     #[inline]
     fn _list_remove<K>(&self, key: K) -> Result<()>
     where
@@ -988,6 +1074,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Removes a key-value pair
     #[inline]
     fn _kv_remove<K>(&self, key: K) -> Result<()>
     where
@@ -1008,6 +1095,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Removes expiration key (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     fn _remove_expire_key(&self, key: &[u8]) -> Result<()> {
@@ -1019,6 +1107,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Transactionally removes expiration key (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     fn _tx_remove_expire_key(
@@ -1034,6 +1123,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Checks if a key is expired
     #[inline]
     fn _is_expired<K, F>(&self, _key: K, _contains_key_f: F) -> Result<bool>
     where
@@ -1052,6 +1142,7 @@ impl SledStorageDB {
         Ok(false)
     }
 
+    /// Gets time-to-live for a key
     #[inline]
     fn _ttl<K, F>(
         &self,
@@ -1067,6 +1158,7 @@ impl SledStorageDB {
             .map(|(expire_at, at_bytes)| (expire_at - timestamp_millis(), at_bytes)))
     }
 
+    /// Gets expiration time for a key
     #[inline]
     fn _ttl_at<K, F>(
         &self,
@@ -1100,6 +1192,7 @@ impl SledStorageDB {
         Ok(ttl_res)
     }
 
+    /// Inserts a key-value pair
     #[inline]
     fn _insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
         #[cfg(not(feature = "ttl"))]
@@ -1117,6 +1210,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Gets a value by key
     #[inline]
     fn _get(&self, key: &[u8]) -> Result<Option<IVec>> {
         let res = if self._is_expired(key.as_ref(), |k| Self::_kv_contains_key(&self.kv_tree, k))? {
@@ -1127,6 +1221,7 @@ impl SledStorageDB {
         Ok(res)
     }
 
+    /// Checks if a map key exists
     #[inline]
     fn _self_map_contains_key(&self, key: &[u8]) -> Result<bool> {
         #[cfg(feature = "ttl")]
@@ -1143,6 +1238,7 @@ impl SledStorageDB {
         Self::_map_contains_key(&self.map_tree, key)
     }
 
+    /// Checks if a list key exists
     #[inline]
     fn _self_list_contains_key(&self, key: &[u8]) -> Result<bool> {
         #[cfg(feature = "ttl")]
@@ -1160,6 +1256,7 @@ impl SledStorageDB {
         Self::_list_contains_key(&self.list_tree, key)
     }
 
+    /// Batch insert key-value pairs
     #[inline]
     fn _batch_insert(&self, key_vals: Vec<(Key, IVec)>) -> Result<()> {
         if key_vals.is_empty() {
@@ -1206,6 +1303,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Batch remove keys
     #[inline]
     fn _batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if keys.is_empty() {
@@ -1246,6 +1344,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Increments a counter
     #[inline]
     fn _counter_incr(&self, key: &[u8], increment: isize) -> Result<()> {
         self.kv_tree.fetch_and_update(key, |old: Option<&[u8]>| {
@@ -1265,6 +1364,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Decrements a counter
     #[inline]
     fn _counter_decr(&self, key: &[u8], decrement: isize) -> Result<()> {
         self.kv_tree.fetch_and_update(key, |old: Option<&[u8]>| {
@@ -1284,6 +1384,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Gets counter value
     #[inline]
     fn _counter_get(&self, key: &[u8]) -> Result<Option<isize>> {
         let this = self;
@@ -1296,6 +1397,7 @@ impl SledStorageDB {
         }
     }
 
+    /// Sets counter value
     #[inline]
     fn _counter_set(&self, key: &[u8], val: isize) -> Result<()> {
         let val = val.to_be_bytes().to_vec();
@@ -1317,6 +1419,7 @@ impl SledStorageDB {
         Ok(())
     }
 
+    /// Checks if a key exists in key-value store
     #[inline]
     fn _self_contains_key(&self, key: &[u8]) -> Result<bool> {
         #[cfg(feature = "ttl")]
@@ -1333,6 +1436,7 @@ impl SledStorageDB {
         Self::_kv_contains_key(&self.kv_tree, key)
     }
 
+    /// Sets expiration time for a key (TTL feature)
     #[inline]
     #[cfg(feature = "ttl")]
     fn _expire_at(&self, key: &[u8], at: TimestampMillis, key_type: KeyType) -> Result<bool> {
@@ -1348,6 +1452,7 @@ impl SledStorageDB {
         }
     }
 
+    /// Transactionally sets expiration time (TTL feature)
     #[inline]
     #[cfg(feature = "ttl")]
     fn _tx_expire_at(
@@ -1365,6 +1470,7 @@ impl SledStorageDB {
         Ok(res)
     }
 
+    /// Gets time-to-live for a key (TTL feature)
     #[inline]
     #[cfg(feature = "ttl")]
     fn _self_ttl(&self, key: &[u8]) -> Result<Option<TimestampMillis>> {
@@ -1373,16 +1479,19 @@ impl SledStorageDB {
             .and_then(|(ttl, _)| if ttl > 0 { Some(ttl) } else { None }))
     }
 
+    /// Creates an iterator for map prefixes
     #[inline]
     fn _map_scan_prefix(&self) -> sled::Iter {
         self.map_tree.scan_prefix(MAP_NAME_PREFIX)
     }
 
+    /// Creates an iterator for list prefixes
     #[inline]
     fn _list_scan_prefix(&self) -> sled::Iter {
         self.list_tree.scan_prefix(LIST_NAME_PREFIX)
     }
 
+    /// Creates an iterator for database scan with pattern
     #[inline]
     fn _db_scan_prefix(&self, pattern: Vec<u8>) -> sled::Iter {
         let mut last_esc_char = false;
@@ -1420,6 +1529,7 @@ impl SledStorageDB {
         iter
     }
 
+    /// Gets number of key-value pairs
     #[inline]
     fn _kv_len(&self) -> usize {
         #[cfg(feature = "ttl")]
@@ -1434,11 +1544,13 @@ impl SledStorageDB {
         self.kv_tree.len()
     }
 
+    /// Gets total database size
     #[inline]
     fn _db_size(&self) -> usize {
         self.db.len() + self.kv_tree.len() + self.map_tree.len() + self.list_tree.len()
     }
 
+    /// Sends a command to the background processor
     #[inline]
     async fn cmd_send(&self, cmd: Command) -> Result<()> {
         self.active_count.fetch_add(1, Ordering::Relaxed);
@@ -1450,11 +1562,13 @@ impl SledStorageDB {
         }
     }
 
+    /// Gets a map handle
     #[inline]
     fn _map<N: AsRef<[u8]>>(&self, name: N) -> SledStorageMap {
         SledStorageMap::_new(name.as_ref().to_vec(), self.clone())
     }
 
+    /// Gets a list handle
     #[inline]
     fn _list<V: AsRef<[u8]>>(&self, name: V) -> SledStorageList {
         SledStorageList::_new(name.as_ref().to_vec(), self.clone())
@@ -1466,6 +1580,7 @@ impl StorageDB for SledStorageDB {
     type MapType = SledStorageMap;
     type ListType = SledStorageList;
 
+    /// Creates or gets a map with optional expiration
     #[inline]
     async fn map<N: AsRef<[u8]> + Sync + Send>(
         &self,
@@ -1475,6 +1590,7 @@ impl StorageDB for SledStorageDB {
         SledStorageMap::new_expire(name.as_ref().to_vec(), expire, self.clone()).await
     }
 
+    /// Removes a map
     #[inline]
     async fn map_remove<K>(&self, name: K) -> Result<()>
     where
@@ -1487,6 +1603,7 @@ impl StorageDB for SledStorageDB {
         Ok(())
     }
 
+    /// Checks if a map exists
     #[inline]
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -1499,6 +1616,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Creates or gets a list with optional expiration
     #[inline]
     async fn list<V: AsRef<[u8]> + Sync + Send>(
         &self,
@@ -1508,6 +1626,7 @@ impl StorageDB for SledStorageDB {
         SledStorageList::new_expire(name.as_ref().to_vec(), expire, self.clone()).await
     }
 
+    /// Removes a list
     #[inline]
     async fn list_remove<K>(&self, name: K) -> Result<()>
     where
@@ -1524,6 +1643,7 @@ impl StorageDB for SledStorageDB {
         Ok(())
     }
 
+    /// Checks if a list exists
     #[inline]
     async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -1536,6 +1656,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Inserts a key-value pair
     #[inline]
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -1555,6 +1676,7 @@ impl StorageDB for SledStorageDB {
         Ok(())
     }
 
+    /// Gets a value by key
     #[inline]
     async fn get<K, V>(&self, key: K) -> Result<Option<V>>
     where
@@ -1570,6 +1692,7 @@ impl StorageDB for SledStorageDB {
         }
     }
 
+    /// Removes a key-value pair
     #[inline]
     async fn remove<K>(&self, key: K) -> Result<()>
     where
@@ -1582,6 +1705,7 @@ impl StorageDB for SledStorageDB {
         Ok(())
     }
 
+    /// Batch inserts key-value pairs
     #[inline]
     async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
@@ -1606,6 +1730,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Batch removes keys
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         if keys.is_empty() {
@@ -1618,6 +1743,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Increments a counter
     #[inline]
     async fn counter_incr<K>(&self, key: K, increment: isize) -> Result<()>
     where
@@ -1634,6 +1760,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Decrements a counter
     #[inline]
     async fn counter_decr<K>(&self, key: K, decrement: isize) -> Result<()>
     where
@@ -1650,6 +1777,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Gets counter value
     #[inline]
     async fn counter_get<K>(&self, key: K) -> Result<Option<isize>>
     where
@@ -1661,6 +1789,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Sets counter value
     #[inline]
     async fn counter_set<K>(&self, key: K, val: isize) -> Result<()>
     where
@@ -1677,6 +1806,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Checks if a key exists
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -1689,6 +1819,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Gets number of key-value pairs (if enabled)
     #[inline]
     #[cfg(feature = "len")]
     async fn len(&self) -> Result<usize> {
@@ -1697,6 +1828,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await?)
     }
 
+    /// Gets total database size
     #[inline]
     async fn db_size(&self) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -1704,6 +1836,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await?)
     }
 
+    /// Sets expiration time for a key (TTL feature)
     #[inline]
     #[cfg(feature = "ttl")]
     async fn expire_at<K>(&self, key: K, at: TimestampMillis) -> Result<bool>
@@ -1721,6 +1854,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Sets time-to-live for a key (TTL feature)
     #[inline]
     #[cfg(feature = "ttl")]
     async fn expire<K>(&self, key: K, dur: TimestampMillis) -> Result<bool>
@@ -1731,6 +1865,7 @@ impl StorageDB for SledStorageDB {
         self.expire_at(key, at).await
     }
 
+    /// Gets time-to-live for a key (TTL feature)
     #[inline]
     #[cfg(feature = "ttl")]
     async fn ttl<K>(&self, key: K) -> Result<Option<TimestampMillis>>
@@ -1743,6 +1878,7 @@ impl StorageDB for SledStorageDB {
         Ok(rx.await??)
     }
 
+    /// Iterates over all maps
     #[inline]
     async fn map_iter<'a>(
         &'a mut self,
@@ -1755,6 +1891,7 @@ impl StorageDB for SledStorageDB {
         Ok(iter)
     }
 
+    /// Iterates over all lists
     #[inline]
     async fn list_iter<'a>(
         &'a mut self,
@@ -1770,6 +1907,7 @@ impl StorageDB for SledStorageDB {
         Ok(iter)
     }
 
+    /// Scans keys matching pattern
     async fn scan<'a, P>(
         &'a mut self,
         pattern: P,
@@ -1791,6 +1929,7 @@ impl StorageDB for SledStorageDB {
         Ok(iter)
     }
 
+    /// Gets database information
     #[inline]
     async fn info(&self) -> Result<Value> {
         let active_count = self.active_count.load(Ordering::Relaxed);
@@ -1852,17 +1991,25 @@ impl StorageDB for SledStorageDB {
     }
 }
 
+/// Map structure for key-value storage within a namespace
 #[derive(Clone)]
 pub struct SledStorageMap {
+    /// Map name
     name: Key,
+    /// Prefix for map keys
     map_prefix_name: Key,
+    /// Prefix for map items
     map_item_prefix_name: Key,
+    /// Key for map count
     map_count_key_name: Key,
+    /// Flag indicating if map is empty
     empty: Arc<AtomicBool>,
+    /// Database handle
     pub(crate) db: SledStorageDB,
 }
 
 impl SledStorageMap {
+    /// Creates a new map with optional expiration
     #[inline]
     async fn new_expire(
         name: Key,
@@ -1875,6 +2022,7 @@ impl SledStorageMap {
         rx.await?
     }
 
+    /// Internal method to create map with expiration
     #[inline]
     fn _new_expire(
         name: Key,
@@ -1890,6 +2038,7 @@ impl SledStorageMap {
         Ok(m)
     }
 
+    /// Internal method to create map
     #[inline]
     fn _new(name: Key, db: SledStorageDB) -> Self {
         let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_slice());
@@ -1905,22 +2054,26 @@ impl SledStorageMap {
         }
     }
 
+    /// Gets the underlying tree
     #[inline]
     fn tree(&self) -> &sled::Tree {
         &self.db.map_tree
     }
 
+    /// Creates a full item key
     #[inline]
     fn make_map_item_key<K: AsRef<[u8]>>(&self, key: K) -> Key {
         [self.map_item_prefix_name.as_ref(), key.as_ref()].concat()
     }
 
+    /// Gets map length (if enabled)
     #[cfg(feature = "map_len")]
     #[inline]
     fn _len_get(&self) -> Result<isize> {
         self._counter_get(self.map_count_key_name.as_slice())
     }
 
+    /// Transactionally increments a counter
     #[inline]
     fn _tx_counter_inc<K: AsRef<[u8]>>(
         tx: &TransactionalTree,
@@ -1941,6 +2094,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Transactionally decrements a counter
     #[inline]
     fn _tx_counter_dec<K: AsRef<[u8]>>(
         tx: &TransactionalTree,
@@ -1965,6 +2119,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Transactionally gets counter value
     #[inline]
     fn _tx_counter_get<K: AsRef<[u8]>, E>(
         tx: &TransactionalTree,
@@ -1985,6 +2140,7 @@ impl SledStorageMap {
         }
     }
 
+    /// Transactionally sets counter value
     #[inline]
     fn _tx_counter_set<K: AsRef<[u8]>, E>(
         tx: &TransactionalTree,
@@ -1995,6 +2151,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Transactionally removes counter
     #[inline]
     fn _tx_counter_remove<K: AsRef<[u8]>, E>(
         tx: &TransactionalTree,
@@ -2004,6 +2161,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Gets counter value
     #[inline]
     fn _counter_get<K: AsRef<[u8]>>(&self, key: K) -> Result<isize> {
         if let Some(v) = self.tree().get(key)? {
@@ -2013,6 +2171,7 @@ impl SledStorageMap {
         }
     }
 
+    /// Initializes counter if not present
     #[inline]
     fn _counter_init(&self) -> Result<()> {
         let tree = self.tree();
@@ -2025,6 +2184,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Clears the map
     #[inline]
     fn _clear(&self) -> Result<()> {
         let batch = self._make_clear_batch();
@@ -2034,6 +2194,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Transactionally clears the map
     #[inline]
     fn _tx_clear(
         &self,
@@ -2045,6 +2206,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Creates batch for clearing map
     #[inline]
     fn _make_clear_batch(&self) -> Batch {
         let mut batch = Batch::default();
@@ -2062,6 +2224,7 @@ impl SledStorageMap {
         batch
     }
 
+    /// Inserts a key-value pair into the map
     #[inline]
     fn _insert(&self, key: IVec, val: IVec) -> Result<()> {
         let item_key = self.make_map_item_key(key.as_ref());
@@ -2109,6 +2272,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Gets a value from the map
     #[inline]
     fn _get(&self, key: IVec) -> Result<Option<IVec>> {
         let this = self;
@@ -2123,6 +2287,7 @@ impl SledStorageMap {
         Ok(res)
     }
 
+    /// Removes a key from the map
     #[inline]
     fn _remove(&self, key: IVec) -> Result<()> {
         let tree = self.tree();
@@ -2148,12 +2313,14 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Checks if key exists in map
     #[inline]
     fn _contains_key(&self, key: IVec) -> Result<bool> {
         let key = self.make_map_item_key(key.as_ref());
         Ok(self.tree().contains_key(key)?)
     }
 
+    /// Gets map length (if enabled)
     #[cfg(feature = "map_len")]
     #[inline]
     fn _len(&self) -> Result<usize> {
@@ -2170,6 +2337,7 @@ impl SledStorageMap {
         Ok(len as usize)
     }
 
+    /// Checks if map is empty
     #[inline]
     fn _is_empty(&self) -> Result<bool> {
         let this = self;
@@ -2188,6 +2356,7 @@ impl SledStorageMap {
         Ok(res)
     }
 
+    /// Removes and returns a value
     #[inline]
     fn _remove_and_fetch(&self, key: IVec) -> Result<Option<IVec>> {
         let key = self.make_map_item_key(key.as_ref());
@@ -2222,6 +2391,7 @@ impl SledStorageMap {
         Ok(removed)
     }
 
+    /// Removes keys with prefix
     #[inline]
     fn _remove_with_prefix(&self, prefix: IVec) -> Result<()> {
         let tree = self.tree();
@@ -2272,6 +2442,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Batch inserts key-value pairs
     #[inline]
     fn _batch_insert(&self, key_vals: Vec<(IVec, IVec)>) -> Result<()> {
         for (k, v) in key_vals {
@@ -2280,6 +2451,7 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Batch removes keys
     #[inline]
     fn _batch_remove(&self, keys: Vec<IVec>) -> Result<()> {
         for k in keys {
@@ -2288,12 +2460,14 @@ impl SledStorageMap {
         Ok(())
     }
 
+    /// Sets expiration time (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     fn _expire_at(&self, at: TimestampMillis) -> Result<bool> {
         self.db._expire_at(self.name.as_slice(), at, KeyType::Map)
     }
 
+    /// Gets time-to-live (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     fn _ttl(&self) -> Result<Option<TimestampMillis>> {
@@ -2306,6 +2480,7 @@ impl SledStorageMap {
         Ok(res)
     }
 
+    /// Checks if map is expired
     #[inline]
     fn _is_expired(&self) -> Result<bool> {
         self.db._is_expired(self.name.as_slice(), |k| {
@@ -2313,6 +2488,7 @@ impl SledStorageMap {
         })
     }
 
+    /// Checks if map is expired (async)
     #[inline]
     async fn call_is_expired(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -2322,6 +2498,7 @@ impl SledStorageMap {
         rx.await?
     }
 
+    /// Creates prefix iterator
     #[inline]
     fn _prefix_iter(&self, prefix: Option<IVec>) -> sled::Iter {
         if let Some(prefix) = prefix {
@@ -2333,6 +2510,7 @@ impl SledStorageMap {
         }
     }
 
+    /// Creates prefix iterator (async)
     #[inline]
     async fn call_prefix_iter(&self, prefix: Option<IVec>) -> Result<sled::Iter> {
         let (tx, rx) = oneshot::channel();
@@ -2345,11 +2523,13 @@ impl SledStorageMap {
 
 #[async_trait]
 impl Map for SledStorageMap {
+    /// Gets map name
     #[inline]
     fn name(&self) -> &[u8] {
         self.name.as_slice()
     }
 
+    /// Inserts a key-value pair
     #[inline]
     async fn insert<K, V>(&self, key: K, val: &V) -> Result<()>
     where
@@ -2370,6 +2550,7 @@ impl Map for SledStorageMap {
         Ok(())
     }
 
+    /// Gets a value by key
     #[inline]
     async fn get<K, V>(&self, key: K) -> Result<Option<V>>
     where
@@ -2387,6 +2568,7 @@ impl Map for SledStorageMap {
         }
     }
 
+    /// Removes a key
     #[inline]
     async fn remove<K>(&self, key: K) -> Result<()>
     where
@@ -2400,6 +2582,7 @@ impl Map for SledStorageMap {
         Ok(())
     }
 
+    /// Checks if key exists
     #[inline]
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -2413,6 +2596,7 @@ impl Map for SledStorageMap {
         Ok(rx.await??)
     }
 
+    /// Gets map length (if enabled)
     #[cfg(feature = "map_len")]
     #[inline]
     async fn len(&self) -> Result<usize> {
@@ -2421,6 +2605,7 @@ impl Map for SledStorageMap {
         Ok(rx.await??)
     }
 
+    /// Checks if map is empty
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -2430,6 +2615,7 @@ impl Map for SledStorageMap {
         Ok(rx.await??)
     }
 
+    /// Clears the map
     #[inline]
     async fn clear(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -2440,6 +2626,7 @@ impl Map for SledStorageMap {
         Ok(())
     }
 
+    /// Removes and returns a value
     #[inline]
     async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
     where
@@ -2461,6 +2648,7 @@ impl Map for SledStorageMap {
         }
     }
 
+    /// Removes keys with prefix
     #[inline]
     async fn remove_with_prefix<K>(&self, prefix: K) -> Result<()>
     where
@@ -2478,6 +2666,7 @@ impl Map for SledStorageMap {
         Ok(())
     }
 
+    /// Batch inserts key-value pairs
     #[inline]
     async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
     where
@@ -2500,6 +2689,7 @@ impl Map for SledStorageMap {
         Ok(())
     }
 
+    /// Batch removes keys
     #[inline]
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
         let keys = keys.into_iter().map(|k| k.into()).collect::<Vec<IVec>>();
@@ -2512,6 +2702,7 @@ impl Map for SledStorageMap {
         Ok(())
     }
 
+    /// Iterates over map items
     #[inline]
     async fn iter<'a, V>(
         &'a mut self,
@@ -2542,6 +2733,7 @@ impl Map for SledStorageMap {
         Ok(res)
     }
 
+    /// Iterates over map keys
     #[inline]
     async fn key_iter<'a>(
         &'a mut self,
@@ -2568,6 +2760,7 @@ impl Map for SledStorageMap {
         Ok(res)
     }
 
+    /// Iterates over items with prefix
     #[inline]
     async fn prefix_iter<'a, P, V>(
         &'a mut self,
@@ -2601,6 +2794,7 @@ impl Map for SledStorageMap {
         Ok(res)
     }
 
+    /// Sets expiration time (TTL feature)
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -2610,12 +2804,14 @@ impl Map for SledStorageMap {
         Ok(rx.await??)
     }
 
+    /// Sets time-to-live (TTL feature)
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         let at = timestamp_millis() + dur;
         self.expire_at(at).await
     }
 
+    /// Gets time-to-live (TTL feature)
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         let (tx, rx) = oneshot::channel();
@@ -2624,14 +2820,19 @@ impl Map for SledStorageMap {
     }
 }
 
+/// List structure for queue-like storage within a namespace
 #[derive(Clone)]
 pub struct SledStorageList {
+    /// List name
     name: Key,
+    /// Prefix for list keys
     prefix_name: Key,
+    /// Database handle
     pub(crate) db: SledStorageDB,
 }
 
 impl SledStorageList {
+    /// Creates a new list with optional expiration
     #[inline]
     async fn new_expire(
         name: Key,
@@ -2644,6 +2845,7 @@ impl SledStorageList {
         rx.await?
     }
 
+    /// Internal method to create list with expiration
     #[inline]
     fn _new_expire(
         name: Key,
@@ -2658,6 +2860,7 @@ impl SledStorageList {
         Ok(l)
     }
 
+    /// Internal method to create list
     #[inline]
     fn _new(name: Key, db: SledStorageDB) -> Self {
         let prefix_name = SledStorageDB::make_list_prefix(name.as_slice());
@@ -2668,22 +2871,26 @@ impl SledStorageList {
         }
     }
 
+    /// Gets list name
     #[inline]
     pub(crate) fn name(&self) -> &[u8] {
         self.name.as_slice()
     }
 
+    /// Gets the underlying tree
     #[inline]
     pub(crate) fn tree(&self) -> &sled::Tree {
         &self.db.list_tree
     }
 
+    /// Creates list count key
     #[inline]
     fn make_list_count_key(&self) -> Vec<u8> {
         let list_count_key = [self.prefix_name.as_ref(), LIST_KEY_COUNT_SUFFIX].concat();
         list_count_key
     }
 
+    /// Creates list content prefix
     #[inline]
     fn make_list_content_prefix(prefix_name: &[u8], idx: Option<&[u8]>) -> Vec<u8> {
         if let Some(idx) = idx {
@@ -2693,6 +2900,7 @@ impl SledStorageList {
         }
     }
 
+    /// Creates list content key
     #[inline]
     fn make_list_content_key(&self, idx: usize) -> Vec<u8> {
         Self::make_list_content_prefix(
@@ -2701,6 +2909,7 @@ impl SledStorageList {
         )
     }
 
+    /// Creates batch of list content keys
     #[inline]
     fn make_list_content_keys(&self, start: usize, end: usize) -> Vec<Vec<u8>> {
         (start..end)
@@ -2708,6 +2917,7 @@ impl SledStorageList {
             .collect()
     }
 
+    /// Transactionally gets list count
     #[inline]
     fn tx_list_count_get<K, E>(
         tx: &TransactionalTree,
@@ -2729,6 +2939,7 @@ impl SledStorageList {
         }
     }
 
+    /// Transactionally sets list count
     #[inline]
     fn tx_list_count_set<K, E>(
         tx: &TransactionalTree,
@@ -2749,6 +2960,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Transactionally sets list content
     #[inline]
     fn tx_list_content_set<K, V, E>(
         tx: &TransactionalTree,
@@ -2763,6 +2975,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Transactionally sets batch list content
     #[inline]
     fn tx_list_content_batch_set<K, V, E>(
         tx: &TransactionalTree,
@@ -2780,6 +2993,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Clears the list
     #[inline]
     fn _clear(&self) -> Result<()> {
         let mut batch = Batch::default();
@@ -2805,6 +3019,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Transactionally clears the list
     #[inline]
     fn _tx_clear(
         list_tree_tx: &TransactionalTree,
@@ -2814,6 +3029,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Creates batch for clearing list
     #[inline]
     fn _make_clear_batch(&self) -> Batch {
         let mut batch = Batch::default();
@@ -2833,6 +3049,7 @@ impl SledStorageList {
         batch
     }
 
+    /// Pushes value to list
     #[inline]
     fn _push(&self, data: IVec) -> Result<()> {
         let this = self;
@@ -2872,6 +3089,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Pushes multiple values to list
     #[inline]
     fn _pushs(&self, vals: Vec<IVec>) -> Result<()> {
         if vals.is_empty() {
@@ -2921,6 +3139,7 @@ impl SledStorageList {
         Ok(())
     }
 
+    /// Pushes value with limit
     #[inline]
     fn _push_limit(
         &self,
@@ -2990,6 +3209,7 @@ impl SledStorageList {
         Ok(removed)
     }
 
+    /// Pops value from list
     #[inline]
     fn _pop(&self) -> Result<Option<IVec>> {
         let this = self;
@@ -3020,6 +3240,7 @@ impl SledStorageList {
         Ok(removed)
     }
 
+    /// Gets all values in list
     #[inline]
     fn _all(&self) -> Result<Vec<IVec>> {
         let this = self;
@@ -3041,6 +3262,7 @@ impl SledStorageList {
         Ok(res)
     }
 
+    /// Gets value by index
     #[inline]
     fn _get_index(&self, idx: usize) -> Result<Option<IVec>> {
         let this = self;
@@ -3072,6 +3294,7 @@ impl SledStorageList {
         Ok(res)
     }
 
+    /// Gets list length
     #[inline]
     fn _len(&self) -> Result<usize> {
         let this = self;
@@ -3093,6 +3316,7 @@ impl SledStorageList {
         Ok(res)
     }
 
+    /// Checks if list is empty
     #[inline]
     fn _is_empty(&self) -> Result<bool> {
         let this = self;
@@ -3115,12 +3339,14 @@ impl SledStorageList {
         Ok(res)
     }
 
+    /// Sets expiration time (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     fn _expire_at(&self, at: TimestampMillis) -> Result<bool> {
         self.db._expire_at(self.name.as_slice(), at, KeyType::List)
     }
 
+    /// Gets time-to-live (TTL feature)
     #[cfg(feature = "ttl")]
     #[inline]
     fn _ttl(&self) -> Result<Option<TimestampMillis>> {
@@ -3132,6 +3358,7 @@ impl SledStorageList {
             .and_then(|(at, _)| if at > 0 { Some(at) } else { None }))
     }
 
+    /// Checks if list is expired
     #[inline]
     fn _is_expired(&self) -> Result<bool> {
         self.db._is_expired(self.name.as_slice(), |k| {
@@ -3139,6 +3366,7 @@ impl SledStorageList {
         })
     }
 
+    /// Checks if list is expired (async)
     #[inline]
     async fn call_is_expired(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -3148,12 +3376,14 @@ impl SledStorageList {
         rx.await?
     }
 
+    /// Creates prefix iterator
     #[inline]
     fn _prefix_iter(&self) -> sled::Iter {
         let list_content_prefix = Self::make_list_content_prefix(self.prefix_name.as_slice(), None);
         self.tree().scan_prefix(list_content_prefix)
     }
 
+    /// Creates prefix iterator (async)
     #[inline]
     async fn call_prefix_iter(&self) -> Result<sled::Iter> {
         let (tx, rx) = oneshot::channel();
@@ -3166,11 +3396,13 @@ impl SledStorageList {
 
 #[async_trait]
 impl List for SledStorageList {
+    /// Gets list name
     #[inline]
     fn name(&self) -> &[u8] {
         self.name.as_slice()
     }
 
+    /// Pushes value to list
     #[inline]
     async fn push<V>(&self, val: &V) -> Result<()>
     where
@@ -3185,6 +3417,7 @@ impl List for SledStorageList {
         Ok(())
     }
 
+    /// Pushes multiple values to list
     #[inline]
     async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
     where
@@ -3211,6 +3444,7 @@ impl List for SledStorageList {
         Ok(())
     }
 
+    /// Pushes value with limit
     #[inline]
     async fn push_limit<V>(
         &self,
@@ -3246,6 +3480,7 @@ impl List for SledStorageList {
         Ok(removed)
     }
 
+    /// Pops value from list
     #[inline]
     async fn pop<V>(&self) -> Result<Option<V>>
     where
@@ -3265,6 +3500,7 @@ impl List for SledStorageList {
         Ok(removed)
     }
 
+    /// Gets all values in list
     #[inline]
     async fn all<V>(&self) -> Result<Vec<V>>
     where
@@ -3279,6 +3515,7 @@ impl List for SledStorageList {
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Gets value by index
     #[inline]
     async fn get_index<V>(&self, idx: usize) -> Result<Option<V>>
     where
@@ -3296,6 +3533,7 @@ impl List for SledStorageList {
         })
     }
 
+    /// Gets list length
     #[inline]
     async fn len(&self) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
@@ -3303,6 +3541,7 @@ impl List for SledStorageList {
         Ok(rx.await??)
     }
 
+    /// Checks if list is empty
     #[inline]
     async fn is_empty(&self) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -3312,6 +3551,7 @@ impl List for SledStorageList {
         Ok(rx.await??)
     }
 
+    /// Clears the list
     #[inline]
     async fn clear(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -3321,6 +3561,7 @@ impl List for SledStorageList {
         Ok(rx.await??)
     }
 
+    /// Iterates over list values
     #[inline]
     async fn iter<'a, V>(
         &'a mut self,
@@ -3350,6 +3591,7 @@ impl List for SledStorageList {
         Ok(res)
     }
 
+    /// Sets expiration time (TTL feature)
     #[cfg(feature = "ttl")]
     async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
@@ -3359,12 +3601,14 @@ impl List for SledStorageList {
         Ok(rx.await??)
     }
 
+    /// Sets time-to-live (TTL feature)
     #[cfg(feature = "ttl")]
     async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
         let at = timestamp_millis() + dur;
         self.expire_at(at).await
     }
 
+    /// Gets time-to-live (TTL feature)
     #[cfg(feature = "ttl")]
     async fn ttl(&self) -> Result<Option<TimestampMillis>> {
         let (tx, rx) = oneshot::channel();
@@ -3373,6 +3617,7 @@ impl List for SledStorageList {
     }
 }
 
+/// Async iterator for map items
 pub struct AsyncIter<'a, V> {
     db: &'a SledStorageDB,
     prefix_len: usize,
@@ -3380,14 +3625,14 @@ pub struct AsyncIter<'a, V> {
     _m: std::marker::PhantomData<V>,
 }
 
-impl<'a, V> Debug for AsyncIter<'a, V> {
+impl<V> Debug for AsyncIter<'_, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a, V> AsyncIterator for AsyncIter<'a, V>
+impl<V> AsyncIterator for AsyncIter<'_, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -3426,20 +3671,21 @@ where
     }
 }
 
+/// Async iterator for map keys
 pub struct AsyncKeyIter<'a> {
     db: &'a SledStorageDB,
     prefix_len: usize,
     iter: Option<sled::Iter>,
 }
 
-impl<'a> Debug for AsyncKeyIter<'a> {
+impl Debug for AsyncKeyIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncKeyIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncKeyIter<'a> {
+impl AsyncIterator for AsyncKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
@@ -3470,20 +3716,21 @@ impl<'a> AsyncIterator for AsyncKeyIter<'a> {
     }
 }
 
+/// Async iterator for list values
 pub struct AsyncListValIter<'a, V> {
     db: &'a SledStorageDB,
     iter: Option<sled::Iter>,
     _m: std::marker::PhantomData<V>,
 }
 
-impl<'a, V> Debug for AsyncListValIter<'a, V> {
+impl<V> Debug for AsyncListValIter<'_, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncListValIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a, V> AsyncIterator for AsyncListValIter<'a, V>
+impl<V> AsyncIterator for AsyncListValIter<'_, V>
 where
     V: DeserializeOwned + Sync + Send + 'static,
 {
@@ -3516,6 +3763,7 @@ where
     }
 }
 
+/// Empty iterator
 pub struct AsyncEmptyIter<T> {
     _m: std::marker::PhantomData<T>,
 }
@@ -3538,6 +3786,7 @@ where
     }
 }
 
+/// Async iterator for maps
 pub struct AsyncMapIter<'a> {
     db: &'a SledStorageDB,
     iter: Option<sled::Iter>,
@@ -3552,14 +3801,14 @@ impl<'a> AsyncMapIter<'a> {
     }
 }
 
-impl<'a> Debug for AsyncMapIter<'a> {
+impl Debug for AsyncMapIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncMapIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncMapIter<'a> {
+impl AsyncIterator for AsyncMapIter<'_> {
     type Item = Result<StorageMap>;
 
     async fn next(&mut self) -> Option<Self::Item> {
@@ -3595,19 +3844,20 @@ impl<'a> AsyncIterator for AsyncMapIter<'a> {
     }
 }
 
+/// Async iterator for lists
 pub struct AsyncListIter<'a> {
     db: &'a SledStorageDB,
     iter: Option<sled::Iter>,
 }
 
-impl<'a> Debug for AsyncListIter<'a> {
+impl Debug for AsyncListIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncListIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncListIter<'a> {
+impl AsyncIterator for AsyncListIter<'_> {
     type Item = Result<StorageList>;
 
     async fn next(&mut self) -> Option<Self::Item> {
@@ -3642,20 +3892,21 @@ impl<'a> AsyncIterator for AsyncListIter<'a> {
     }
 }
 
+/// Async iterator for database keys with pattern matching
 pub struct AsyncDbKeyIter<'a> {
     db: &'a SledStorageDB,
     pattern: Pattern,
     iter: Option<sled::Iter>,
 }
 
-impl<'a> Debug for AsyncDbKeyIter<'a> {
+impl Debug for AsyncDbKeyIter<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AsyncDbKeyIter .. ").finish()
     }
 }
 
 #[async_trait]
-impl<'a> AsyncIterator for AsyncDbKeyIter<'a> {
+impl AsyncIterator for AsyncDbKeyIter<'_> {
     type Item = Result<Key>;
 
     async fn next(&mut self) -> Option<Self::Item> {
