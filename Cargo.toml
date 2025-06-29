@@ -15,7 +15,7 @@ exclude = ["examples", ".gitignore", ".cargo/config"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package.metadata.docs.rs]
-features = ["sled", "redis", "redis-cluster", "ttl", "map_len", "len"]
+all-features = true
 
 [features]
 default = []
