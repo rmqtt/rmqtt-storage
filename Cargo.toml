@@ -1,6 +1,6 @@
 [package]
 name = "rmqtt-storage"
-version = "0.7.0"
+version = "0.7.1"
 authors = ["rmqtt <rmqttd@126.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -19,6 +19,8 @@ default = []
 ttl = []
 map_len = []
 len = []
+sled = ["dep:sled"]
+redis = ["dep:redis"]
 redis-cluster = ["redis", "redis/cluster", "redis/cluster-async"]
 
 [dependencies]
