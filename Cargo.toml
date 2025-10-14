@@ -1,6 +1,6 @@
 [package]
 name = "rmqtt-storage"
-version = "0.7.3"
+version = "0.7.4"
 authors = ["rmqtt <rmqttd@126.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -28,7 +28,7 @@ redis-cluster = ["redis", "redis/cluster", "redis/cluster-async"]
 
 [dependencies]
 sled = { version = "0.34", optional = true }
-redis = { version = "0.32", features = [ "tokio-comp", "safe_iterators", "connection-manager"], optional = true }
+redis = { version = "=0.32.6", features = [ "tokio-comp", "safe_iterators", "connection-manager"], optional = true }
 
 tokio = { version = "1", features = ["sync", "rt"] }
 futures = "0.3"
