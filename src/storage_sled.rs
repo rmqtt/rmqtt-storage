@@ -1663,7 +1663,7 @@ impl StorageDB for SledStorageDB {
         K: AsRef<[u8]> + Sync + Send,
         V: serde::ser::Serialize + Sync + Send,
     {
-        let val = bincode::serialize(val)?;
+        let val = postcard::to_stdvec(&val)?;
         let (tx, rx) = oneshot::channel();
         self.cmd_send(Command::DBInsert(
             self.clone(),
@@ -1687,7 +1687,7 @@ impl StorageDB for SledStorageDB {
         self.cmd_send(Command::DBGet(self.clone(), key.as_ref().into(), tx))
             .await?;
         match rx.await?? {
-            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
+            Some(v) => Ok(Some(postcard::from_bytes::<V>(v.as_ref())?)),
             None => Ok(None),
         }
     }
@@ -1718,7 +1718,7 @@ impl StorageDB for SledStorageDB {
         let key_vals = key_vals
             .into_iter()
             .map(|(k, v)| {
-                bincode::serialize(&v)
+                postcard::to_stdvec(&v)
                     .map(|v| (k, v.into()))
                     .map_err(|e| anyhow!(e))
             })
@@ -2536,7 +2536,7 @@ impl Map for SledStorageMap {
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send + ?Sized,
     {
-        let val = bincode::serialize(val)?;
+        let val = postcard::to_stdvec(&val)?;
         let (tx, rx) = oneshot::channel();
         self.db
             .cmd_send(Command::MapInsert(
@@ -2563,7 +2563,7 @@ impl Map for SledStorageMap {
             .await?;
 
         match rx.await?? {
-            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
+            Some(v) => Ok(Some(postcard::from_bytes::<V>(v.as_ref())?)),
             None => Ok(None),
         }
     }
@@ -2643,7 +2643,7 @@ impl Map for SledStorageMap {
             .await?;
 
         match rx.await?? {
-            Some(v) => Ok(Some(bincode::deserialize::<V>(v.as_ref())?)),
+            Some(v) => Ok(Some(postcard::from_bytes::<V>(v.as_ref())?)),
             None => Ok(None),
         }
     }
@@ -2675,7 +2675,7 @@ impl Map for SledStorageMap {
         let key_vals = key_vals
             .into_iter()
             .map(|(k, v)| {
-                bincode::serialize(&v)
+                postcard::to_stdvec(&v)
                     .map(|v| (k.into(), v.into()))
                     .map_err(|e| anyhow!(e))
             })
@@ -2927,7 +2927,7 @@ impl SledStorageList {
         K: AsRef<[u8]>,
     {
         if let Some(v) = tx.get(list_count_key.as_ref())? {
-            let (start, end) = bincode::deserialize::<(usize, usize)>(v.as_ref()).map_err(|e| {
+            let (start, end) = postcard::from_bytes::<(usize, usize)>(v.as_ref()).map_err(|e| {
                 ConflictableTransactionError::Storage(sled::Error::Io(io::Error::new(
                     ErrorKind::InvalidData,
                     e,
@@ -2950,7 +2950,7 @@ impl SledStorageList {
     where
         K: AsRef<[u8]>,
     {
-        let count_bytes = bincode::serialize(&(start, end)).map_err(|e| {
+        let count_bytes = postcard::to_stdvec(&(start, end)).map_err(|e| {
             ConflictableTransactionError::Storage(sled::Error::Io(io::Error::new(
                 ErrorKind::InvalidData,
                 e,
@@ -3306,7 +3306,7 @@ impl SledStorageList {
             } else {
                 let list_count_key = this.make_list_count_key();
                 if let Some(v) = this.tree().get(list_count_key.as_slice())? {
-                    let (start, end) = bincode::deserialize::<(usize, usize)>(v.as_ref())?;
+                    let (start, end) = postcard::from_bytes::<(usize, usize)>(v.as_ref())?;
                     Ok(end - start)
                 } else {
                     Ok(0)
@@ -3408,7 +3408,7 @@ impl List for SledStorageList {
     where
         V: serde::ser::Serialize + Sync + Send,
     {
-        let val = bincode::serialize(val)?;
+        let val = postcard::to_stdvec(&val)?;
         let (tx, rx) = oneshot::channel();
         self.db
             .cmd_send(Command::ListPush(self.clone(), val.into(), tx))
@@ -3430,7 +3430,7 @@ impl List for SledStorageList {
         let vals = vals
             .into_iter()
             .map(|v| {
-                bincode::serialize(&v)
+                postcard::to_stdvec(&v)
                     .map(|v| v.into())
                     .map_err(|e| anyhow!(e))
             })
@@ -3456,7 +3456,7 @@ impl List for SledStorageList {
         V: serde::ser::Serialize + Sync + Send,
         V: DeserializeOwned,
     {
-        let data = bincode::serialize(val)?;
+        let data = postcard::to_stdvec(&val)?;
 
         let (tx, rx) = oneshot::channel();
         self.db
@@ -3471,7 +3471,7 @@ impl List for SledStorageList {
 
         let removed = if let Some(removed) = rx.await?? {
             Some(
-                bincode::deserialize::<V>(removed.as_ref())
+                postcard::from_bytes::<V>(removed.as_ref())
                     .map_err(|e| sled::Error::Io(io::Error::new(ErrorKind::InvalidData, e)))?,
             )
         } else {
@@ -3491,7 +3491,7 @@ impl List for SledStorageList {
 
         let removed = if let Some(removed) = rx.await?? {
             Some(
-                bincode::deserialize::<V>(removed.as_ref())
+                postcard::from_bytes::<V>(removed.as_ref())
                     .map_err(|e| sled::Error::Io(io::Error::new(ErrorKind::InvalidData, e)))?,
             )
         } else {
@@ -3511,7 +3511,7 @@ impl List for SledStorageList {
 
         rx.await??
             .iter()
-            .map(|v| bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
+            .map(|v| postcard::from_bytes::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
             .collect::<Result<Vec<_>>>()
     }
 
@@ -3527,7 +3527,7 @@ impl List for SledStorageList {
             .await?;
 
         Ok(if let Some(res) = rx.await?? {
-            Some(bincode::deserialize::<V>(res.as_ref()).map_err(|e| anyhow!(e))?)
+            Some(postcard::from_bytes::<V>(res.as_ref()).map_err(|e| anyhow!(e))?)
         } else {
             None
         })
@@ -3659,7 +3659,7 @@ where
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((k, v))) => {
                 let name = k.as_ref()[self.prefix_len..].to_vec();
-                match bincode::deserialize::<V>(v.as_ref()) {
+                match postcard::from_bytes::<V>(v.as_ref()) {
                     Ok(v) => {
                         self.iter = Some(iter);
                         Some(Ok((name, v)))
@@ -3757,7 +3757,7 @@ where
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
             Some(Ok((_k, v))) => {
                 self.iter = Some(iter);
-                Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
+                Some(postcard::from_bytes::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
             }
         }
     }
