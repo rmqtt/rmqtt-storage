@@ -227,14 +227,14 @@ impl RedisStorageDB {
                 let mut async_conn = self.async_conn();
                 pipe()
                     .atomic()
-                    .set(full_key.as_slice(), bincode::serialize(val)?)
+                    .set(full_key.as_slice(), postcard::to_stdvec(&val)?)
                     .pexpire(full_key.as_slice(), expire_interval)
                     .query_async::<()>(&mut async_conn)
                     .await?;
             } else {
                 let _: () = self
                     .async_conn()
-                    .set(full_key, bincode::serialize(val)?)
+                    .set(full_key, postcard::to_stdvec(&val)?)
                     .await?;
             }
         }
@@ -245,7 +245,7 @@ impl RedisStorageDB {
             if let Some(expire_interval) = expire_interval {
                 pipe()
                     .atomic()
-                    .set(full_key.as_slice(), bincode::serialize(val)?)
+                    .set(full_key.as_slice(), postcard::to_stdvec(&val)?)
                     .pexpire(full_key.as_slice(), expire_interval)
                     .zadd(db_zkey, key.as_ref(), timestamp_millis() + expire_interval)
                     .query_async::<()>(&mut async_conn)
@@ -253,7 +253,7 @@ impl RedisStorageDB {
             } else {
                 pipe()
                     .atomic()
-                    .set(full_key.as_slice(), bincode::serialize(val)?)
+                    .set(full_key.as_slice(), postcard::to_stdvec(&val)?)
                     .zadd(db_zkey, key.as_ref(), i64::MAX)
                     .query_async::<()>(&mut async_conn)
                     .await?;
@@ -616,7 +616,7 @@ impl StorageDB for RedisStorageDB {
             .get::<_, Option<Vec<u8>>>(full_key)
             .await?
         {
-            Ok(Some(bincode::deserialize::<V>(v.as_ref())?))
+            Ok(Some(postcard::from_bytes::<V>(v.as_ref())?))
         } else {
             Ok(None)
         }
@@ -641,7 +641,7 @@ impl StorageDB for RedisStorageDB {
             let keys_vals_expires = key_vals
                 .into_iter()
                 .map(|(k, v)| {
-                    bincode::serialize(&v)
+                    postcard::to_stdvec(&v)
                         .map(move |v| (k, v, None))
                         .map_err(|e| anyhow!(e))
                 })
@@ -1025,7 +1025,7 @@ impl Map for RedisStorageMap {
         K: AsRef<[u8]> + Sync + Send,
         V: Serialize + Sync + Send + ?Sized,
     {
-        self._insert_expire(key.as_ref(), bincode::serialize(val)?)
+        self._insert_expire(key.as_ref(), postcard::to_stdvec(&val)?)
             .await
     }
 
@@ -1041,7 +1041,7 @@ impl Map for RedisStorageMap {
             .hget(self.full_name.as_slice(), key.as_ref())
             .await?;
         if let Some(res) = res {
-            Ok(Some(bincode::deserialize::<V>(res.as_ref())?))
+            Ok(Some(postcard::from_bytes::<V>(res.as_ref())?))
         } else {
             Ok(None)
         }
@@ -1115,7 +1115,7 @@ impl Map for RedisStorageMap {
             .await?;
 
         if let Some(res) = res {
-            Ok(Some(bincode::deserialize::<V>(res.as_ref())?))
+            Ok(Some(postcard::from_bytes::<V>(res.as_ref())?))
         } else {
             Ok(None)
         }
@@ -1161,7 +1161,7 @@ impl Map for RedisStorageMap {
             let key_vals = key_vals
                 .into_iter()
                 .map(|(k, v)| {
-                    bincode::serialize(&v)
+                    postcard::to_stdvec(&v)
                         .map(move |v| (k, v))
                         .map_err(|e| anyhow!(e))
                 })
@@ -1476,7 +1476,7 @@ impl List for RedisStorageList {
     where
         V: Serialize + Sync + Send,
     {
-        self._push_expire(bincode::serialize(val)?).await
+        self._push_expire(postcard::to_stdvec(&val)?).await
     }
 
     /// Pushes multiple values to the end of the list
@@ -1487,7 +1487,7 @@ impl List for RedisStorageList {
     {
         let vals = vals
             .into_iter()
-            .map(|v| bincode::serialize(&v).map_err(|e| anyhow!(e)))
+            .map(|v| postcard::to_stdvec(&v).map_err(|e| anyhow!(e)))
             .collect::<Result<Vec<_>>>()?;
         self._pushs_expire(vals).await
     }
@@ -1504,14 +1504,14 @@ impl List for RedisStorageList {
         V: Serialize + Sync + Send,
         V: DeserializeOwned,
     {
-        let data = bincode::serialize(val)?;
+        let data = postcard::to_stdvec(&val)?;
 
         if let Some(res) = self
             ._push_limit_expire(data, limit, pop_front_if_limited)
             .await?
         {
             Ok(Some(
-                bincode::deserialize::<V>(res.as_ref()).map_err(|e| anyhow!(e))?,
+                postcard::from_bytes::<V>(res.as_ref()).map_err(|e| anyhow!(e))?,
             ))
         } else {
             Ok(None)
@@ -1530,7 +1530,7 @@ impl List for RedisStorageList {
             .await?;
 
         let removed = if let Some(v) = removed {
-            Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
+            Some(postcard::from_bytes::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
         } else {
             None
         };
@@ -1549,7 +1549,7 @@ impl List for RedisStorageList {
             .lrange::<_, Vec<Vec<u8>>>(self.full_name.as_slice(), 0, -1)
             .await?;
         all.iter()
-            .map(|v| bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
+            .map(|v| postcard::from_bytes::<V>(v.as_ref()).map_err(|e| anyhow!(e)))
             .collect::<Result<Vec<_>>>()
     }
 
@@ -1565,7 +1565,7 @@ impl List for RedisStorageList {
             .await?;
 
         Ok(if let Some(v) = val {
-            Some(bincode::deserialize::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
+            Some(postcard::from_bytes::<V>(v.as_ref()).map_err(|e| anyhow!(e))?)
         } else {
             None
         })
@@ -1675,7 +1675,7 @@ where
 
     async fn next(&mut self) -> Option<Self::Item> {
         if let Some(val) = self.catch_vals.pop() {
-            return Some(bincode::deserialize::<V>(val.as_ref()).map_err(|e| anyhow!(e)));
+            return Some(postcard::from_bytes::<V>(val.as_ref()).map_err(|e| anyhow!(e)));
         }
 
         let vals = self
@@ -1697,7 +1697,7 @@ where
 
         self.catch_vals
             .pop()
-            .map(|val| bincode::deserialize::<V>(val.as_ref()).map_err(|e| anyhow!(e)))
+            .map(|val| postcard::from_bytes::<V>(val.as_ref()).map_err(|e| anyhow!(e)))
     }
 }
 
@@ -1718,7 +1718,7 @@ where
         match self.iter.next_item().await {
             None => None,
             Some(Err(e)) => Some(Err(anyhow::Error::new(e))),
-            Some(Ok((key, v))) => match bincode::deserialize::<V>(v.as_ref()) {
+            Some(Ok((key, v))) => match postcard::from_bytes::<V>(v.as_ref()) {
                 Ok(v) => Some(Ok((key, v))),
                 Err(e) => Some(Err(anyhow::Error::new(e))),
             },

@@ -1071,7 +1071,7 @@ mod tests {
     //     map1.retain(|item| {
     //         let res = match item {
     //             Ok((_k, v)) => {
-    //                 let v = bincode::deserialize::<usize>(v.as_ref()).unwrap();
+    //                 let v = postcard::from_bytes::<usize>(v.as_ref()).unwrap();
     //                 v != 10
     //             }
     //             Err(e) => {
