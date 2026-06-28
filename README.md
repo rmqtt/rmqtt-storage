@@ -14,7 +14,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rmqtt-storage = "0.7"
+rmqtt-storage = "0.9"
 ```
 
 ## Features
@@ -26,3 +26,13 @@ rmqtt-storage = "0.7"
 - Provides an implementation for 'sled'.
 - Provides an implementation for 'redis'.
 - Provides an implementation for 'redis cluster'. Note: the 'len' feature is not supported yet.
+- Uses [`postcard`](https://crates.io/crates/postcard) for binary serialization.
+- Asynchronous API with command-based architecture for thread-safe operations.
+
+## Changelog
+
+### 0.9.0
+
+- **Serialization**: Migrated from `bincode` to `postcard` — faster, smaller encoded output
+- **Refactor**: Removed sled transaction dependency, replaced with direct tree operations for better single-threaded throughput
+- **Testing**: Added `serial_test` to prevent sled I/O contention in parallel test runs

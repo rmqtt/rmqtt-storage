@@ -30,13 +30,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 #[allow(unused_imports)]
-use sled::transaction::TransactionResult;
-use sled::transaction::{
-    ConflictableTransactionError, ConflictableTransactionResult, TransactionError,
-    TransactionalTree,
-};
-#[allow(unused_imports)]
-use sled::Transactional;
 use sled::{Batch, IVec, Tree};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -709,6 +702,7 @@ impl SledStorageDB {
 
                     active_count1.fetch_sub(1, Ordering::Relaxed);
                 }
+                log::error!("cmd_rx.recv() is None");
             })
         });
 
@@ -811,13 +805,10 @@ impl SledStorageDB {
         //     log::error!("{:?}", e);
         // }
 
-        if let Err(e) = (&self.key_expire_tree, &self.expire_key_tree).transaction(
-            |(key_expire_tx, expire_key_tx)| {
-                key_expire_tx.apply_batch(&key_expire_batch)?;
-                expire_key_tx.apply_batch(&expire_key_batch)?;
-                Ok::<_, ConflictableTransactionError<()>>(())
-            },
-        ) {
+        if let Err(e) = self.key_expire_tree.apply_batch(key_expire_batch) {
+            log::error!("{:?}", e);
+        }
+        if let Err(e) = self.expire_key_tree.apply_batch(expire_key_batch) {
             log::error!("{:?}", e);
         }
         count
@@ -879,14 +870,13 @@ impl SledStorageDB {
             keys.remove(key);
         }
 
-        if let Err(e) = (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree).transaction(
-            |(kv_tx, key_expire_tx, expire_key_tx)| {
-                kv_tx.apply_batch(&keys)?;
-                key_expire_tx.apply_batch(&key_expire_batch)?;
-                expire_key_tx.apply_batch(&expire_key_batch)?;
-                Ok::<_, ConflictableTransactionError<()>>(())
-            },
-        ) {
+        if let Err(e) = self.kv_tree.apply_batch(keys) {
+            log::error!("{:?}", e);
+        }
+        if let Err(e) = self.key_expire_tree.apply_batch(key_expire_batch) {
+            log::error!("{:?}", e);
+        }
+        if let Err(e) = self.expire_key_tree.apply_batch(expire_key_batch) {
             log::error!("{:?}", e);
         }
         count
@@ -1036,13 +1026,8 @@ impl SledStorageDB {
         {
             let map = self._map(key.as_ref());
             let map_clear_batch = map._make_clear_batch();
-            (&self.map_tree, &self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(map_tx, key_expire_tx, expire_key_tx)| {
-                    map._tx_clear(map_tx, &map_clear_batch)?;
-                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key.as_ref())?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            map.tree().apply_batch(map_clear_batch)?;
+            self._remove_expire_key(key.as_ref())?;
         }
         Ok(())
     }
@@ -1059,17 +1044,8 @@ impl SledStorageDB {
         {
             let list = self._list(key.as_ref());
             let list_clear_batch = list._make_clear_batch();
-            (
-                &self.list_tree,
-                &self.key_expire_tree,
-                &self.expire_key_tree,
-            )
-                .transaction(|(list_tx, key_expire_tx, expire_key_tx)| {
-                    SledStorageList::_tx_clear(list_tx, &list_clear_batch)?;
-                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key.as_ref())?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            list.tree().apply_batch(list_clear_batch)?;
+            self._remove_expire_key(key.as_ref())?;
         }
         Ok(())
     }
@@ -1084,13 +1060,8 @@ impl SledStorageDB {
         self.kv_tree.remove(key.as_ref())?;
         #[cfg(feature = "ttl")]
         {
-            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
-                    kv_tx.remove(key.as_ref())?;
-                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key.as_ref())?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            self.kv_tree.remove(key.as_ref())?;
+            self._remove_expire_key(key.as_ref())?;
         }
         Ok(())
     }
@@ -1103,22 +1074,6 @@ impl SledStorageDB {
             self.key_expire_tree.remove(key)?;
             let expire_key = [expire_at_bytes.as_ref(), key].concat();
             self.expire_key_tree.remove(expire_key.as_slice())?;
-        }
-        Ok(())
-    }
-
-    /// Transactionally removes expiration key (TTL feature)
-    #[cfg(feature = "ttl")]
-    #[inline]
-    fn _tx_remove_expire_key(
-        key_expire_tx: &TransactionalTree,
-        expire_key_tx: &TransactionalTree,
-        key: &[u8],
-    ) -> ConflictableTransactionResult<()> {
-        if let Some(expire_at_bytes) = key_expire_tx.get(key)? {
-            key_expire_tx.remove(key)?;
-            let expire_key = [expire_at_bytes.as_ref(), key].concat();
-            expire_key_tx.remove(expire_key.as_slice())?;
         }
         Ok(())
     }
@@ -1192,20 +1147,14 @@ impl SledStorageDB {
         Ok(ttl_res)
     }
 
-    /// Inserts a key-value pair
+    /// Inserts a key-value pair (简化版: 跳过事务, 单独清理 expire)
     #[inline]
     fn _insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        #[cfg(not(feature = "ttl"))]
         self.kv_tree.insert(key, val)?;
-        #[cfg(feature = "ttl")]
-        {
-            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(kv_tx, key_expire_tx, expire_keys_tx)| {
-                    kv_tx.insert(key, val)?;
-                    Self::_tx_remove_expire_key(key_expire_tx, expire_keys_tx, key)?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        if let Some(expire_at_bytes) = self.key_expire_tree.get(key)? {
+            let expire_key = [expire_at_bytes.as_ref(), key].concat();
+            self.expire_key_tree.remove(expire_key.as_slice())?;
+            self.key_expire_tree.remove(key)?;
         }
         Ok(())
     }
@@ -1288,17 +1237,9 @@ impl SledStorageDB {
                 }
             }
 
-            // this.key_expire_tree.apply_batch(remove_key_expire_batch)?;
-            // this.expire_key_tree.apply_batch(remove_expire_key_batch)?;
-            // this.kv_tree.apply_batch(batch)?;
-            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
-                    key_expire_tx.apply_batch(&remove_key_expire_batch)?;
-                    expire_key_tx.apply_batch(&remove_expire_key_batch)?;
-                    kv_tx.apply_batch(&batch)?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            self.key_expire_tree.apply_batch(remove_key_expire_batch)?;
+            self.expire_key_tree.apply_batch(remove_expire_key_batch)?;
+            self.kv_tree.apply_batch(batch)?;
         }
         Ok(())
     }
@@ -1328,17 +1269,9 @@ impl SledStorageDB {
                     remove_expire_key_batch.remove(expire_key.as_slice())
                 }
             }
-            // this.key_expire_tree.apply_batch(remove_key_expire_batch)?;
-            // this.expire_key_tree.apply_batch(remove_expire_key_batch)?;
-            // this.kv_tree.apply_batch(batch)?;
-            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
-                    key_expire_tx.apply_batch(&remove_key_expire_batch)?;
-                    expire_key_tx.apply_batch(&remove_expire_key_batch)?;
-                    kv_tx.apply_batch(&batch)?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            self.key_expire_tree.apply_batch(remove_key_expire_batch)?;
+            self.expire_key_tree.apply_batch(remove_expire_key_batch)?;
+            self.kv_tree.apply_batch(batch)?;
         }
 
         Ok(())
@@ -1406,15 +1339,8 @@ impl SledStorageDB {
         self.kv_tree.insert(key, val.as_slice())?;
         #[cfg(feature = "ttl")]
         {
-            // self._remove_expire_key(key)?;
-            // kv_tree.insert(key, val.as_slice())?;
-            (&self.kv_tree, &self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(kv_tx, key_expire_tx, expire_key_tx)| {
-                    Self::_tx_remove_expire_key(key_expire_tx, expire_key_tx, key)?;
-                    kv_tx.insert(key, val.as_slice())?;
-                    Ok::<(), ConflictableTransactionError<()>>(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            self._remove_expire_key(key)?;
+            self.kv_tree.insert(key, val.as_slice())?;
         }
         Ok(())
     }
@@ -1441,33 +1367,28 @@ impl SledStorageDB {
     #[cfg(feature = "ttl")]
     fn _expire_at(&self, key: &[u8], at: TimestampMillis, key_type: KeyType) -> Result<bool> {
         if self._contains_key(key, key_type)? {
-            let res = (&self.key_expire_tree, &self.expire_key_tree)
-                .transaction(|(key_expire_tx, expire_key_tx)| {
-                    Self::_tx_expire_at(key_expire_tx, expire_key_tx, key, at, key_type)
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            let res = self._non_tx_expire_at(key, at, key_type)?;
             Ok(res)
         } else {
             Ok(false)
         }
     }
 
-    /// Transactionally sets expiration time (TTL feature)
-    #[inline]
+    /// Non-transactional: sets expiration time using direct tree ops
     #[cfg(feature = "ttl")]
-    fn _tx_expire_at(
-        key_expire_tx: &TransactionalTree,
-        expire_key_tx: &TransactionalTree,
+    #[inline]
+    fn _non_tx_expire_at(
+        &self,
         key: &[u8],
         at: TimestampMillis,
         key_type: KeyType,
-    ) -> ConflictableTransactionResult<bool> {
+    ) -> Result<bool> {
         let at_bytes = at.to_be_bytes();
-        key_expire_tx.insert(key, at_bytes.as_slice())?;
-        let res = expire_key_tx
-            .insert([at_bytes.as_ref(), key].concat(), key_type.encode())
-            .map(|_| true)?;
-        Ok(res)
+        self.key_expire_tree.insert(key, at_bytes.as_slice())?;
+        let res = self
+            .expire_key_tree
+            .insert([at_bytes.as_ref(), key].concat(), key_type.encode())?;
+        Ok(res.is_none())
     }
 
     /// Gets time-to-live for a key (TTL feature)
@@ -1534,12 +1455,12 @@ impl SledStorageDB {
     fn _kv_len(&self) -> usize {
         #[cfg(feature = "ttl")]
         {
-            let limit = 500;
-            loop {
-                if self.cleanup_kvs(limit) < limit {
-                    break;
-                }
-            }
+            // let limit = 500;
+            // loop {
+            //     if self.cleanup_kvs(limit) < limit {
+            //         break;
+            //     }
+            // }
         }
         self.kv_tree.len()
     }
@@ -2073,92 +1994,45 @@ impl SledStorageMap {
         self._counter_get(self.map_count_key_name.as_slice())
     }
 
-    /// Transactionally increments a counter
+    /// Non-transactional: increments a counter on a direct Tree
     #[inline]
-    fn _tx_counter_inc<K: AsRef<[u8]>>(
-        tx: &TransactionalTree,
-        key: K,
-    ) -> ConflictableTransactionResult<()> {
-        let val = match tx.get(key.as_ref())? {
+    fn _non_tx_counter_inc(tree: &Tree, key: &[u8]) -> Result<isize> {
+        let val = match tree.get(key)? {
             Some(data) => {
                 if let Ok(array) = data.as_ref().try_into() {
-                    let number = isize::from_be_bytes(array);
-                    number + 1
+                    isize::from_be_bytes(array) + 1
                 } else {
                     1
                 }
             }
             None => 1,
         };
-        tx.insert(key.as_ref(), val.to_be_bytes().as_slice())?;
-        Ok(())
+        tree.insert(key, &val.to_be_bytes())?;
+        Ok(val)
     }
 
-    /// Transactionally decrements a counter
+    /// Non-transactional: decrements a counter on a direct Tree
+    /// (removes the key when counter reaches 0)
     #[inline]
-    fn _tx_counter_dec<K: AsRef<[u8]>>(
-        tx: &TransactionalTree,
-        key: K,
-    ) -> ConflictableTransactionResult<()> {
-        let val = match tx.get(key.as_ref())? {
+    fn _non_tx_counter_dec(tree: &Tree, key: &[u8]) -> Result<isize> {
+        let val = match tree.get(key)? {
             Some(data) => {
                 if let Ok(array) = data.as_ref().try_into() {
-                    let number = isize::from_be_bytes(array);
-                    number - 1
+                    let n = isize::from_be_bytes(array) - 1;
+                    if n > 0 {
+                        n
+                    } else {
+                        tree.remove(key)?;
+                        return Ok(0);
+                    }
                 } else {
-                    -1
+                    0
                 }
             }
-            None => -1,
+            None => 0,
         };
-        if val > 0 {
-            tx.insert(key.as_ref(), val.to_be_bytes().as_slice())?;
-        } else {
-            tx.remove(key.as_ref())?;
-        }
-        Ok(())
-    }
-
-    /// Transactionally gets counter value
-    #[inline]
-    fn _tx_counter_get<K: AsRef<[u8]>, E>(
-        tx: &TransactionalTree,
-        key: K,
-    ) -> ConflictableTransactionResult<isize, E> {
-        if let Some(v) = tx.get(key)? {
-            let c = match v.as_ref().try_into() {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(ConflictableTransactionError::Storage(sled::Error::Io(
-                        io::Error::new(ErrorKind::InvalidData, e),
-                    )))
-                }
-            };
-            Ok(isize::from_be_bytes(c))
-        } else {
-            Ok(0)
-        }
-    }
-
-    /// Transactionally sets counter value
-    #[inline]
-    fn _tx_counter_set<K: AsRef<[u8]>, E>(
-        tx: &TransactionalTree,
-        key: K,
-        val: isize,
-    ) -> ConflictableTransactionResult<(), E> {
-        tx.insert(key.as_ref(), val.to_be_bytes().as_slice())?;
-        Ok(())
-    }
-
-    /// Transactionally removes counter
-    #[inline]
-    fn _tx_counter_remove<K: AsRef<[u8]>, E>(
-        tx: &TransactionalTree,
-        key: K,
-    ) -> ConflictableTransactionResult<(), E> {
-        tx.remove(key.as_ref())?;
-        Ok(())
+        tree.insert(key, &val.to_be_bytes())?;
+        Ok(val)
     }
 
     /// Gets counter value
@@ -2188,20 +2062,7 @@ impl SledStorageMap {
     #[inline]
     fn _clear(&self) -> Result<()> {
         let batch = self._make_clear_batch();
-        self.tree()
-            .transaction(|tx| self._tx_clear(tx, &batch))
-            .map_err(|e| anyhow!(format!("{:?}", e)))?;
-        Ok(())
-    }
-
-    /// Transactionally clears the map
-    #[inline]
-    fn _tx_clear(
-        &self,
-        map_tree_tx: &TransactionalTree,
-        batch: &Batch,
-    ) -> ConflictableTransactionResult<()> {
-        map_tree_tx.apply_batch(batch)?;
+        self.tree().apply_batch(batch)?;
         self.empty.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -2228,18 +2089,16 @@ impl SledStorageMap {
     #[inline]
     fn _insert(&self, key: IVec, val: IVec) -> Result<()> {
         let item_key = self.make_map_item_key(key.as_ref());
-        let this = self;
         #[cfg(feature = "map_len")]
         {
-            let count_key = this.map_count_key_name.as_slice();
-            this.tree()
-                .transaction(move |tx| {
-                    if tx.insert(item_key.as_slice(), val.as_ref())?.is_none() {
-                        Self::_tx_counter_inc(tx, count_key)?;
-                    }
-                    Ok(())
-                })
-                .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            let count_key = self.map_count_key_name.as_slice();
+            if self
+                .tree()
+                .insert(item_key.as_slice(), val.as_ref())?
+                .is_none()
+            {
+                Self::_non_tx_counter_inc(self.tree(), count_key)?;
+            }
         }
         #[cfg(not(feature = "map_len"))]
         {
@@ -2247,25 +2106,15 @@ impl SledStorageMap {
                 self._counter_init()?;
                 self.empty.store(false, Ordering::SeqCst)
             }
-            this.tree().insert(item_key.as_slice(), val.as_ref())?;
+            self.tree().insert(item_key.as_slice(), val.as_ref())?;
         }
 
         #[cfg(feature = "ttl")]
         {
-            if this.db._is_expired(this.name.as_slice(), |k| {
-                SledStorageDB::_map_contains_key(this.tree(), k)
+            if self.db._is_expired(self.name.as_slice(), |k| {
+                SledStorageDB::_map_contains_key(self.tree(), k)
             })? {
-                // this.db._remove_expire_key(this.name.as_slice())?;
-                (&self.db.key_expire_tree, &self.db.expire_key_tree)
-                    .transaction(|(key_expire_tx, expire_key_tx)| {
-                        SledStorageDB::_tx_remove_expire_key(
-                            key_expire_tx,
-                            expire_key_tx,
-                            this.name.as_slice(),
-                        )?;
-                        Ok::<(), ConflictableTransactionError<()>>(())
-                    })
-                    .map_err(|e| anyhow!(format!("{:?}", e)))?;
+                self.db._remove_expire_key(self.name.as_slice())?;
             }
         }
 
@@ -2295,14 +2144,10 @@ impl SledStorageMap {
 
         #[cfg(feature = "map_len")]
         {
-            let count_key = self.map_count_key_name.to_vec();
-            tree.transaction(move |tx| {
-                if tx.remove(key.as_slice())?.is_some() {
-                    Self::_tx_counter_dec(tx, count_key.as_slice())?;
-                }
-                Ok(())
-            })
-            .map_err(|e| anyhow!(format!("{:?}", e)))?;
+            let count_key = self.map_count_key_name.as_slice();
+            if tree.remove(key.as_slice())?.is_some() {
+                Self::_non_tx_counter_dec(tree, count_key)?;
+            }
         }
 
         #[cfg(not(feature = "map_len"))]
@@ -2369,24 +2214,19 @@ impl SledStorageMap {
             } else {
                 #[cfg(feature = "map_len")]
                 {
-                    let count_key = this.map_count_key_name.to_vec();
-                    this.tree().transaction(move |tx| {
-                        if let Some(removed) = tx.remove(key.as_slice())? {
-                            Self::_tx_counter_dec(tx, count_key.as_slice())?;
-                            Ok(Some(removed))
-                        } else {
-                            Ok(None)
-                        }
-                    })
+                    let removed = this.tree().remove(key.as_slice())?;
+                    if removed.is_some() {
+                        Self::_non_tx_counter_dec(this.tree(), this.map_count_key_name.as_slice())?;
+                    }
+                    Ok::<_, anyhow::Error>(removed)
                 }
                 #[cfg(not(feature = "map_len"))]
                 {
                     let removed = this.tree().remove(key.as_slice())?;
-                    Ok::<_, TransactionError<()>>(removed)
+                    Ok::<_, anyhow::Error>(removed)
                 }
             }
-        }
-        .map_err(|e| anyhow!(format!("{:?}", e)))?;
+        }?;
 
         Ok(removed)
     }
@@ -2422,23 +2262,23 @@ impl SledStorageMap {
 
             #[cfg(feature = "map_len")]
             {
-                tree.transaction(move |tx| {
-                    let len = Self::_tx_counter_get(tx, map_count_key_name.as_slice())? - c;
-                    if len > 0 {
-                        Self::_tx_counter_set(tx, map_count_key_name.as_slice(), len)?;
-                    } else {
-                        Self::_tx_counter_remove(tx, map_count_key_name.as_slice())?;
-                    };
-                    tx.apply_batch(&removeds)?;
-                    Ok::<(), ConflictableTransactionError<sled::Error>>(())
-                })
+                let old = tree
+                    .get(map_count_key_name.as_slice())?
+                    .map(|v| isize::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8])))
+                    .unwrap_or(0);
+                let len = old - c;
+                if len > 0 {
+                    tree.insert(map_count_key_name.as_slice(), &len.to_be_bytes())?;
+                } else {
+                    tree.remove(map_count_key_name.as_slice())?;
+                }
+                tree.apply_batch(removeds)?;
             }
             #[cfg(not(feature = "map_len"))]
             {
                 tree.apply_batch(removeds)?;
-                Ok::<(), ConflictableTransactionError<sled::Error>>(())
             }
-        }?;
+        }
         Ok(())
     }
 
@@ -2917,80 +2757,15 @@ impl SledStorageList {
             .collect()
     }
 
-    /// Transactionally gets list count
+    /// Non-transactional: gets list count using direct Tree ops
     #[inline]
-    fn tx_list_count_get<K, E>(
-        tx: &TransactionalTree,
-        list_count_key: K,
-    ) -> ConflictableTransactionResult<(usize, usize), E>
-    where
-        K: AsRef<[u8]>,
-    {
-        if let Some(v) = tx.get(list_count_key.as_ref())? {
-            let (start, end) = postcard::from_bytes::<(usize, usize)>(v.as_ref()).map_err(|e| {
-                ConflictableTransactionError::Storage(sled::Error::Io(io::Error::new(
-                    ErrorKind::InvalidData,
-                    e,
-                )))
-            })?;
+    fn non_tx_list_count_get(tree: &Tree, key: &[u8]) -> Result<(usize, usize)> {
+        if let Some(v) = tree.get(key)? {
+            let (start, end) = postcard::from_bytes::<(usize, usize)>(v.as_ref())?;
             Ok((start, end))
         } else {
             Ok((0, 0))
         }
-    }
-
-    /// Transactionally sets list count
-    #[inline]
-    fn tx_list_count_set<K, E>(
-        tx: &TransactionalTree,
-        key_count: K,
-        start: usize,
-        end: usize,
-    ) -> ConflictableTransactionResult<(), E>
-    where
-        K: AsRef<[u8]>,
-    {
-        let count_bytes = postcard::to_stdvec(&(start, end)).map_err(|e| {
-            ConflictableTransactionError::Storage(sled::Error::Io(io::Error::new(
-                ErrorKind::InvalidData,
-                e,
-            )))
-        })?;
-        tx.insert(key_count.as_ref(), count_bytes.as_slice())?;
-        Ok(())
-    }
-
-    /// Transactionally sets list content
-    #[inline]
-    fn tx_list_content_set<K, V, E>(
-        tx: &TransactionalTree,
-        key_content: K,
-        data: V,
-    ) -> ConflictableTransactionResult<(), E>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        tx.insert(key_content.as_ref(), data.as_ref())?;
-        Ok(())
-    }
-
-    /// Transactionally sets batch list content
-    #[inline]
-    fn tx_list_content_batch_set<K, V, E>(
-        tx: &TransactionalTree,
-        key_contents: Vec<(K, V)>,
-    ) -> ConflictableTransactionResult<(), E>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        let mut batch = Batch::default();
-        for (k, v) in key_contents {
-            batch.insert(k.as_ref(), v.as_ref());
-        }
-        tx.apply_batch(&batch)?;
-        Ok(())
     }
 
     /// Clears the list
@@ -3010,22 +2785,7 @@ impl SledStorageList {
                 }
             }
         }
-        self.tree()
-            .transaction(|tx| {
-                tx.apply_batch(&batch)?;
-                Ok::<_, ConflictableTransactionError<()>>(())
-            })
-            .map_err(|e| anyhow!(format!("{:?}", e)))?;
-        Ok(())
-    }
-
-    /// Transactionally clears the list
-    #[inline]
-    fn _tx_clear(
-        list_tree_tx: &TransactionalTree,
-        batch: &Batch,
-    ) -> ConflictableTransactionResult<()> {
-        list_tree_tx.apply_batch(batch)?;
+        self.tree().apply_batch(batch)?;
         Ok(())
     }
 
@@ -3052,37 +2812,22 @@ impl SledStorageList {
     /// Pushes value to list
     #[inline]
     fn _push(&self, data: IVec) -> Result<()> {
-        let this = self;
-        this.tree().transaction(move |tx| {
-            let list_count_key = this.make_list_count_key();
-            let (start, mut end) = Self::tx_list_count_get::<
-                _,
-                ConflictableTransactionError<sled::Error>,
-            >(tx, list_count_key.as_slice())?;
-            end += 1;
-            Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
+        let tree = self.tree();
+        let list_count_key = self.make_list_count_key();
+        let (start, mut end) = Self::non_tx_list_count_get(tree, list_count_key.as_slice())?;
+        end += 1;
+        let count_bytes = postcard::to_allocvec(&(start, end))?;
+        tree.insert(list_count_key.as_slice(), count_bytes.as_slice())?;
 
-            let list_content_key = this.make_list_content_key(end);
-            Self::tx_list_content_set(tx, list_content_key.as_slice(), data.as_ref())?;
-            Ok(())
-        })?;
+        let list_content_key = self.make_list_content_key(end);
+        tree.insert(list_content_key.as_slice(), data.as_ref())?;
 
         #[cfg(feature = "ttl")]
         {
-            if this.db._is_expired(this.name.as_slice(), |k| {
-                SledStorageDB::_list_contains_key(this.tree(), k)
+            if self.db._is_expired(self.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(tree, k)
             })? {
-                // this.db._remove_expire_key(this.name.as_slice())?;
-                (&self.db.key_expire_tree, &self.db.expire_key_tree)
-                    .transaction(|(key_expire_tx, expire_key_tx)| {
-                        SledStorageDB::_tx_remove_expire_key(
-                            key_expire_tx,
-                            expire_key_tx,
-                            this.name.as_slice(),
-                        )?;
-                        Ok::<(), ConflictableTransactionError<()>>(())
-                    })
-                    .map_err(|e| anyhow!(format!("{:?}", e)))?;
+                self.db._remove_expire_key(self.name.as_slice())?;
             }
         }
 
@@ -3096,44 +2841,27 @@ impl SledStorageList {
             return Ok(());
         }
         let tree = self.tree();
-        let this = self;
+        let list_count_key = self.make_list_count_key();
+        let (start, mut end) = Self::non_tx_list_count_get(tree, list_count_key.as_slice())?;
 
-        tree.transaction(move |tx| {
-            let list_count_key = this.make_list_count_key();
-            let (start, mut end) = Self::tx_list_count_get::<
-                _,
-                ConflictableTransactionError<sled::Error>,
-            >(tx, list_count_key.as_slice())?;
+        let mut list_content_keys = self.make_list_content_keys(end + 1, end + vals.len() + 1);
+        end += vals.len();
+        let count_bytes = postcard::to_allocvec(&(start, end))?;
+        tree.insert(list_count_key.as_slice(), count_bytes.as_slice())?;
 
-            let mut list_content_keys = this.make_list_content_keys(end + 1, end + vals.len() + 1);
-            //assert_eq!(vals.len(), list_content_keys.len());
-            end += vals.len();
-            Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
-
-            let list_contents = vals
-                .iter()
-                .map(|val| (list_content_keys.remove(0), val))
-                .collect::<Vec<_>>();
-            Self::tx_list_content_batch_set(tx, list_contents)?;
-            Ok(())
-        })?;
+        let mut batch = Batch::default();
+        for val in vals.iter() {
+            let k = list_content_keys.remove(0);
+            batch.insert(k, val.as_ref());
+        }
+        tree.apply_batch(batch)?;
 
         #[cfg(feature = "ttl")]
         {
-            if this.db._is_expired(this.name.as_slice(), |k| {
-                SledStorageDB::_list_contains_key(this.tree(), k)
+            if self.db._is_expired(self.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(tree, k)
             })? {
-                // this.db._remove_expire_key(this.name.as_slice())?;
-                (&self.db.key_expire_tree, &self.db.expire_key_tree)
-                    .transaction(|(key_expire_tx, expire_key_tx)| {
-                        SledStorageDB::_tx_remove_expire_key(
-                            key_expire_tx,
-                            expire_key_tx,
-                            this.name.as_slice(),
-                        )?;
-                        Ok::<(), ConflictableTransactionError<()>>(())
-                    })
-                    .map_err(|e| anyhow!(format!("{:?}", e)))?;
+                self.db._remove_expire_key(self.name.as_slice())?;
             }
         }
         Ok(())
@@ -3148,63 +2876,42 @@ impl SledStorageList {
         pop_front_if_limited: bool,
     ) -> Result<Option<IVec>> {
         let tree = self.tree();
-        let this = self;
-        let removed = {
-            let res = tree.transaction(move |tx| {
-                let list_count_key = this.make_list_count_key();
-                let (mut start, mut end) = Self::tx_list_count_get::<
-                    _,
-                    ConflictableTransactionError<sled::Error>,
-                >(tx, list_count_key.as_slice())?;
-                let count = end - start;
+        let list_count_key = self.make_list_count_key();
+        let (mut start, mut end) = Self::non_tx_list_count_get(tree, list_count_key.as_slice())?;
+        let count = end - start;
 
-                if count < limit {
-                    end += 1;
-                    Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
-                    let list_content_key = this.make_list_content_key(end);
-                    Self::tx_list_content_set(tx, list_content_key.as_slice(), data.as_ref())?;
-                    Ok(None)
-                } else if pop_front_if_limited {
-                    let mut removed = None;
-                    let removed_content_key = this.make_list_content_key(start + 1);
-                    if let Some(v) = tx.remove(removed_content_key)? {
-                        removed = Some(v);
-                        start += 1;
-                    }
-                    end += 1;
-                    Self::tx_list_count_set(tx, list_count_key.as_slice(), start, end)?;
-                    let list_content_key = this.make_list_content_key(end);
-                    Self::tx_list_content_set(tx, list_content_key.as_slice(), data.as_ref())?;
-                    Ok(removed)
-                } else {
-                    Err(ConflictableTransactionError::Storage(sled::Error::Io(
-                        io::Error::new(ErrorKind::InvalidData, "Is full"),
-                    )))
-                }
-            });
-
-            #[cfg(feature = "ttl")]
-            {
-                if this.db._is_expired(this.name.as_slice(), |k| {
-                    SledStorageDB::_list_contains_key(this.tree(), k)
-                })? {
-                    // this.db._remove_expire_key(this.name.as_slice())?;
-                    (&self.db.key_expire_tree, &self.db.expire_key_tree)
-                        .transaction(|(key_expire_tx, expire_key_tx)| {
-                            SledStorageDB::_tx_remove_expire_key(
-                                key_expire_tx,
-                                expire_key_tx,
-                                this.name.as_slice(),
-                            )?;
-                            Ok::<(), ConflictableTransactionError<()>>(())
-                        })
-                        .map_err(|e| anyhow!(format!("{:?}", e)))?;
-                }
+        let removed = if count < limit {
+            end += 1;
+            let count_bytes = postcard::to_allocvec(&(start, end))?;
+            tree.insert(list_count_key.as_slice(), count_bytes.as_slice())?;
+            let list_content_key = self.make_list_content_key(end);
+            tree.insert(list_content_key.as_slice(), data.as_ref())?;
+            None
+        } else if pop_front_if_limited {
+            let mut removed = None;
+            let removed_content_key = self.make_list_content_key(start + 1);
+            if let Some(v) = tree.remove(removed_content_key)? {
+                removed = Some(v);
+                start += 1;
             }
+            end += 1;
+            let count_bytes = postcard::to_allocvec(&(start, end))?;
+            tree.insert(list_count_key.as_slice(), count_bytes.as_slice())?;
+            let list_content_key = self.make_list_content_key(end);
+            tree.insert(list_content_key.as_slice(), data.as_ref())?;
+            removed
+        } else {
+            return Err(anyhow::anyhow!("Is full"));
+        };
 
-            Ok::<_, TransactionError<()>>(res)
+        #[cfg(feature = "ttl")]
+        {
+            if self.db._is_expired(self.name.as_slice(), |k| {
+                SledStorageDB::_list_contains_key(tree, k)
+            })? {
+                self.db._remove_expire_key(self.name.as_slice())?;
+            }
         }
-        .map_err(|e| anyhow!(format!("{:?}", e)))??;
 
         Ok(removed)
     }
@@ -3212,30 +2919,28 @@ impl SledStorageList {
     /// Pops value from list
     #[inline]
     fn _pop(&self) -> Result<Option<IVec>> {
-        let this = self;
-        let removed = {
-            if this.db._is_expired(this.name.as_slice(), |k| {
-                SledStorageDB::_list_contains_key(this.tree(), k)
-            })? {
-                Ok(None)
-            } else {
-                let removed = this.tree().transaction(move |tx| {
-                    let list_count_key = this.make_list_count_key();
-                    let (start, end) = Self::tx_list_count_get(tx, list_count_key.as_slice())?;
+        if self.db._is_expired(self.name.as_slice(), |k| {
+            SledStorageDB::_list_contains_key(self.tree(), k)
+        })? {
+            return Ok(None);
+        }
 
-                    let mut removed = None;
-                    if (end - start) > 0 {
-                        let removed_content_key = this.make_list_content_key(start + 1);
-                        if let Some(v) = tx.remove(removed_content_key)? {
-                            removed = Some(v);
-                            Self::tx_list_count_set(tx, list_count_key.as_slice(), start + 1, end)?;
-                        }
-                    }
-                    Ok::<_, ConflictableTransactionError<sled::Error>>(removed)
-                });
-                removed
+        let tree = self.tree();
+        let list_count_key = self.make_list_count_key();
+        let (start, end) = Self::non_tx_list_count_get(tree, list_count_key.as_slice())?;
+
+        let removed = if (end - start) > 0 {
+            let removed_content_key = self.make_list_content_key(start + 1);
+            if let Some(v) = tree.remove(removed_content_key)? {
+                let count_bytes = postcard::to_allocvec(&(start + 1, end))?;
+                tree.insert(list_count_key.as_slice(), count_bytes.as_slice())?;
+                Some(v)
+            } else {
+                None
             }
-        }?;
+        } else {
+            None
+        };
 
         Ok(removed)
     }
@@ -3265,33 +2970,22 @@ impl SledStorageList {
     /// Gets value by index
     #[inline]
     fn _get_index(&self, idx: usize) -> Result<Option<IVec>> {
-        let this = self;
-        let res = {
-            if this.db._is_expired(this.name.as_slice(), |k| {
-                SledStorageDB::_list_contains_key(this.tree(), k)
-            })? {
-                Ok(None)
-            } else {
-                this.tree().transaction(move |tx| {
-                    let list_count_key = this.make_list_count_key();
-                    let (start, end) = Self::tx_list_count_get::<
-                        _,
-                        ConflictableTransactionError<sled::Error>,
-                    >(tx, list_count_key.as_slice())?;
-                    if idx < (end - start) {
-                        let list_content_key = this.make_list_content_key(start + idx + 1);
-                        if let Some(v) = tx.get(list_content_key)? {
-                            Ok(Some(v))
-                        } else {
-                            Ok(None)
-                        }
-                    } else {
-                        Ok(None)
-                    }
-                })
-            }
-        }?;
-        Ok(res)
+        if self.db._is_expired(self.name.as_slice(), |k| {
+            SledStorageDB::_list_contains_key(self.tree(), k)
+        })? {
+            return Ok(None);
+        }
+
+        let tree = self.tree();
+        let list_count_key = self.make_list_count_key();
+        let (start, end) = Self::non_tx_list_count_get(tree, list_count_key.as_slice())?;
+
+        if idx < (end - start) {
+            let list_content_key = self.make_list_content_key(start + idx + 1);
+            Ok(tree.get(list_content_key)?)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Gets list length
