@@ -14,7 +14,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rmqtt-storage = "0.9"
+rmqtt-storage = "0.10"
 ```
 
 ## Features
@@ -28,6 +28,59 @@ rmqtt-storage = "0.9"
 - Provides an implementation for 'redis cluster'. Note: the 'len' feature is not supported yet.
 - Uses [`postcard`](https://crates.io/crates/postcard) for binary serialization.
 - Asynchronous API with command-based architecture for thread-safe operations.
+- **Circuit Breaker** (optional): Protects Redis/Redis Cluster backends from cascading failures using [`tower-resilience-circuitbreaker`](https://crates.io/crates/tower-resilience-circuitbreaker). Configure failure thresholds, sliding windows, and automatic recovery.
+
+## Feature Flags
+
+| Feature | Description | Default |
+|---------|-------------|---------|
+| `sled` | Sled embedded database backend | no |
+| `redis` | Single-node Redis backend | no |
+| `redis-cluster` | Redis Cluster distributed backend | no |
+| `ttl` | Key expiration / TTL support | no |
+| `len` | Storage item count (`len()`) | no |
+| `map_len` | Map item count (`map.len()`) | no |
+| `circuit-breaker` | Circuit breaker protection (requires a storage backend) | no |
+
+### Circuit Breaker Usage
+
+Enable the feature and wrap your storage with `CircuitBrokenDB`:
+
+```toml
+[dependencies]
+rmqtt-storage = { version = "0.10", features = ["sled", "circuit-breaker"] }
+```
+
+```rust
+use rmqtt_storage::circuit_breaker::{CircuitBrokenDB, CircuitBreakerConfig};
+use rmqtt_storage::init_db;
+
+let inner = init_db(&cfg).await?;
+let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
+
+// All existing APIs work transparently through the circuit breaker
+let val: Option<String> = db.get("my-key").await?;
+let map = db.map("my-map", None).await?;
+map.insert("k", &"v").await?;
+```
+
+`CircuitBrokenDB` implements the [`StorageDB`] trait, and `CircuitBrokenMap`/`CircuitBrokenList` implement the [`Map`]/[`List`] traits respectively. This means they can be used polymorphically alongside native storage backends in generic contexts.
+
+When the failure rate exceeds the configured threshold, the circuit opens and subsequent calls fail fast instead of waiting for timeouts. After a configurable recovery period, the circuit transitions to half-open to test if the backend has recovered.
+
+#### Operation Timeout
+
+Set `operation_timeout` to abort calls that take longer than the specified duration. Timed-out calls are automatically counted as failures, triggering the circuit breaker:
+
+```rust
+use std::time::Duration;
+use rmqtt_storage::circuit_breaker::CircuitBreakerConfig;
+
+let config = CircuitBreakerConfig {
+    operation_timeout: Some(Duration::from_secs(5)),
+    ..CircuitBreakerConfig::default()
+};
+```
 
 ## Changelog
 
@@ -36,3 +89,16 @@ rmqtt-storage = "0.9"
 - **Serialization**: Migrated from `bincode` to `postcard` — faster, smaller encoded output
 - **Refactor**: Removed sled transaction dependency, replaced with direct tree operations for better single-threaded throughput
 - **Testing**: Added `serial_test` to prevent sled I/O contention in parallel test runs
+
+### 0.10.0
+
+- **Circuit Breaker**: New `circuit-breaker` feature — wraps `DefaultStorageDB` / `StorageMap` / `StorageList` with per-instance fault tolerance via `tower-resilience-circuitbreaker` 0.10
+  - Sliding window failure rate detection (default: 50% over 20 calls)
+  - Half-Open automatic recovery (default: 30 s wait)
+  - Slow call detection (default: 2 s threshold)
+  - **Operation timeout** (`operation_timeout`): abort hung calls and count as failures
+  - State transition logging
+  - Independent breakers per DB / Map / List instance
+  - **Trait implementation**: `CircuitBrokenDB` now implements `StorageDB` trait, `CircuitBrokenMap` implements `Map` trait, `CircuitBrokenList` implements `List` trait — enabling polymorphic dispatch alongside native storage backends
+  - Iterator methods (`map_iter`, `list_iter`, `scan`, `iter`, `key_iter`, `prefix_iter`) bypass the circuit breaker for safe pass-through
+  - Zero impact when feature is disabled
