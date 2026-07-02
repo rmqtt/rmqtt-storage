@@ -19,9 +19,17 @@ mod storage_redis_cluster;
 #[cfg(feature = "sled")]
 mod storage_sled;
 
+#[cfg(all(
+    feature = "circuit-breaker",
+    any(feature = "redis", feature = "redis-cluster", feature = "sled")
+))]
+pub mod circuit_breaker;
+
 // Re-export public storage interfaces and implementations
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
-pub use storage::{DefaultStorageDB, List, Map, StorageDB, StorageList, StorageMap};
+pub use storage::{
+    AsyncIterator, DefaultStorageDB, Key, List, Map, StorageDB, StorageList, StorageMap,
+};
 #[cfg(feature = "redis")]
 pub use storage_redis::{RedisConfig, RedisStorageDB};
 #[cfg(feature = "redis-cluster")]

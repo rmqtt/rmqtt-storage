@@ -1,6 +1,6 @@
 [package]
 name = "rmqtt-storage"
-version = "0.9.0"
+version = "0.10.0"
 authors = ["rmqtt <rmqttd@126.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -25,12 +25,13 @@ len = []
 sled = ["dep:sled"]
 redis = ["dep:redis"]
 redis-cluster = ["redis", "redis/cluster", "redis/cluster-async"]
+circuit-breaker = ["dep:tower", "dep:tower-resilience-circuitbreaker"]
 
 [dependencies]
 sled = { version = "0.34", optional = true }
 redis = { version = "=0.32.6", features = [ "tokio-comp", "safe_iterators", "connection-manager"], optional = true }
 
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -42,6 +43,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dashmap = "6.1"
 ahash = "0.8"
 convert = { package = "box-convert", version = "0.1", features = ["bytesize"] }
+tower = { version = "0.5", optional = true, default-features = false, features = ["util"] }
+tower-resilience-circuitbreaker = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
