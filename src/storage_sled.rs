@@ -1912,6 +1912,57 @@ impl StorageDB for SledStorageDB {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inherent raw methods on SledStorageDB — NOT part of the StorageDB trait.
+// Used internally (e.g., by circuit-breaker) to bypass serde overhead.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl SledStorageDB {
+    /// Inserts raw bytes directly, skipping postcard serialization.
+    #[inline]
+    pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_send(Command::DBInsert(
+            self.clone(),
+            key.to_vec(),
+            val.to_vec(),
+            tx,
+        ))
+        .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    /// Retrieves raw bytes directly, skipping postcard deserialization.
+    #[inline]
+    pub(crate) async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_send(Command::DBGet(self.clone(), key.into(), tx))
+            .await?;
+        match rx.await?? {
+            Some(v) => Ok(Some(v.to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Batch insert of raw key-value pairs, skipping serialization.
+    #[inline]
+    pub(crate) async fn batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        if key_vals.is_empty() {
+            return Ok(());
+        }
+        let key_vals = key_vals
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect::<Vec<(Key, IVec)>>();
+        let (tx, rx) = oneshot::channel();
+        self.cmd_send(Command::DBBatchInsert(self.clone(), key_vals, tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+}
+
 /// Map structure for key-value storage within a namespace
 #[derive(Clone)]
 pub struct SledStorageMap {
@@ -2358,6 +2409,60 @@ impl SledStorageMap {
             .cmd_send(Command::MapPrefixIter(self.clone(), prefix, tx))
             .await?;
         Ok(rx.await?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inherent raw methods on SledStorageMap — NOT part of the Map trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl SledStorageMap {
+    /// Inserts raw bytes directly, skipping postcard serialization.
+    #[inline]
+    pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::MapInsert(self.clone(), key.into(), val.into(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    /// Retrieves raw bytes directly, skipping postcard deserialization.
+    #[inline]
+    pub(crate) async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::MapGet(self.clone(), key.into(), tx))
+            .await?;
+        match rx.await?? {
+            Some(v) => Ok(Some(v.to_vec())),
+            None => Ok(None),
+        }
+    }
+
+    /// Removes and returns a raw value, skipping postcard deserialization.
+    #[inline]
+    pub(crate) async fn remove_and_fetch_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self._remove_and_fetch(key.into())?.map(|v| v.to_vec()))
+    }
+
+    /// Batch insert of raw key-value pairs, skipping serialization.
+    #[inline]
+    pub(crate) async fn batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        if key_vals.is_empty() {
+            return Ok(());
+        }
+        let key_vals = key_vals
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect::<Vec<(IVec, IVec)>>();
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::MapBatchInsert(self.clone(), key_vals, tx))
+            .await?;
+        rx.await??;
+        Ok(())
     }
 }
 
@@ -3308,6 +3413,80 @@ impl List for SledStorageList {
         let (tx, rx) = oneshot::channel();
         self.db.cmd_send(Command::ListTTL(self.clone(), tx)).await?;
         Ok(rx.await??)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inherent raw methods on SledStorageList — NOT part of the List trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl SledStorageList {
+    #[inline]
+    pub(crate) async fn push_raw(&self, val: &[u8]) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::ListPush(self.clone(), val.into(), tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) async fn pushs_raw(&self, vals: Vec<Vec<u8>>) -> Result<()> {
+        if vals.is_empty() {
+            return Ok(());
+        }
+        let vals: Vec<IVec> = vals.into_iter().map(|v| v.into()).collect();
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::ListPushs(self.clone(), vals, tx))
+            .await?;
+        rx.await??;
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) async fn push_limit_raw(
+        &self,
+        val: &[u8],
+        limit: usize,
+        pop_front_if_limited: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::ListPushLimit(
+                self.clone(),
+                val.into(),
+                limit,
+                pop_front_if_limited,
+                tx,
+            ))
+            .await?;
+
+        Ok(rx.await??.map(|v| v.to_vec()))
+    }
+
+    #[inline]
+    pub(crate) async fn pop_raw(&self) -> Result<Option<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.db.cmd_send(Command::ListPop(self.clone(), tx)).await?;
+        Ok(rx.await??.map(|v| v.to_vec()))
+    }
+
+    #[inline]
+    pub(crate) async fn all_raw(&self) -> Result<Vec<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.db.cmd_send(Command::ListAll(self.clone(), tx)).await?;
+        Ok(rx.await??.into_iter().map(|v| v.to_vec()).collect())
+    }
+
+    #[inline]
+    pub(crate) async fn get_index_raw(&self, idx: usize) -> Result<Option<Vec<u8>>> {
+        let (tx, rx) = oneshot::channel();
+        self.db
+            .cmd_send(Command::ListGetIndex(self.clone(), idx, tx))
+            .await?;
+        Ok(rx.await??.map(|v| v.to_vec()))
     }
 }
 

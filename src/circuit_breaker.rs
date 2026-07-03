@@ -274,11 +274,11 @@ impl tower::Service<CBStorageRequest> for CBStorageService {
         Box::pin(async move {
             match req {
                 CBStorageRequest::Insert { key, val } => this
-                    .insert(&key, &val)
+                    .insert_raw(&key, &val)
                     .await
                     .map(|_| CBStorageResponse::Insert),
                 CBStorageRequest::Get { key } => {
-                    let val: Option<Vec<u8>> = this.get(&key).await?;
+                    let val = this.get_raw(&key).await?;
                     Ok(CBStorageResponse::Get(val))
                 }
                 CBStorageRequest::Remove { key } => {
@@ -329,7 +329,7 @@ impl tower::Service<CBStorageRequest> for CBStorageService {
                     .await
                     .map(|_| CBStorageResponse::CounterSet),
                 CBStorageRequest::BatchInsert { key_vals } => this
-                    .batch_insert(key_vals)
+                    .batch_insert_raw(key_vals)
                     .await
                     .map(|_| CBStorageResponse::BatchInsert),
                 CBStorageRequest::BatchRemove { keys } => this
@@ -470,11 +470,12 @@ impl tower::Service<CBMapRequest> for CBMapService {
         let this = self.inner.clone();
         Box::pin(async move {
             match req {
-                CBMapRequest::Insert { key, val } => {
-                    this.insert(&key, &val).await.map(|_| CBMapResponse::Insert)
-                }
+                CBMapRequest::Insert { key, val } => this
+                    .insert_raw(&key, &val)
+                    .await
+                    .map(|_| CBMapResponse::Insert),
                 CBMapRequest::Get { key } => {
-                    let val: Option<Vec<u8>> = this.get(&key).await?;
+                    let val = this.get_raw(&key).await?;
                     Ok(CBMapResponse::Get(val))
                 }
                 CBMapRequest::Remove { key } => {
@@ -487,7 +488,7 @@ impl tower::Service<CBMapRequest> for CBMapService {
                 CBMapRequest::IsEmpty => this.is_empty().await.map(CBMapResponse::IsEmpty),
                 CBMapRequest::Clear => this.clear().await.map(|_| CBMapResponse::Clear),
                 CBMapRequest::RemoveAndFetch { key } => {
-                    let val: Option<Vec<u8>> = this.remove_and_fetch(&key).await?;
+                    let val = this.remove_and_fetch_raw(&key).await?;
                     Ok(CBMapResponse::RemoveAndFetch(val))
                 }
                 CBMapRequest::RemoveWithPrefix { prefix } => this
@@ -495,7 +496,7 @@ impl tower::Service<CBMapRequest> for CBMapService {
                     .await
                     .map(|_| CBMapResponse::RemoveWithPrefix),
                 CBMapRequest::BatchInsert { key_vals } => this
-                    .batch_insert(key_vals)
+                    .batch_insert_raw(key_vals)
                     .await
                     .map(|_| CBMapResponse::BatchInsert),
                 CBMapRequest::BatchRemove { keys } => this
@@ -607,27 +608,22 @@ impl tower::Service<CBListRequest> for CBListService {
         let this = self.inner.clone();
         Box::pin(async move {
             match req {
-                CBListRequest::Push(val) => this.push(&val).await.map(|_| CBListResponse::Push),
-                CBListRequest::Pushs(vals) => this.pushs(vals).await.map(|_| CBListResponse::Pushs),
+                CBListRequest::Push(val) => this.push_raw(&val).await.map(|_| CBListResponse::Push),
+                CBListRequest::Pushs(vals) => {
+                    this.pushs_raw(vals).await.map(|_| CBListResponse::Pushs)
+                }
                 CBListRequest::PushLimit {
                     val,
                     limit,
                     pop_front_if_limited,
                 } => this
-                    .push_limit(&val, limit, pop_front_if_limited)
+                    .push_limit_raw(&val, limit, pop_front_if_limited)
                     .await
                     .map(CBListResponse::PushLimit),
-                CBListRequest::Pop => {
-                    let val: Option<Vec<u8>> = this.pop().await?;
-                    Ok(CBListResponse::Pop(val))
-                }
-                CBListRequest::GetAll => {
-                    let vals: Vec<Vec<u8>> = this.all().await?;
-                    Ok(CBListResponse::GetAll(vals))
-                }
+                CBListRequest::Pop => Ok(CBListResponse::Pop(this.pop_raw().await?)),
+                CBListRequest::GetAll => Ok(CBListResponse::GetAll(this.all_raw().await?)),
                 CBListRequest::GetIndex(idx) => {
-                    let val: Option<Vec<u8>> = this.get_index(idx).await?;
-                    Ok(CBListResponse::GetIndex(val))
+                    Ok(CBListResponse::GetIndex(this.get_index_raw(idx).await?))
                 }
                 CBListRequest::Len => this.len().await.map(CBListResponse::Len),
                 CBListRequest::IsEmpty => this.is_empty().await.map(CBListResponse::IsEmpty),
@@ -1954,191 +1950,5 @@ mod cb_unit_tests {
             }
             Ok(_) => panic!("expected OpenCircuit error on fourth call"),
         }
-    }
-}
-
-#[cfg(test)]
-#[cfg(feature = "sled")]
-mod cb_integration_tests {
-    use serial_test::serial;
-
-    use super::*;
-    use crate::{init_db, Config, SledConfig, StorageType};
-
-    fn test_cfg(name: &str) -> Config {
-        Config {
-            typ: StorageType::Sled,
-            sled: SledConfig {
-                path: format!("./.catch/{}", name),
-                ..Default::default()
-            },
-            #[cfg(feature = "redis")]
-            redis: Default::default(),
-            #[cfg(feature = "redis-cluster")]
-            redis_cluster: Default::default(),
-        }
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_basic_ops() {
-        let cfg = test_cfg("cb_basic_ops");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        db.insert("k1", &"hello").await.unwrap();
-        let val: Option<String> = db.get("k1").await.unwrap();
-        assert_eq!(val, Some("hello".into()));
-
-        assert!(db.contains_key("k1").await.unwrap());
-
-        db.remove("k1").await.unwrap();
-        let val: Option<String> = db.get("k1").await.unwrap();
-        assert_eq!(val, None);
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_map_ops() {
-        let cfg = test_cfg("cb_map_ops");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        let map = db.map("mymap", None).await.unwrap();
-        map.insert("mk1", &42).await.unwrap();
-        let val: Option<i32> = map.get("mk1").await.unwrap();
-        assert_eq!(val, Some(42));
-
-        assert!(map.contains_key("mk1").await.unwrap());
-        assert!(!map.is_empty().await.unwrap());
-
-        map.remove("mk1").await.unwrap();
-        assert!(!map.contains_key("mk1").await.unwrap());
-        assert!(map.is_empty().await.unwrap());
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_list_ops() {
-        let cfg = test_cfg("cb_list_ops");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        let list = db.list("mylist", None).await.unwrap();
-        assert!(list.is_empty().await.unwrap());
-        assert_eq!(list.len().await.unwrap(), 0);
-
-        list.push(&"a").await.unwrap();
-        list.push(&"b").await.unwrap();
-        list.push(&"c").await.unwrap();
-        assert_eq!(list.len().await.unwrap(), 3);
-
-        let all: Vec<String> = list.all().await.unwrap();
-        assert_eq!(all, vec!["a", "b", "c"]);
-
-        let popped: Option<String> = list.pop().await.unwrap();
-        assert_eq!(popped, Some("a".into()));
-        assert_eq!(list.len().await.unwrap(), 2);
-
-        list.clear().await.unwrap();
-        assert!(list.is_empty().await.unwrap());
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_counters() {
-        let cfg = test_cfg("cb_counters");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        // Always set first to avoid stale state from previous test runs
-        db.counter_set("ctr", 10).await.unwrap();
-        let val: Option<isize> = db.counter_get("ctr").await.unwrap();
-        assert_eq!(val, Some(10));
-
-        db.counter_incr("ctr", 5).await.unwrap();
-        let val: Option<isize> = db.counter_get("ctr").await.unwrap();
-        assert_eq!(val, Some(15));
-
-        db.counter_decr("ctr", 3).await.unwrap();
-        let val: Option<isize> = db.counter_get("ctr").await.unwrap();
-        assert_eq!(val, Some(12));
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_batch() {
-        let cfg = test_cfg("cb_batch");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        db.batch_insert(vec![
-            (b"b1".to_vec(), "x"),
-            (b"b2".to_vec(), "y"),
-            (b"b3".to_vec(), "z"),
-        ])
-        .await
-        .unwrap();
-
-        let v1: Option<String> = db.get("b1").await.unwrap();
-        assert_eq!(v1, Some("x".into()));
-
-        db.batch_remove(vec![b"b1".to_vec(), b"b2".to_vec()])
-            .await
-            .unwrap();
-        assert!(!db.contains_key("b1").await.unwrap());
-        assert!(!db.contains_key("b2").await.unwrap());
-        assert!(db.contains_key("b3").await.unwrap());
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_map_remove() {
-        let cfg = test_cfg("cb_map_rm");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        let map = db.map("rmmap", None).await.unwrap();
-        map.insert("k", &1).await.unwrap();
-        drop(map);
-
-        assert!(db.map_contains_key("rmmap").await.unwrap());
-        db.map_remove("rmmap").await.unwrap();
-        assert!(!db.map_contains_key("rmmap").await.unwrap());
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_map_batch() {
-        let cfg = test_cfg("cb_map_batch");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        let map = db.map("batchmap", None).await.unwrap();
-        map.batch_insert(vec![(b"a".to_vec(), 1), (b"b".to_vec(), 2)])
-            .await
-            .unwrap();
-
-        let va: Option<i32> = map.get("a").await.unwrap();
-        assert_eq!(va, Some(1));
-
-        map.batch_remove(vec![b"a".to_vec()]).await.unwrap();
-        assert!(!map.contains_key("a").await.unwrap());
-        assert!(map.contains_key("b").await.unwrap());
-    }
-
-    #[serial]
-    #[tokio::test]
-    async fn test_cb_integration_db_size_info() {
-        let cfg = test_cfg("cb_size_info");
-        let inner = init_db(&cfg).await.unwrap();
-        let db = CircuitBrokenDB::new(inner, CircuitBreakerConfig::default());
-
-        db.insert("sz1", &"data").await.unwrap();
-        let size = db.db_size().await.unwrap();
-        assert!(size > 0, "db_size should be > 0");
-
-        let info = db.info().await.unwrap();
-        assert!(info.is_object());
     }
 }

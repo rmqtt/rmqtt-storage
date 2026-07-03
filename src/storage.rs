@@ -773,6 +773,45 @@ impl DefaultStorageDB {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inherent raw methods on DefaultStorageDB — NOT part of the StorageDB trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl DefaultStorageDB {
+    pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        match self {
+            #[cfg(feature = "sled")]
+            DefaultStorageDB::Sled(db) => db.insert_raw(key, val).await,
+            #[cfg(feature = "redis")]
+            DefaultStorageDB::Redis(db) => db.insert_raw(key, val).await,
+            #[cfg(feature = "redis-cluster")]
+            DefaultStorageDB::RedisCluster(db) => db.insert_raw(key, val).await,
+        }
+    }
+
+    pub(crate) async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            DefaultStorageDB::Sled(db) => db.get_raw(key).await,
+            #[cfg(feature = "redis")]
+            DefaultStorageDB::Redis(db) => db.get_raw(key).await,
+            #[cfg(feature = "redis-cluster")]
+            DefaultStorageDB::RedisCluster(db) => db.get_raw(key).await,
+        }
+    }
+
+    pub(crate) async fn batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        match self {
+            #[cfg(feature = "sled")]
+            DefaultStorageDB::Sled(db) => db.batch_insert_raw(key_vals).await,
+            #[cfg(feature = "redis")]
+            DefaultStorageDB::Redis(db) => db.batch_insert_raw(key_vals).await,
+            #[cfg(feature = "redis-cluster")]
+            DefaultStorageDB::RedisCluster(db) => db.batch_insert_raw(key_vals).await,
+        }
+    }
+}
+
 /// Unified map implementation enum
 #[derive(Clone)]
 pub enum StorageMap {
@@ -1027,6 +1066,61 @@ impl Map for StorageMap {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inherent methods on StorageMap — NOT part of the Map trait.
+// Used internally (e.g., by circuit-breaker) to bypass serde overhead.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl StorageMap {
+    /// Inserts raw bytes directly, skipping serialization.
+    pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageMap::Sled(m) => m.insert_raw(key, val).await,
+            #[cfg(feature = "redis")]
+            StorageMap::Redis(m) => m.insert_raw(key, val).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageMap::RedisCluster(m) => m.insert_raw(key, val).await,
+        }
+    }
+
+    /// Retrieves raw bytes directly, skipping deserialization.
+    pub(crate) async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageMap::Sled(m) => m.get_raw(key).await,
+            #[cfg(feature = "redis")]
+            StorageMap::Redis(m) => m.get_raw(key).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageMap::RedisCluster(m) => m.get_raw(key).await,
+        }
+    }
+
+    /// Removes and returns a raw value, skipping postcard deserialization.
+    pub(crate) async fn remove_and_fetch_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageMap::Sled(m) => m.remove_and_fetch_raw(key).await,
+            #[cfg(feature = "redis")]
+            StorageMap::Redis(m) => m.remove_and_fetch_raw(key).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageMap::RedisCluster(m) => m.remove_and_fetch_raw(key).await,
+        }
+    }
+
+    /// Batch insert of raw key-value pairs, skipping serialization.
+    pub(crate) async fn batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageMap::Sled(m) => m.batch_insert_raw(key_vals).await,
+            #[cfg(feature = "redis")]
+            StorageMap::Redis(m) => m.batch_insert_raw(key_vals).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageMap::RedisCluster(m) => m.batch_insert_raw(key_vals).await,
+        }
+    }
+}
+
 /// Unified list implementation enum
 #[derive(Clone)]
 pub enum StorageList {
@@ -1247,3 +1341,86 @@ impl List for StorageList {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Inherent raw methods on StorageList — NOT part of the List trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl StorageList {
+    pub(crate) async fn push_raw(&self, val: &[u8]) -> Result<()> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageList::Sled(l) => l.push_raw(val).await,
+            #[cfg(feature = "redis")]
+            StorageList::Redis(l) => l.push_raw(val).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageList::RedisCluster(l) => l.push_raw(val).await,
+        }
+    }
+
+    pub(crate) async fn pushs_raw(&self, vals: Vec<Vec<u8>>) -> Result<()> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageList::Sled(l) => l.pushs_raw(vals).await,
+            #[cfg(feature = "redis")]
+            StorageList::Redis(l) => l.pushs_raw(vals).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageList::RedisCluster(l) => l.pushs_raw(vals).await,
+        }
+    }
+
+    pub(crate) async fn push_limit_raw(
+        &self,
+        val: &[u8],
+        limit: usize,
+        pop_front_if_limited: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageList::Sled(l) => l.push_limit_raw(val, limit, pop_front_if_limited).await,
+            #[cfg(feature = "redis")]
+            StorageList::Redis(l) => l.push_limit_raw(val, limit, pop_front_if_limited).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageList::RedisCluster(l) => {
+                l.push_limit_raw(val, limit, pop_front_if_limited).await
+            }
+        }
+    }
+
+    pub(crate) async fn pop_raw(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageList::Sled(l) => l.pop_raw().await,
+            #[cfg(feature = "redis")]
+            StorageList::Redis(l) => l.pop_raw().await,
+            #[cfg(feature = "redis-cluster")]
+            StorageList::RedisCluster(l) => l.pop_raw().await,
+        }
+    }
+
+    pub(crate) async fn all_raw(&self) -> Result<Vec<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageList::Sled(l) => l.all_raw().await,
+            #[cfg(feature = "redis")]
+            StorageList::Redis(l) => l.all_raw().await,
+            #[cfg(feature = "redis-cluster")]
+            StorageList::RedisCluster(l) => l.all_raw().await,
+        }
+    }
+
+    pub(crate) async fn get_index_raw(&self, idx: usize) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageList::Sled(l) => l.get_index_raw(idx).await,
+            #[cfg(feature = "redis")]
+            StorageList::Redis(l) => l.get_index_raw(idx).await,
+            #[cfg(feature = "redis-cluster")]
+            StorageList::RedisCluster(l) => l.get_index_raw(idx).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DefaultStorageDB / StorageDB trait
+// ---------------------------------------------------------------------------
