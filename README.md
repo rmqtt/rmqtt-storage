@@ -102,3 +102,13 @@ let config = CircuitBreakerConfig {
   - **Trait implementation**: `CircuitBrokenDB` now implements `StorageDB` trait, `CircuitBrokenMap` implements `Map` trait, `CircuitBrokenList` implements `List` trait — enabling polymorphic dispatch alongside native storage backends
   - Iterator methods (`map_iter`, `list_iter`, `scan`, `iter`, `key_iter`, `prefix_iter`) bypass the circuit breaker for safe pass-through
   - Zero impact when feature is disabled
+
+### 0.10.1
+
+- **Internal `_raw` methods**: Added `_insert_raw`, `_batch_insert_raw`, `remove_and_fetch_raw` to Redis and Redis Cluster backends — bypass `postcard` ser/de for `circuit-breaker` internal use
+  - `insert_raw` / `batch_insert_raw` refactored to delegate to their `_raw` counterparts
+  - `remove_and_fetch_raw` — new raw-bytes variant of `remove_and_fetch`
+- **CB optimization**: `CBMapRequest::RemoveAndFetch` now uses a single `remove_and_fetch_raw` call instead of `get_raw` + `remove` (fewer round trips, atomic)
+- **Bug fix**: Redis `_batch_insert` now guards against empty input to avoid `MSET` with zero arguments
+- **Tests**: Added 7 new test cases — `push_limit`, `map_remove`/`list_remove` (DB level), empty list pop/get_index, empty map `remove_and_fetch`, large value (100KB), empty `batch_insert`/`batch_remove`
+- **Cleanup**: Removed hanging CB integration tests (redundant with lib.rs `test_init_db` coverage); fixed `init_db` return type and feature-gated imports in `lib.rs`
