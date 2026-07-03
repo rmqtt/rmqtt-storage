@@ -23,9 +23,13 @@ mod storage_sled;
     feature = "circuit-breaker",
     any(feature = "redis", feature = "redis-cluster", feature = "sled")
 ))]
-pub mod circuit_breaker;
+mod circuit_breaker;
 
 // Re-export public storage interfaces and implementations
+#[cfg(feature = "circuit-breaker")]
+pub use crate::circuit_breaker::{
+    CircuitBreakerConfig, CircuitBrokenDB, CircuitBrokenList, CircuitBrokenMap,
+};
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 pub use storage::{
     AsyncIterator, DefaultStorageDB, Key, List, Map, StorageDB, StorageList, StorageMap,
@@ -166,7 +170,6 @@ pub(crate) fn timestamp_millis() -> TimestampMillis {
 #[cfg(test)]
 #[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
 mod tests {
-    use super::storage::*;
     use super::*;
     use std::borrow::Cow;
     use std::time::Duration;
@@ -210,6 +213,19 @@ mod tests {
             },
         };
         cfg
+    }
+
+    #[cfg(feature = "circuit-breaker")]
+    async fn test_init_db(cfg: &Config) -> Result<CircuitBrokenDB> {
+        Ok(CircuitBrokenDB::new(
+            init_db(cfg).await?,
+            CircuitBreakerConfig::default(),
+        ))
+    }
+
+    #[cfg(not(feature = "circuit-breaker"))]
+    async fn test_init_db(cfg: &Config) -> Result<DefaultStorageDB> {
+        init_db(cfg).await
     }
 
     #[serial_test::serial]
@@ -328,7 +344,7 @@ mod tests {
     #[test]
     async fn test_stress() {
         let cfg = get_cfg("stress");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         let now = std::time::Instant::now();
         for i in 0..10_000usize {
             db.insert(i.to_be_bytes(), &i).await.unwrap();
@@ -417,7 +433,7 @@ mod tests {
     async fn test_expiration_cleaning() {
         //Clear Expired Cleanup
         let cfg = get_cfg("expiration_cleaning");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         for i in 0..3usize {
             let key = format!("k_{}", i);
             db.insert(key.as_bytes(), &format!("v_{}", (i * 10)))
@@ -462,7 +478,7 @@ mod tests {
     async fn test_db_insert() {
         let cfg = get_cfg("db_insert");
 
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         let db_key_1 = b"key_1";
         let db_key_2 = b"key_2";
         let db_val_1 = String::from("val_001");
@@ -521,7 +537,7 @@ mod tests {
     async fn test_db_remove() {
         let cfg = get_cfg("db_remove");
 
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         let db_key_1 = b"key_11";
         let db_key_2 = b"key_22";
         let db_val_1 = String::from("val_001");
@@ -553,7 +569,7 @@ mod tests {
     #[test]
     async fn test_db_contains_key() {
         let cfg = get_cfg("db_contains_key");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         db.remove("test_c_001").await.unwrap();
         let c_res = db.contains_key("test_c_001").await.unwrap();
         assert!(!c_res);
@@ -608,7 +624,7 @@ mod tests {
     #[test]
     async fn test_db_contains_key2() {
         let cfg = get_cfg("db_contains_key2");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         let max = 10;
         for i in 0..max {
             db.insert(format!("key_{}", i), &1).await.unwrap();
@@ -635,7 +651,7 @@ mod tests {
     #[test]
     async fn test_db_expire() {
         let cfg = get_cfg("expire");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let res_none = db.ttl("test_k001").await.unwrap();
         println!("ttl res_none: {:?}", res_none);
@@ -928,7 +944,7 @@ mod tests {
     #[test]
     async fn test_map_insert() {
         let cfg = get_cfg("map_insert");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let map001 = db.map("001", None).await.unwrap();
         map001.clear().await.unwrap();
@@ -959,7 +975,7 @@ mod tests {
     #[test]
     async fn test_map_contains_key() {
         let cfg = get_cfg("map_contains_key");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let map001 = db.map("m001", None).await.unwrap();
         map001.clear().await.unwrap();
@@ -980,7 +996,7 @@ mod tests {
     #[test]
     async fn test_map() {
         let cfg = get_cfg("map");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let kv001 = db.map("tree_kv001", None).await.unwrap();
         let kv_key_1 = b"kv_key_1";
@@ -1045,7 +1061,7 @@ mod tests {
     #[test]
     async fn test_map_iter2() {
         let cfg = get_cfg("map_iter2");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
 
         let mut map_iter = db.map_iter().await.unwrap();
         while let Some(map) = map_iter.next().await {
@@ -1084,7 +1100,7 @@ mod tests {
     #[test]
     async fn test_batch() {
         let cfg = get_cfg("batch");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let skv = db.map("batch_kv001", None).await.unwrap();
 
@@ -1109,7 +1125,7 @@ mod tests {
     #[test]
     async fn test_iter() {
         let cfg = get_cfg("iter");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let mut skv = db.map("iter_kv002", None).await.unwrap();
         skv.clear().await.unwrap();
@@ -1186,7 +1202,7 @@ mod tests {
     #[test]
     async fn test_list() {
         let cfg = get_cfg("array");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let array_a = db.list("array_a", None).await.unwrap();
         let array_b = db.list("array_b", None).await.unwrap();
@@ -1254,7 +1270,7 @@ mod tests {
     #[test]
     async fn test_list2() {
         let cfg = get_cfg("map_list");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let ml001 = db.map("m_l_001", None).await.unwrap();
         ml001.clear().await.unwrap();
@@ -1334,7 +1350,7 @@ mod tests {
     #[test]
     async fn test_list_iter() {
         let cfg = get_cfg("list_iter");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
 
         let l1 = db.list("l1", None).await.unwrap();
         let l2 = db.list("l2", None).await.unwrap();
@@ -1364,7 +1380,7 @@ mod tests {
     #[test]
     async fn test_list_iter2() {
         let cfg = get_cfg("list_iter2");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
 
         let mut list_iter = db.list_iter().await.unwrap();
         while let Some(list) = list_iter.next().await {
@@ -1402,7 +1418,7 @@ mod tests {
     #[test]
     async fn test_map_iter() {
         let cfg = get_cfg("async_map_iter");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
 
         let m1 = db.map("m1", None).await.unwrap();
         let m2 = db.map("m2", None).await.unwrap();
@@ -1438,7 +1454,7 @@ mod tests {
     #[test]
     async fn test_counter() {
         let cfg = get_cfg("incr");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         db.remove("incr1").await.unwrap();
         db.remove("incr2").await.unwrap();
@@ -1471,7 +1487,7 @@ mod tests {
     #[test]
     async fn test_db_batch() {
         let cfg = get_cfg("db_batch_insert");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         let mut key_vals = Vec::new();
         for i in 0..100 {
@@ -1504,7 +1520,7 @@ mod tests {
     #[test]
     async fn test_list_pushs() {
         let cfg = get_cfg("list_pushs");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         let l11 = db.list("l11", None).await.unwrap();
         l11.clear().await.unwrap();
         let mut vals = Vec::new();
@@ -1536,7 +1552,7 @@ mod tests {
     #[test]
     async fn test_list_pop() {
         let cfg = get_cfg("list_pop");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
         let l11 = db.list("l11", None).await.unwrap();
         l11.clear().await.unwrap();
         for i in 0..10 {
@@ -1605,7 +1621,7 @@ mod tests {
     #[test]
     async fn test_session_iter() {
         let cfg = get_cfg("session");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
         let now = std::time::Instant::now();
         let mut iter = db.map_iter().await.unwrap();
         let mut count = 0;
@@ -1622,7 +1638,7 @@ mod tests {
     // #[test]
     async fn test_map_expire() {
         let cfg = get_cfg("map_expire");
-        let db = init_db(&cfg).await.unwrap();
+        let db = test_init_db(&cfg).await.unwrap();
 
         #[cfg(feature = "ttl")]
         #[cfg(feature = "map_len")]
@@ -1797,7 +1813,7 @@ mod tests {
     #[test]
     async fn test_db_size() {
         let cfg = get_cfg("db_size");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
         let iter = db.scan("*").await.unwrap();
         for item in collect(iter).await {
             db.remove(item).await.unwrap();
@@ -1834,7 +1850,7 @@ mod tests {
     #[test]
     async fn test_scan() {
         let cfg = get_cfg("scan");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
         let iter = db.scan("*").await.unwrap();
         for item in collect(iter).await {
             println!("removed item: {:?}", String::from_utf8_lossy(&item));
@@ -1918,7 +1934,7 @@ mod tests {
     // #[test]
     async fn test_len() {
         let cfg = get_cfg("test_len");
-        let mut db = init_db(&cfg).await.unwrap();
+        let mut db = test_init_db(&cfg).await.unwrap();
         println!("a test_len len: {:?}", db.len().await);
         let iter = db.scan("*").await.unwrap();
         for item in collect(iter).await {
@@ -1968,5 +1984,132 @@ mod tests {
 
         assert_eq!(db.len().await.unwrap(), 2);
         println!("test_len len: {:?}", db.len().await);
+    }
+
+    // -----------------------------------------------------------------------
+    // P0 — 核心功能补缺
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_push_limit() {
+        let db = test_init_db(&get_cfg("list_push_limit")).await.unwrap();
+        let l = db.list("l", None).await.unwrap();
+        l.clear().await.unwrap();
+
+        // 先 push 3 个元素
+        l.push(&1).await.unwrap();
+        l.push(&2).await.unwrap();
+        l.push(&3).await.unwrap();
+        assert_eq!(l.len().await.unwrap(), 3);
+
+        // limit=2, pop_front_if_limited=true → 应挤出队首的 1
+        let removed = l.push_limit(&4, 2, true).await.unwrap();
+        assert_eq!(removed, Some(1));
+        assert_eq!(l.all::<i32>().await.unwrap(), vec![2, 3, 4]);
+
+        // 再次 push_limit, limit=2 → 挤出 2
+        let removed = l.push_limit(&5, 2, true).await.unwrap();
+        assert_eq!(removed, Some(2));
+        assert_eq!(l.all::<i32>().await.unwrap(), vec![3, 4, 5]);
+
+        // pop_front_if_limited=false 时，已达 limit 应报错
+        let result = l.push_limit(&6, 2, false).await;
+        assert!(
+            result.is_err(),
+            "expected error when list is full and pop_front_if_limited=false"
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_db_map_list_remove() {
+        let cfg = get_cfg("db_map_list_rm");
+        let db = test_init_db(&cfg).await.unwrap();
+
+        // map_remove: 创建 map → 验证存在 → 删除 → 验证不存在
+        let map = db.map("m", None).await.unwrap();
+        map.insert("k", &1).await.unwrap();
+        drop(map);
+        assert!(db.map_contains_key("m").await.unwrap());
+        db.map_remove("m").await.unwrap();
+        assert!(!db.map_contains_key("m").await.unwrap());
+
+        // list_remove: 创建 list → 验证存在 → 删除 → 验证不存在
+        let list = db.list("l", None).await.unwrap();
+        list.push(&"a").await.unwrap();
+        drop(list);
+        assert!(db.list_contains_key("l").await.unwrap());
+        db.list_remove("l").await.unwrap();
+        assert!(!db.list_contains_key("l").await.unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 — 边界情况
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_pop_empty() {
+        let db = test_init_db(&get_cfg("list_pop_empty")).await.unwrap();
+        let l = db.list("l", None).await.unwrap();
+        l.clear().await.unwrap();
+
+        // 空 list 上 pop 和 get_index 应返回 None
+        assert_eq!(l.pop::<i32>().await.unwrap(), None);
+        assert_eq!(l.get_index::<i32>(0).await.unwrap(), None);
+        // 再 clear 不应报错（幂等）
+        l.clear().await.unwrap();
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_map_remove_and_fetch_empty() {
+        let db = test_init_db(&get_cfg("map_rm_empty")).await.unwrap();
+        let m = db.map("m", None).await.unwrap();
+        m.clear().await.unwrap();
+
+        // 空 map 上 remove_and_fetch 应返回 None
+        assert_eq!(m.remove_and_fetch::<_, i32>("k").await.unwrap(), None);
+        // 再 clear 不应报错
+        m.clear().await.unwrap();
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_large_value() {
+        let db = test_init_db(&get_cfg("large_val")).await.unwrap();
+
+        // 100KB 二进制大负载
+        let val = vec![42u8; 1024 * 100];
+        db.insert("large", &val).await.unwrap();
+        let got: Option<Vec<u8>> = db.get("large").await.unwrap();
+        assert_eq!(got, Some(val));
+
+        // 空 value
+        let empty = vec![];
+        db.insert("empty", &empty).await.unwrap();
+        let got: Option<Vec<u8>> = db.get("empty").await.unwrap();
+        assert_eq!(got, Some(empty));
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 — 幂等性与空操作
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_batch_insert_empty() {
+        let _ = std::fs::remove_dir_all("./.catch/batch_empty");
+        let db = test_init_db(&get_cfg("batch_empty")).await.unwrap();
+
+        // 空批量操作不应报错
+        db.batch_insert::<i32>(vec![]).await.unwrap();
+        db.batch_remove(vec![]).await.unwrap();
+
+        // Map 级别 batch_insert_empty
+        let m = db.map("m", None).await.unwrap();
+        m.batch_insert::<i32>(vec![]).await.unwrap();
+        m.batch_remove(vec![]).await.unwrap();
     }
 }

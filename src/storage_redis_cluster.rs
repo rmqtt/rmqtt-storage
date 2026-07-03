@@ -374,6 +374,10 @@ impl RedisStorageDB {
     where
         V: serde::ser::Serialize + Sync + Send,
     {
+        if _key_val_expires.is_empty() {
+            return Ok(());
+        }
+
         #[cfg(not(feature = "len"))]
         {
             let keys_vals: Vec<(&Key, Vec<u8>)> = _key_val_expires
@@ -1100,6 +1104,149 @@ impl StorageDB for RedisStorageDB {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inherent raw methods on RedisClusterStorageDB — NOT part of the StorageDB trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl RedisStorageDB {
+    /// Internal raw method — parallel to [`_insert`] but without postcard serialization.
+    #[inline]
+    async fn _insert_raw(
+        &self,
+        _key: &[u8],
+        _val: &[u8],
+        _expire_interval: Option<TimestampMillis>,
+    ) -> Result<()> {
+        #[cfg(not(feature = "len"))]
+        {
+            let full_key = self.make_full_key(_key);
+            if let Some(expire_interval) = _expire_interval {
+                let mut async_conn = self.async_conn();
+                pipe()
+                    .atomic()
+                    .set(full_key.as_slice(), _val)
+                    .pexpire(full_key.as_slice(), expire_interval)
+                    .query_async::<()>(&mut async_conn)
+                    .await?;
+            } else {
+                let _: () = self.async_conn().set(full_key, _val).await?;
+            }
+        }
+        #[cfg(feature = "len")]
+        {
+            return Err(anyhow!("unsupported!"));
+            //@TODO ...
+            #[allow(unreachable_code)]
+            {
+                let full_key = self.make_full_key(_key);
+                let db_zkey = self.make_len_sortedset_key();
+                let mut async_conn = self.async_conn();
+                if get_slot(db_zkey.as_slice()) == get_slot(full_key.as_slice()) {
+                    if let Some(expire_interval) = _expire_interval {
+                        pipe()
+                            .atomic()
+                            .set(full_key.as_slice(), _val)
+                            .pexpire(full_key.as_slice(), expire_interval)
+                            .zadd(db_zkey, _key, timestamp_millis() + expire_interval)
+                            .query_async::<()>(&mut async_conn)
+                            .await?;
+                    } else {
+                        pipe()
+                            .atomic()
+                            .set(full_key.as_slice(), _val)
+                            .zadd(db_zkey, _key, i64::MAX)
+                            .query_async::<()>(&mut async_conn)
+                            .await?;
+                    }
+                } else {
+                    if let Some(expire_interval) = _expire_interval {
+                        let _: () = pipe()
+                            .atomic()
+                            .set(full_key.as_slice(), _val)
+                            .pexpire(full_key.as_slice(), expire_interval)
+                            .query_async(&mut async_conn)
+                            .await?;
+                        let _: () = async_conn
+                            .zadd(db_zkey, _key, timestamp_millis() + expire_interval)
+                            .await?;
+                    } else {
+                        let _: () = async_conn.set(full_key.as_slice(), _val).await?;
+                        let _: () = async_conn.zadd(db_zkey, _key, i64::MAX).await?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        self._insert_raw(key, val, None).await
+    }
+
+    /// Internal raw batch insert — parallel to [`_batch_insert`] but without
+    /// postcard serialization. Takes slot-grouped `(full_key, raw_value)` pairs.
+    #[allow(unused_variables)]
+    #[inline]
+    async fn _batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        #[cfg(not(feature = "len"))]
+        {
+            let mut async_conn = self.async_conn();
+            pipe()
+                .atomic()
+                .mset(key_vals.as_slice())
+                .query_async::<()>(&mut async_conn)
+                .await?;
+            Ok(())
+        }
+        #[cfg(feature = "len")]
+        {
+            Err(anyhow!("unsupported!"))
+        }
+    }
+
+    #[inline]
+    pub(crate) async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let full_key = self.make_full_key(key);
+        Ok(self.async_conn().get(full_key).await?)
+    }
+
+    #[inline]
+    pub(crate) async fn batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        if key_vals.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "len"))]
+        {
+            let mut slot_keys_vals = key_vals
+                .into_iter()
+                .map(|(k, v)| {
+                    let full_key = self.make_full_key(&k);
+                    (get_slot(&full_key), (full_key, v))
+                })
+                .collect::<Vec<_>>();
+
+            if !slot_keys_vals.is_empty() {
+                for keys_vals in transform_by_slot(slot_keys_vals) {
+                    self._batch_insert_raw(keys_vals).await?;
+                }
+            } else if let Some((_, (full_key, v))) = slot_keys_vals.pop() {
+                let mut async_conn = self.async_conn();
+                let _: () = async_conn.set(full_key, v).await?;
+            }
+
+            Ok(())
+        }
+
+        #[cfg(feature = "len")]
+        {
+            Err(anyhow!("unsupported!"))
+        }
+    }
+}
+
 /// Redis-backed map storage implementation
 #[derive(Clone)]
 pub struct RedisStorageMap {
@@ -1230,6 +1377,50 @@ impl RedisStorageMap {
         //HSET key field value
         let _: () = async_conn.hset_multiple(name, key_vals.as_slice()).await?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inherent raw methods on RedisClusterStorageMap — NOT part of the Map trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl RedisStorageMap {
+    /// Inserts raw bytes directly, skipping postcard serialization.
+    #[inline]
+    pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        self._insert_expire(key, val.to_vec()).await
+    }
+
+    /// Retrieves raw bytes directly, skipping postcard deserialization.
+    #[inline]
+    pub(crate) async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .async_conn()
+            .hget(self.full_name.as_slice(), key)
+            .await?)
+    }
+
+    /// Removes and returns a raw value, skipping postcard deserialization.
+    #[inline]
+    pub(crate) async fn remove_and_fetch_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let name = self.full_name.as_slice();
+        let mut conn = self.async_conn();
+        let (res, _): (Option<Vec<u8>>, isize) = redis::pipe()
+            .atomic()
+            .hget(name, key)
+            .hdel(name, key)
+            .query_async(&mut conn)
+            .await?;
+        Ok(res)
+    }
+
+    /// Batch insert of raw key-value pairs, skipping serialization.
+    #[inline]
+    pub(crate) async fn batch_insert_raw(&self, key_vals: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        if key_vals.is_empty() {
+            return Ok(());
+        }
+        self._batch_insert_expire(key_vals).await
     }
 }
 
@@ -1879,6 +2070,57 @@ impl List for RedisStorageList {
             -1 => Ok(Some(TimestampMillis::MAX)),
             _ => Ok(Some(res as TimestampMillis)),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inherent raw methods on RedisClusterStorageList — NOT part of the List trait.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "circuit-breaker")]
+impl RedisStorageList {
+    #[inline]
+    pub(crate) async fn push_raw(&self, val: &[u8]) -> Result<()> {
+        self._push_expire(val.to_vec()).await
+    }
+
+    #[inline]
+    pub(crate) async fn pushs_raw(&self, vals: Vec<Vec<u8>>) -> Result<()> {
+        self._pushs_expire(vals).await
+    }
+
+    #[inline]
+    pub(crate) async fn push_limit_raw(
+        &self,
+        val: &[u8],
+        limit: usize,
+        pop_front_if_limited: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        self._push_limit_expire(val.to_vec(), limit, pop_front_if_limited)
+            .await
+    }
+
+    #[inline]
+    pub(crate) async fn pop_raw(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .async_conn()
+            .lpop::<_, Option<Vec<u8>>>(self.full_name.as_slice(), None)
+            .await?)
+    }
+
+    #[inline]
+    pub(crate) async fn all_raw(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .async_conn()
+            .lrange::<_, Vec<Vec<u8>>>(self.full_name.as_slice(), 0, -1)
+            .await?)
+    }
+
+    #[inline]
+    pub(crate) async fn get_index_raw(&self, idx: usize) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .async_conn()
+            .lindex::<_, Option<Vec<u8>>>(self.full_name.as_slice(), idx as isize)
+            .await?)
     }
 }
 
