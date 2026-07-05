@@ -1,9 +1,27 @@
 //! Circuit breaker wrappers for storage backends using `tower_resilience_circuitbreaker`.
 //!
-//! Provides [`CircuitBrokenDB`], [`CircuitBrokenMap`], and [`CircuitBrokenList`] which wrap the
-//! corresponding enums with a per-instance circuit breaker. All operations funnel through
-//! a Tower service chain so that `tower_resilience_circuitbreaker` can track success/failure
-//! and automatically open the circuit when the failure rate exceeds the configured threshold.
+//! Provides [`CircuitBrokenDB`], [`CircuitBrokenMap`], and [`CircuitBrokenList`] which funnel
+//! all operations through a **single shared** DB-level circuit breaker.  Map / List / DB
+//! operations share one failure metric so that a failing backend trips the breaker globally.
+//!
+//! The Tower chain is:
+//!
+//! ```text
+//! CircuitBreaker<CbTimeoutWrapper<CBStorageService>, DefaultClassifier>
+//! ```
+//!
+//! Inside `CbTimeoutWrapper` applies the optional per-operation timeout —
+//! timeouts are counted as failures by the `DefaultClassifier` and correctly
+//! contribute to the sliding window.
+//!
+//! # Concurrency
+//!
+//! The `CircuitBreaker` is held behind an `Arc` and cloned per-call (cheap —
+//! only Arcs are copied).  The inner `Circuit` state is shared via its own
+//! `Arc<tokio::sync::Mutex<Circuit>>`, providing fine-grained locking.  No
+//! outer `Mutex` is needed — `is_open()` is an atomic read, and `call()`
+//! acquires the inner lock only during `try_acquire()` / result recording
+//! (microseconds).
 //!
 //! # Feature gate
 //!
