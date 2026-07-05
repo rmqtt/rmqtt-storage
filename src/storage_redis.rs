@@ -539,12 +539,9 @@ impl StorageDB for RedisStorageDB {
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::MapType> {
+    ) -> Self::MapType {
         let full_name = self.make_map_full_name(name.as_ref());
-        Ok(
-            RedisStorageMap::new_expire(name.as_ref().to_vec(), full_name, expire, self.clone())
-                .await?,
-        )
+        RedisStorageMap::new_expire(name.as_ref().to_vec(), full_name, expire, self.clone()).await
     }
 
     /// Removes a map
@@ -571,12 +568,9 @@ impl StorageDB for RedisStorageDB {
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::ListType> {
+    ) -> Self::ListType {
         let full_name = self.make_list_full_name(name.as_ref());
-        Ok(
-            RedisStorageList::new_expire(name.as_ref().to_vec(), full_name, expire, self.clone())
-                .await?,
-        )
+        RedisStorageList::new_expire(name.as_ref().to_vec(), full_name, expire, self.clone()).await
     }
 
     /// Removes a list
@@ -998,26 +992,40 @@ impl RedisStorageMap {
     }
 
     /// Creates a new map with expiration
+    ///
+    /// If the connection to Redis fails (e.g. Redis is unavailable), the error is
+    /// swallowed, a warning is logged, and the map is conservatively assumed to be
+    /// empty. This ensures [`map()`](StorageDB::map) never fails due to a transient
+    /// backend issue; actual operations on the returned map will still propagate
+    /// the connection error.
     #[inline]
     pub(crate) async fn new_expire(
         name: Key,
         full_name: Key,
         expire: Option<TimestampMillis>,
         mut db: RedisStorageDB,
-    ) -> Result<Self> {
+    ) -> Self {
         let empty = if expire.is_some() {
-            let empty = Self::_is_empty(&mut db.async_conn, full_name.as_slice()).await?;
-            Arc::new(AtomicBool::new(empty))
+            match Self::_is_empty(&mut db.async_conn, full_name.as_slice()).await {
+                Ok(empty) => Arc::new(AtomicBool::new(empty)),
+                Err(e) => {
+                    log::warn!(
+                        "redis unavailable, assuming map '{}' is empty: {e}",
+                        String::from_utf8_lossy(&name)
+                    );
+                    Arc::new(AtomicBool::new(true))
+                }
+            }
         } else {
             Arc::new(AtomicBool::new(true))
         };
-        Ok(Self {
+        Self {
             name,
             full_name,
             expire,
             empty,
             db,
-        })
+        }
     }
 
     /// Gets a clone of the async connection
@@ -1434,26 +1442,40 @@ impl RedisStorageList {
     }
 
     /// Creates a new list with expiration
+    ///
+    /// If the connection to Redis fails (e.g. Redis is unavailable), the error is
+    /// swallowed, a warning is logged, and the list is conservatively assumed to be
+    /// empty. This ensures [`list()`](StorageDB::list) never fails due to a transient
+    /// backend issue; actual operations on the returned list will still propagate
+    /// the connection error.
     #[inline]
     pub(crate) async fn new_expire(
         name: Key,
         full_name: Key,
         expire: Option<TimestampMillis>,
         mut db: RedisStorageDB,
-    ) -> Result<Self> {
+    ) -> Self {
         let empty = if expire.is_some() {
-            let empty = Self::_is_empty(&mut db.async_conn, full_name.as_slice()).await?;
-            Arc::new(AtomicBool::new(empty))
+            match Self::_is_empty(&mut db.async_conn, full_name.as_slice()).await {
+                Ok(empty) => Arc::new(AtomicBool::new(empty)),
+                Err(e) => {
+                    log::warn!(
+                        "redis unavailable, assuming list '{}' is empty: {e}",
+                        String::from_utf8_lossy(&name)
+                    );
+                    Arc::new(AtomicBool::new(true))
+                }
+            }
         } else {
             Arc::new(AtomicBool::new(true))
         };
-        Ok(Self {
+        Self {
             name,
             full_name,
             expire,
             empty,
             db,
-        })
+        }
     }
 
     /// Gets a clone of the async connection

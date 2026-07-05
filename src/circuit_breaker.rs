@@ -28,7 +28,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::sync::Mutex;
+#[allow(unused_imports)]
 use tower::{Layer, Service, ServiceExt};
 use tower_resilience_circuitbreaker::{
     CircuitBreakerError, CircuitBreakerLayer, DefaultClassifier, SlidingWindowType,
@@ -39,6 +39,20 @@ use crate::storage::{
 };
 use crate::{Result, TimestampMillis};
 
+// StorageMap doesn't derive Debug; provide one so CBStorageRequest can.
+impl fmt::Debug for StorageMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(feature = "sled")]
+            StorageMap::Sled(_) => write!(f, "SledMap"),
+            #[cfg(feature = "redis")]
+            StorageMap::Redis(_) => write!(f, "RedisMap"),
+            #[cfg(feature = "redis-cluster")]
+            StorageMap::RedisCluster(_) => write!(f, "RedisClusterMap"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -48,12 +62,11 @@ use crate::{Result, TimestampMillis};
 /// Defaults match the Redis-network workload typical of this crate.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    /// Failure rate threshold (0.0 – 1.0). Default: 0.5
+    /// Failure rate threshold (0.0 – 1.0). Default: 0.25
     pub failure_rate_threshold: f64,
-    /// Sliding window type. Default: CountBased
-    pub sliding_window_type: SlidingWindowType,
-    /// Sliding window size. Default: 20
-    pub sliding_window_size: usize,
+    /// Sliding window configuration (enum — see [`WindowConfig`]).
+    /// Default: `WindowConfig::CountBased` with [`CountBasedWindowConfig`] defaults.
+    pub window: WindowConfig,
     /// Minimum number of calls before the breaker can trip. Default: 10
     pub minimum_number_of_calls: usize,
     /// Duration the breaker stays Open before transitioning to HalfOpen. Default: 30 s
@@ -70,12 +83,78 @@ pub struct CircuitBreakerConfig {
     pub name: String,
 }
 
+/// CountBased 滑动窗口专有配置。
+///
+/// 仅在 `WindowConfig::CountBased` 时生效。
+#[derive(Debug, Clone)]
+pub struct CountBasedWindowConfig {
+    /// 滑动窗口大小（调用次数）。默认: 20
+    pub sliding_window_size: usize,
+}
+
+impl Default for CountBasedWindowConfig {
+    fn default() -> Self {
+        Self {
+            sliding_window_size: 20,
+        }
+    }
+}
+
+impl From<CountBasedWindowConfig> for WindowConfig {
+    fn from(cfg: CountBasedWindowConfig) -> Self {
+        Self::CountBased(cfg)
+    }
+}
+
+/// TimeBased 滑动窗口专有配置。
+///
+/// 仅在 `WindowConfig::TimeBased` 时生效。
+#[derive(Debug, Clone)]
+pub struct TimeBasedWindowConfig {
+    /// 滑动窗口时间跨度。默认: 45s
+    pub sliding_window_duration: Duration,
+    /// 最大跟踪调用数（影响 `minimum_number_of_calls` 默认值）。默认: 20
+    pub sliding_window_size: usize,
+}
+
+impl Default for TimeBasedWindowConfig {
+    fn default() -> Self {
+        Self {
+            sliding_window_duration: Duration::from_secs(45),
+            sliding_window_size: 20,
+        }
+    }
+}
+
+impl From<TimeBasedWindowConfig> for WindowConfig {
+    fn from(cfg: TimeBasedWindowConfig) -> Self {
+        Self::TimeBased(cfg)
+    }
+}
+
+/// 滑动窗口配置枚举。
+///
+/// - `CountBased` — 基于调用次数的滑动窗口
+/// - `TimeBased` — 基于时间跨度的滑动窗口
+#[derive(Debug, Clone)]
+pub enum WindowConfig {
+    /// 基于调用次数的滑动窗口（携带 `CountBasedWindowConfig`）
+    CountBased(CountBasedWindowConfig),
+    /// 基于时间跨度的滑动窗口（携带 `TimeBasedWindowConfig`）
+    TimeBased(TimeBasedWindowConfig),
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self::TimeBased(TimeBasedWindowConfig::default())
+    }
+}
+
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_rate_threshold: 0.5,
-            sliding_window_type: SlidingWindowType::CountBased,
-            sliding_window_size: 20,
+            failure_rate_threshold: 0.25,
+            window: WindowConfig::default(),
             minimum_number_of_calls: 10,
             wait_duration_in_open: Duration::from_secs(30),
             slow_call_duration_threshold: Duration::from_secs(2),
@@ -83,17 +162,6 @@ impl Default for CircuitBreakerConfig {
             operation_timeout: None,
             name: "storage".into(),
         }
-    }
-}
-
-/// Convert a `CircuitBreakerError<anyhow::Error>` into an `anyhow::Error`, extracting
-/// the inner error for `Inner` and producing a descriptive message for `OpenCircuit`.
-fn map_cb_err(err: CircuitBreakerError<anyhow::Error>, name: &str) -> anyhow::Error {
-    match err {
-        CircuitBreakerError::OpenCircuit => {
-            anyhow!("storage unavailable (circuit breaker open for '{}')", name)
-        }
-        CircuitBreakerError::Inner(inner) => inner,
     }
 }
 
@@ -117,24 +185,26 @@ pub enum CBStorageRequest {
     ContainsKey {
         key: Vec<u8>,
     },
-    Map {
+    #[allow(dead_code)]
+    DbMap {
         name: Vec<u8>,
         expire: Option<TimestampMillis>,
     },
-    MapRemove {
+    DbMapRemove {
         name: Vec<u8>,
     },
-    MapContainsKey {
+    DbMapContainsKey {
         key: Vec<u8>,
     },
-    List {
+    #[allow(dead_code)]
+    DbList {
         name: Vec<u8>,
         expire: Option<TimestampMillis>,
     },
-    ListRemove {
+    DbListRemove {
         name: Vec<u8>,
     },
-    ListContainsKey {
+    DbListContainsKey {
         key: Vec<u8>,
     },
     CounterIncr {
@@ -176,6 +246,112 @@ pub enum CBStorageRequest {
     Ttl {
         key: Vec<u8>,
     },
+    // ── Map operations ──
+    MapInsert {
+        map: StorageMap,
+        key: Vec<u8>,
+        val: Vec<u8>,
+    },
+    MapGet {
+        map: StorageMap,
+        key: Vec<u8>,
+    },
+    MapRemove {
+        map: StorageMap,
+        key: Vec<u8>,
+    },
+    MapContainsKey {
+        map: StorageMap,
+        key: Vec<u8>,
+    },
+    MapIsEmpty {
+        map: StorageMap,
+    },
+    MapClear {
+        map: StorageMap,
+    },
+    MapRemoveAndFetch {
+        map: StorageMap,
+        key: Vec<u8>,
+    },
+    MapRemoveWithPrefix {
+        map: StorageMap,
+        prefix: Vec<u8>,
+    },
+    MapBatchInsert {
+        map: StorageMap,
+        key_vals: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    MapBatchRemove {
+        map: StorageMap,
+        keys: Vec<Vec<u8>>,
+    },
+    #[cfg(feature = "map_len")]
+    MapLen {
+        map: StorageMap,
+    },
+    #[cfg(feature = "ttl")]
+    MapExpireAt {
+        map: StorageMap,
+        at: TimestampMillis,
+    },
+    #[cfg(feature = "ttl")]
+    MapExpire {
+        map: StorageMap,
+        dur: TimestampMillis,
+    },
+    #[cfg(feature = "ttl")]
+    MapTtl {
+        map: StorageMap,
+    },
+    // ── List operations ──
+    ListPush {
+        list: StorageList,
+        val: Vec<u8>,
+    },
+    ListPushs {
+        list: StorageList,
+        vals: Vec<Vec<u8>>,
+    },
+    ListPushLimit {
+        list: StorageList,
+        val: Vec<u8>,
+        limit: usize,
+        pop_front_if_limited: bool,
+    },
+    ListPop {
+        list: StorageList,
+    },
+    ListGetAll {
+        list: StorageList,
+    },
+    ListGetIndex {
+        list: StorageList,
+        idx: usize,
+    },
+    ListLen {
+        list: StorageList,
+    },
+    ListIsEmpty {
+        list: StorageList,
+    },
+    ListClear {
+        list: StorageList,
+    },
+    #[cfg(feature = "ttl")]
+    ListExpireAt {
+        list: StorageList,
+        at: TimestampMillis,
+    },
+    #[cfg(feature = "ttl")]
+    ListExpire {
+        list: StorageList,
+        dur: TimestampMillis,
+    },
+    #[cfg(feature = "ttl")]
+    ListTtl {
+        list: StorageList,
+    },
 }
 
 /// Unified response enum for all `DefaultStorageDB` operations.
@@ -185,12 +361,14 @@ pub enum CBStorageResponse {
     Get(Option<Vec<u8>>),
     Remove,
     ContainsKey(bool),
-    Map(StorageMap),
-    MapRemove,
-    MapContainsKey(bool),
-    List(StorageList),
-    ListRemove,
-    ListContainsKey(bool),
+    #[allow(dead_code)]
+    DbMap(StorageMap),
+    DbMapRemove,
+    DbMapContainsKey(bool),
+    #[allow(dead_code)]
+    DbList(StorageList),
+    DbListRemove,
+    DbListContainsKey(bool),
     CounterIncr,
     CounterDecr,
     CounterGet(Option<isize>),
@@ -207,6 +385,41 @@ pub enum CBStorageResponse {
     Expire(bool),
     #[cfg(feature = "ttl")]
     Ttl(Option<TimestampMillis>),
+    // ── Map responses ──
+    MapInsert,
+    MapGet(Option<Vec<u8>>),
+    MapRemove,
+    MapContainsKey(bool),
+    MapIsEmpty(bool),
+    MapClear,
+    MapRemoveAndFetch(Option<Vec<u8>>),
+    MapRemoveWithPrefix,
+    MapBatchInsert,
+    MapBatchRemove,
+    #[cfg(feature = "map_len")]
+    MapLen(usize),
+    #[cfg(feature = "ttl")]
+    MapExpireAt(bool),
+    #[cfg(feature = "ttl")]
+    MapExpire(bool),
+    #[cfg(feature = "ttl")]
+    MapTtl(Option<TimestampMillis>),
+    // ── List responses ──
+    ListPush,
+    ListPushs,
+    ListPushLimit(Option<Vec<u8>>),
+    ListPop(Option<Vec<u8>>),
+    ListGetAll(Vec<Vec<u8>>),
+    ListGetIndex(Option<Vec<u8>>),
+    ListLen(usize),
+    ListIsEmpty(bool),
+    ListClear,
+    #[cfg(feature = "ttl")]
+    ListExpireAt(bool),
+    #[cfg(feature = "ttl")]
+    ListExpire(bool),
+    #[cfg(feature = "ttl")]
+    ListTtl(Option<TimestampMillis>),
 }
 
 impl fmt::Debug for CBStorageResponse {
@@ -216,14 +429,14 @@ impl fmt::Debug for CBStorageResponse {
             CBStorageResponse::Get(v) => f.debug_tuple("Get").field(v).finish(),
             CBStorageResponse::Remove => write!(f, "Remove"),
             CBStorageResponse::ContainsKey(b) => f.debug_tuple("ContainsKey").field(b).finish(),
-            CBStorageResponse::Map(_) => write!(f, "Map(..)"),
-            CBStorageResponse::MapRemove => write!(f, "MapRemove"),
-            CBStorageResponse::MapContainsKey(b) => {
+            CBStorageResponse::DbMap(_) => write!(f, "Map(..)"),
+            CBStorageResponse::DbMapRemove => write!(f, "MapRemove"),
+            CBStorageResponse::DbMapContainsKey(b) => {
                 f.debug_tuple("MapContainsKey").field(b).finish()
             }
-            CBStorageResponse::List(_) => write!(f, "List(..)"),
-            CBStorageResponse::ListRemove => write!(f, "ListRemove"),
-            CBStorageResponse::ListContainsKey(b) => {
+            CBStorageResponse::DbList(_) => write!(f, "List(..)"),
+            CBStorageResponse::DbListRemove => write!(f, "ListRemove"),
+            CBStorageResponse::DbListContainsKey(b) => {
                 f.debug_tuple("ListContainsKey").field(b).finish()
             }
             CBStorageResponse::CounterIncr => write!(f, "CounterIncr"),
@@ -242,6 +455,47 @@ impl fmt::Debug for CBStorageResponse {
             CBStorageResponse::Expire(b) => f.debug_tuple("Expire").field(b).finish(),
             #[cfg(feature = "ttl")]
             CBStorageResponse::Ttl(v) => f.debug_tuple("Ttl").field(v).finish(),
+            // ── Map responses ──
+            CBStorageResponse::MapInsert => write!(f, "MapInsert"),
+            CBStorageResponse::MapGet(v) => f.debug_tuple("MapGet").field(v).finish(),
+            CBStorageResponse::MapRemove => write!(f, "MapRemove"),
+            CBStorageResponse::MapContainsKey(b) => {
+                f.debug_tuple("MapContainsKey").field(b).finish()
+            }
+            CBStorageResponse::MapIsEmpty(b) => f.debug_tuple("MapIsEmpty").field(b).finish(),
+            CBStorageResponse::MapClear => write!(f, "MapClear"),
+            CBStorageResponse::MapRemoveAndFetch(v) => {
+                f.debug_tuple("MapRemoveAndFetch").field(v).finish()
+            }
+            CBStorageResponse::MapRemoveWithPrefix => write!(f, "MapRemoveWithPrefix"),
+            CBStorageResponse::MapBatchInsert => write!(f, "MapBatchInsert"),
+            CBStorageResponse::MapBatchRemove => write!(f, "MapBatchRemove"),
+            #[cfg(feature = "map_len")]
+            CBStorageResponse::MapLen(n) => f.debug_tuple("MapLen").field(n).finish(),
+            #[cfg(feature = "ttl")]
+            CBStorageResponse::MapExpireAt(b) => f.debug_tuple("MapExpireAt").field(b).finish(),
+            #[cfg(feature = "ttl")]
+            CBStorageResponse::MapExpire(b) => f.debug_tuple("MapExpire").field(b).finish(),
+            #[cfg(feature = "ttl")]
+            CBStorageResponse::MapTtl(v) => f.debug_tuple("MapTtl").field(v).finish(),
+            // ── List responses ──
+            CBStorageResponse::ListPush => write!(f, "ListPush"),
+            CBStorageResponse::ListPushs => write!(f, "ListPushs"),
+            CBStorageResponse::ListPushLimit(v) => f.debug_tuple("ListPushLimit").field(v).finish(),
+            CBStorageResponse::ListPop(v) => f.debug_tuple("ListPop").field(v).finish(),
+            CBStorageResponse::ListGetAll(v) => {
+                f.debug_tuple("ListGetAll").field(&v.len()).finish()
+            }
+            CBStorageResponse::ListGetIndex(v) => f.debug_tuple("ListGetIndex").field(v).finish(),
+            CBStorageResponse::ListLen(n) => f.debug_tuple("ListLen").field(n).finish(),
+            CBStorageResponse::ListIsEmpty(b) => f.debug_tuple("ListIsEmpty").field(b).finish(),
+            CBStorageResponse::ListClear => write!(f, "ListClear"),
+            #[cfg(feature = "ttl")]
+            CBStorageResponse::ListExpireAt(b) => f.debug_tuple("ListExpireAt").field(b).finish(),
+            #[cfg(feature = "ttl")]
+            CBStorageResponse::ListExpire(b) => f.debug_tuple("ListExpire").field(b).finish(),
+            #[cfg(feature = "ttl")]
+            CBStorageResponse::ListTtl(v) => f.debug_tuple("ListTtl").field(v).finish(),
         }
     }
 }
@@ -288,30 +542,30 @@ impl tower::Service<CBStorageRequest> for CBStorageService {
                     .contains_key(&key)
                     .await
                     .map(CBStorageResponse::ContainsKey),
-                CBStorageRequest::Map { name, expire } => {
-                    let m = this.map(&name, expire).await?;
-                    Ok(CBStorageResponse::Map(m))
+                CBStorageRequest::DbMap { name, expire } => {
+                    let m = this.map(&name, expire).await;
+                    Ok(CBStorageResponse::DbMap(m))
                 }
-                CBStorageRequest::MapRemove { name } => this
+                CBStorageRequest::DbMapRemove { name } => this
                     .map_remove(&name)
                     .await
-                    .map(|_| CBStorageResponse::MapRemove),
-                CBStorageRequest::MapContainsKey { key } => this
+                    .map(|_| CBStorageResponse::DbMapRemove),
+                CBStorageRequest::DbMapContainsKey { key } => this
                     .map_contains_key(&key)
                     .await
-                    .map(CBStorageResponse::MapContainsKey),
-                CBStorageRequest::List { name, expire } => {
-                    let l = this.list(&name, expire).await?;
-                    Ok(CBStorageResponse::List(l))
+                    .map(CBStorageResponse::DbMapContainsKey),
+                CBStorageRequest::DbList { name, expire } => {
+                    let l = this.list(&name, expire).await;
+                    Ok(CBStorageResponse::DbList(l))
                 }
-                CBStorageRequest::ListRemove { name } => this
+                CBStorageRequest::DbListRemove { name } => this
                     .list_remove(&name)
                     .await
-                    .map(|_| CBStorageResponse::ListRemove),
-                CBStorageRequest::ListContainsKey { key } => this
+                    .map(|_| CBStorageResponse::DbListRemove),
+                CBStorageRequest::DbListContainsKey { key } => this
                     .list_contains_key(&key)
                     .await
-                    .map(CBStorageResponse::ListContainsKey),
+                    .map(CBStorageResponse::DbListContainsKey),
                 CBStorageRequest::CounterIncr { key, increment } => this
                     .counter_incr(&key, increment)
                     .await
@@ -351,317 +605,135 @@ impl tower::Service<CBStorageRequest> for CBStorageService {
                 }
                 #[cfg(feature = "ttl")]
                 CBStorageRequest::Ttl { key } => this.ttl(&key).await.map(CBStorageResponse::Ttl),
-            }
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Map-level Request / Response & Service
-// ---------------------------------------------------------------------------
-
-/// Unified request enum for all [`Map`](crate::storage::Map) operations.
-#[derive(Debug, Clone)]
-pub enum CBMapRequest {
-    Insert {
-        key: Vec<u8>,
-        val: Vec<u8>,
-    },
-    Get {
-        key: Vec<u8>,
-    },
-    Remove {
-        key: Vec<u8>,
-    },
-    ContainsKey {
-        key: Vec<u8>,
-    },
-    IsEmpty,
-    Clear,
-    RemoveAndFetch {
-        key: Vec<u8>,
-    },
-    RemoveWithPrefix {
-        prefix: Vec<u8>,
-    },
-    BatchInsert {
-        key_vals: Vec<(Vec<u8>, Vec<u8>)>,
-    },
-    BatchRemove {
-        keys: Vec<Vec<u8>>,
-    },
-    #[cfg(feature = "map_len")]
-    Len,
-    #[cfg(feature = "ttl")]
-    ExpireAt(TimestampMillis),
-    #[cfg(feature = "ttl")]
-    Expire(TimestampMillis),
-    #[cfg(feature = "ttl")]
-    Ttl,
-}
-
-/// Unified response enum for all [`Map`](crate::storage::Map) operations.
-pub enum CBMapResponse {
-    Insert,
-    Get(Option<Vec<u8>>),
-    Remove,
-    ContainsKey(bool),
-    IsEmpty(bool),
-    Clear,
-    RemoveAndFetch(Option<Vec<u8>>),
-    RemoveWithPrefix,
-    BatchInsert,
-    BatchRemove,
-    #[cfg(feature = "map_len")]
-    Len(usize),
-    #[cfg(feature = "ttl")]
-    ExpireAt(bool),
-    #[cfg(feature = "ttl")]
-    Expire(bool),
-    #[cfg(feature = "ttl")]
-    Ttl(Option<TimestampMillis>),
-}
-
-impl fmt::Debug for CBMapResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CBMapResponse::Insert => write!(f, "Insert"),
-            CBMapResponse::Get(v) => f.debug_tuple("Get").field(v).finish(),
-            CBMapResponse::Remove => write!(f, "Remove"),
-            CBMapResponse::ContainsKey(b) => f.debug_tuple("ContainsKey").field(b).finish(),
-            CBMapResponse::IsEmpty(b) => f.debug_tuple("IsEmpty").field(b).finish(),
-            CBMapResponse::Clear => write!(f, "Clear"),
-            CBMapResponse::RemoveAndFetch(v) => f.debug_tuple("RemoveAndFetch").field(v).finish(),
-            CBMapResponse::RemoveWithPrefix => write!(f, "RemoveWithPrefix"),
-            CBMapResponse::BatchInsert => write!(f, "BatchInsert"),
-            CBMapResponse::BatchRemove => write!(f, "BatchRemove"),
-            #[cfg(feature = "map_len")]
-            CBMapResponse::Len(n) => f.debug_tuple("Len").field(n).finish(),
-            #[cfg(feature = "ttl")]
-            CBMapResponse::ExpireAt(b) => f.debug_tuple("ExpireAt").field(b).finish(),
-            #[cfg(feature = "ttl")]
-            CBMapResponse::Expire(b) => f.debug_tuple("Expire").field(b).finish(),
-            #[cfg(feature = "ttl")]
-            CBMapResponse::Ttl(v) => f.debug_tuple("Ttl").field(v).finish(),
-        }
-    }
-}
-
-/// A Tower [`Service`] that dispatches [`CBMapRequest`] to the inner [`StorageMap`].
-#[derive(Clone)]
-pub struct CBMapService {
-    inner: StorageMap,
-}
-
-impl tower::Service<CBMapRequest> for CBMapService {
-    type Response = CBMapResponse;
-    type Error = anyhow::Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: CBMapRequest) -> Self::Future {
-        let this = self.inner.clone();
-        Box::pin(async move {
-            match req {
-                CBMapRequest::Insert { key, val } => this
+                // ── Map dispatch ──
+                CBStorageRequest::MapInsert { map, key, val } => map
                     .insert_raw(&key, &val)
                     .await
-                    .map(|_| CBMapResponse::Insert),
-                CBMapRequest::Get { key } => {
-                    let val = this.get_raw(&key).await?;
-                    Ok(CBMapResponse::Get(val))
+                    .map(|_| CBStorageResponse::MapInsert),
+                CBStorageRequest::MapGet { map, key } => {
+                    map.get_raw(&key).await.map(CBStorageResponse::MapGet)
                 }
-                CBMapRequest::Remove { key } => {
-                    this.remove(&key).await.map(|_| CBMapResponse::Remove)
+                CBStorageRequest::MapRemove { map, key } => {
+                    map.remove(&key).await.map(|_| CBStorageResponse::MapRemove)
                 }
-                CBMapRequest::ContainsKey { key } => this
+                CBStorageRequest::MapContainsKey { map, key } => map
                     .contains_key(&key)
                     .await
-                    .map(CBMapResponse::ContainsKey),
-                CBMapRequest::IsEmpty => this.is_empty().await.map(CBMapResponse::IsEmpty),
-                CBMapRequest::Clear => this.clear().await.map(|_| CBMapResponse::Clear),
-                CBMapRequest::RemoveAndFetch { key } => {
-                    let val = this.remove_and_fetch_raw(&key).await?;
-                    Ok(CBMapResponse::RemoveAndFetch(val))
+                    .map(CBStorageResponse::MapContainsKey),
+                CBStorageRequest::MapIsEmpty { map } => {
+                    map.is_empty().await.map(CBStorageResponse::MapIsEmpty)
                 }
-                CBMapRequest::RemoveWithPrefix { prefix } => this
+                CBStorageRequest::MapClear { map } => {
+                    map.clear().await.map(|_| CBStorageResponse::MapClear)
+                }
+                CBStorageRequest::MapRemoveAndFetch { map, key } => map
+                    .remove_and_fetch_raw(&key)
+                    .await
+                    .map(CBStorageResponse::MapRemoveAndFetch),
+                CBStorageRequest::MapRemoveWithPrefix { map, prefix } => map
                     .remove_with_prefix(&prefix)
                     .await
-                    .map(|_| CBMapResponse::RemoveWithPrefix),
-                CBMapRequest::BatchInsert { key_vals } => this
+                    .map(|_| CBStorageResponse::MapRemoveWithPrefix),
+                CBStorageRequest::MapBatchInsert { map, key_vals } => map
                     .batch_insert_raw(key_vals)
                     .await
-                    .map(|_| CBMapResponse::BatchInsert),
-                CBMapRequest::BatchRemove { keys } => this
+                    .map(|_| CBStorageResponse::MapBatchInsert),
+                CBStorageRequest::MapBatchRemove { map, keys } => map
                     .batch_remove(keys)
                     .await
-                    .map(|_| CBMapResponse::BatchRemove),
+                    .map(|_| CBStorageResponse::MapBatchRemove),
                 #[cfg(feature = "map_len")]
-                CBMapRequest::Len => this.len().await.map(CBMapResponse::Len),
+                CBStorageRequest::MapLen { map } => map.len().await.map(CBStorageResponse::MapLen),
                 #[cfg(feature = "ttl")]
-                CBMapRequest::ExpireAt(at) => this.expire_at(at).await.map(CBMapResponse::ExpireAt),
-                #[cfg(feature = "ttl")]
-                CBMapRequest::Expire(dur) => this.expire(dur).await.map(CBMapResponse::Expire),
-                #[cfg(feature = "ttl")]
-                CBMapRequest::Ttl => this.ttl().await.map(CBMapResponse::Ttl),
-            }
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// List-level Request / Response & Service
-// ---------------------------------------------------------------------------
-
-/// Unified request enum for all [`List`](crate::storage::List) operations.
-#[derive(Debug, Clone)]
-pub enum CBListRequest {
-    Push(Vec<u8>),
-    Pushs(Vec<Vec<u8>>),
-    PushLimit {
-        val: Vec<u8>,
-        limit: usize,
-        pop_front_if_limited: bool,
-    },
-    Pop,
-    GetAll,
-    GetIndex(usize),
-    Len,
-    IsEmpty,
-    Clear,
-    #[cfg(feature = "ttl")]
-    ExpireAt(TimestampMillis),
-    #[cfg(feature = "ttl")]
-    Expire(TimestampMillis),
-    #[cfg(feature = "ttl")]
-    Ttl,
-}
-
-/// Unified response enum for all [`List`](crate::storage::List) operations.
-pub enum CBListResponse {
-    Push,
-    Pushs,
-    PushLimit(Option<Vec<u8>>),
-    Pop(Option<Vec<u8>>),
-    GetAll(Vec<Vec<u8>>),
-    GetIndex(Option<Vec<u8>>),
-    Len(usize),
-    IsEmpty(bool),
-    Clear,
-    #[cfg(feature = "ttl")]
-    ExpireAt(bool),
-    #[cfg(feature = "ttl")]
-    Expire(bool),
-    #[cfg(feature = "ttl")]
-    Ttl(Option<TimestampMillis>),
-}
-
-impl fmt::Debug for CBListResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CBListResponse::Push => write!(f, "Push"),
-            CBListResponse::Pushs => write!(f, "Pushs"),
-            CBListResponse::PushLimit(v) => f.debug_tuple("PushLimit").field(v).finish(),
-            CBListResponse::Pop(v) => f.debug_tuple("Pop").field(v).finish(),
-            CBListResponse::GetAll(v) => f.debug_tuple("GetAll").field(&v.len()).finish(),
-            CBListResponse::GetIndex(v) => f.debug_tuple("GetIndex").field(v).finish(),
-            CBListResponse::Len(n) => f.debug_tuple("Len").field(n).finish(),
-            CBListResponse::IsEmpty(b) => f.debug_tuple("IsEmpty").field(b).finish(),
-            CBListResponse::Clear => write!(f, "Clear"),
-            #[cfg(feature = "ttl")]
-            CBListResponse::ExpireAt(b) => f.debug_tuple("ExpireAt").field(b).finish(),
-            #[cfg(feature = "ttl")]
-            CBListResponse::Expire(b) => f.debug_tuple("Expire").field(b).finish(),
-            #[cfg(feature = "ttl")]
-            CBListResponse::Ttl(v) => f.debug_tuple("Ttl").field(v).finish(),
-        }
-    }
-}
-
-/// A Tower [`Service`] that dispatches [`CBListRequest`] to the inner [`StorageList`].
-#[derive(Clone)]
-pub struct CBListService {
-    inner: StorageList,
-}
-
-impl tower::Service<CBListRequest> for CBListService {
-    type Response = CBListResponse;
-    type Error = anyhow::Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: CBListRequest) -> Self::Future {
-        let this = self.inner.clone();
-        Box::pin(async move {
-            match req {
-                CBListRequest::Push(val) => this.push_raw(&val).await.map(|_| CBListResponse::Push),
-                CBListRequest::Pushs(vals) => {
-                    this.pushs_raw(vals).await.map(|_| CBListResponse::Pushs)
+                CBStorageRequest::MapExpireAt { map, at } => {
+                    map.expire_at(at).await.map(CBStorageResponse::MapExpireAt)
                 }
-                CBListRequest::PushLimit {
+                #[cfg(feature = "ttl")]
+                CBStorageRequest::MapExpire { map, dur } => {
+                    map.expire(dur).await.map(CBStorageResponse::MapExpire)
+                }
+                #[cfg(feature = "ttl")]
+                CBStorageRequest::MapTtl { map } => map.ttl().await.map(CBStorageResponse::MapTtl),
+                // ── List dispatch ──
+                CBStorageRequest::ListPush { list, val } => list
+                    .push_raw(&val)
+                    .await
+                    .map(|_| CBStorageResponse::ListPush),
+                CBStorageRequest::ListPushs { list, vals } => list
+                    .pushs_raw(vals)
+                    .await
+                    .map(|_| CBStorageResponse::ListPushs),
+                CBStorageRequest::ListPushLimit {
+                    list,
                     val,
                     limit,
                     pop_front_if_limited,
-                } => this
+                } => list
                     .push_limit_raw(&val, limit, pop_front_if_limited)
                     .await
-                    .map(CBListResponse::PushLimit),
-                CBListRequest::Pop => Ok(CBListResponse::Pop(this.pop_raw().await?)),
-                CBListRequest::GetAll => Ok(CBListResponse::GetAll(this.all_raw().await?)),
-                CBListRequest::GetIndex(idx) => {
-                    Ok(CBListResponse::GetIndex(this.get_index_raw(idx).await?))
+                    .map(CBStorageResponse::ListPushLimit),
+                CBStorageRequest::ListPop { list } => {
+                    list.pop_raw().await.map(CBStorageResponse::ListPop)
                 }
-                CBListRequest::Len => this.len().await.map(CBListResponse::Len),
-                CBListRequest::IsEmpty => this.is_empty().await.map(CBListResponse::IsEmpty),
-                CBListRequest::Clear => this.clear().await.map(|_| CBListResponse::Clear),
-                #[cfg(feature = "ttl")]
-                CBListRequest::ExpireAt(at) => {
-                    this.expire_at(at).await.map(CBListResponse::ExpireAt)
+                CBStorageRequest::ListGetAll { list } => {
+                    list.all_raw().await.map(CBStorageResponse::ListGetAll)
+                }
+                CBStorageRequest::ListGetIndex { list, idx } => list
+                    .get_index_raw(idx)
+                    .await
+                    .map(CBStorageResponse::ListGetIndex),
+                CBStorageRequest::ListLen { list } => {
+                    list.len().await.map(CBStorageResponse::ListLen)
+                }
+                CBStorageRequest::ListIsEmpty { list } => {
+                    list.is_empty().await.map(CBStorageResponse::ListIsEmpty)
+                }
+                CBStorageRequest::ListClear { list } => {
+                    list.clear().await.map(|_| CBStorageResponse::ListClear)
                 }
                 #[cfg(feature = "ttl")]
-                CBListRequest::Expire(dur) => this.expire(dur).await.map(CBListResponse::Expire),
+                CBStorageRequest::ListExpireAt { list, at } => list
+                    .expire_at(at)
+                    .await
+                    .map(CBStorageResponse::ListExpireAt),
                 #[cfg(feature = "ttl")]
-                CBListRequest::Ttl => this.ttl().await.map(CBListResponse::Ttl),
+                CBStorageRequest::ListExpire { list, dur } => {
+                    list.expire(dur).await.map(CBStorageResponse::ListExpire)
+                }
+                #[cfg(feature = "ttl")]
+                CBStorageRequest::ListTtl { list } => {
+                    list.ttl().await.map(CBStorageResponse::ListTtl)
+                }
             }
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build Tower service chains with circuit breaker
+// CbTimeoutWrapper — inserts per-operation timeout into the Tower chain
 // ---------------------------------------------------------------------------
 
-/// A Tower [`Service`] wrapper that applies an optional per-call timeout.
+/// Tower [`Service`] wrapper that applies an optional timeout to each call.
 ///
-/// When `timeout` is `Some(dur)`, every [`call`](Service::call) is raced against
-/// `tokio::time::timeout`. If the inner service does not complete within `dur`,
-/// the operation is aborted and an `anyhow::Error` is returned — which the outer
-/// circuit breaker will wrap in `CircuitBreakerError::Inner` and count as a failure.
+/// When the timeout fires, the inner service's future is dropped and an
+/// `anyhow::Error` is returned. The enclosing `CircuitBreaker` then sees an
+/// `Err` and the [`DefaultClassifier`] correctly counts it as a failure,
+/// so timeouts are properly tracked in the sliding window.
+///
+/// When `timeout` is `None`, calls pass through unchanged (zero overhead).
 #[derive(Clone)]
-struct CbTimeoutWrapper<S> {
+pub(crate) struct CbTimeoutWrapper<S> {
     inner: S,
     timeout: Option<Duration>,
 }
 
 impl<S, Req> tower::Service<Req> for CbTimeoutWrapper<S>
 where
-    S: tower::Service<Req>,
-    S::Error: Into<anyhow::Error>,
+    S: tower::Service<Req> + Clone + Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: Into<anyhow::Error> + Send + 'static,
     S::Future: Send + 'static,
+    Req: Send + 'static,
 {
     type Response = S::Response;
     type Error = anyhow::Error;
@@ -676,47 +748,49 @@ where
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
+        self.inner.poll_ready(cx).map_err(|e| e.into())
     }
 
     fn call(&mut self, req: Req) -> Self::Future {
-        let dur = self.timeout;
         let fut = self.inner.call(req);
+        let timeout = self.timeout;
         Box::pin(async move {
-            match dur {
-                Some(d) => match tokio::time::timeout(d, fut).await {
-                    Ok(Ok(r)) => Ok(r),
-                    Ok(Err(e)) => Err(e.into()),
-                    Err(_) => Err(anyhow!("operation timed out after {:?}", d)),
+            match timeout {
+                Some(dur) => match tokio::time::timeout(dur, fut).await {
+                    Ok(r) => r.map_err(|e| e.into()),
+                    Err(_) => Err(anyhow!("operation timed out after {:?}", dur)),
                 },
-                None => fut.await.map_err(Into::into),
+                None => fut.await.map_err(|e| e.into()),
             }
         })
     }
 }
 
-/// Type alias: the circuit-breaker-wrapped concrete service for DB ops.
-type CbStorageServiceCb = tower_resilience_circuitbreaker::CircuitBreaker<
+// ---------------------------------------------------------------------------
+// Helper: build Tower service chains with circuit breaker
+// ---------------------------------------------------------------------------
+
+/// Build the circuit breaker for DB-level service.
+fn build_db_cb(
+    inner: CBStorageService,
+    config: &CircuitBreakerConfig,
+    name: &str,
+) -> tower_resilience_circuitbreaker::CircuitBreaker<
     CbTimeoutWrapper<CBStorageService>,
     DefaultClassifier,
->;
-/// Type alias: the circuit-breaker-wrapped concrete service for Map ops.
-type CbMapServiceCb = tower_resilience_circuitbreaker::CircuitBreaker<
-    CbTimeoutWrapper<CBMapService>,
-    DefaultClassifier,
->;
-/// Type alias: the circuit-breaker-wrapped concrete service for List ops.
-type CbListServiceCb = tower_resilience_circuitbreaker::CircuitBreaker<
-    CbTimeoutWrapper<CBListService>,
-    DefaultClassifier,
->;
+> {
+    let timeout_svc = CbTimeoutWrapper {
+        inner,
+        timeout: config.operation_timeout,
+    };
+    build_cb_inner(timeout_svc, config, name)
+}
 
-/// Build circuit breaker wrapping an arbitrary inner service.
 fn build_cb_inner<S, Req>(
     inner: S,
     config: &CircuitBreakerConfig,
     name: &str,
-) -> tower_resilience_circuitbreaker::CircuitBreaker<CbTimeoutWrapper<S>, DefaultClassifier>
+) -> tower_resilience_circuitbreaker::CircuitBreaker<S, DefaultClassifier>
 where
     S: tower::Service<Req> + Clone + Send + 'static,
     S::Response: Send + 'static,
@@ -724,20 +798,30 @@ where
     S::Future: Send + 'static,
     Req: Send + 'static,
 {
-    let timeout_svc = CbTimeoutWrapper {
-        inner,
-        timeout: config.operation_timeout,
-    };
     let n = name.to_owned();
-    CircuitBreakerLayer::builder()
+    let mut builder = CircuitBreakerLayer::builder()
         .name(name)
         .failure_rate_threshold(config.failure_rate_threshold)
-        .sliding_window_type(config.sliding_window_type)
-        .sliding_window_size(config.sliding_window_size)
         .minimum_number_of_calls(config.minimum_number_of_calls)
         .wait_duration_in_open(config.wait_duration_in_open)
         .slow_call_duration_threshold(config.slow_call_duration_threshold)
-        .slow_call_rate_threshold(config.slow_call_rate_threshold)
+        .slow_call_rate_threshold(config.slow_call_rate_threshold);
+
+    match &config.window {
+        WindowConfig::CountBased(cfg) => {
+            builder = builder
+                .sliding_window_type(SlidingWindowType::CountBased)
+                .sliding_window_size(cfg.sliding_window_size);
+        }
+        WindowConfig::TimeBased(cfg) => {
+            builder = builder
+                .sliding_window_type(SlidingWindowType::TimeBased)
+                .sliding_window_duration(cfg.sliding_window_duration)
+                .sliding_window_size(cfg.sliding_window_size);
+        }
+    }
+
+    builder
         .on_state_transition(move |from, to| {
             log::info!(
                 "[circuit-breaker:{}] state changed: {:?} -> {:?}",
@@ -747,31 +831,18 @@ where
             );
         })
         .build()
-        .layer(timeout_svc)
+        .layer(inner)
 }
 
-/// Build the circuit breaker for DB-level service.
-fn build_db_cb(
-    inner: CBStorageService,
-    config: &CircuitBreakerConfig,
-    name: &str,
-) -> CbStorageServiceCb {
-    build_cb_inner(inner, config, name)
-}
-
-/// Build the circuit breaker for Map-level service.
-fn build_map_cb(inner: CBMapService, config: &CircuitBreakerConfig, name: &str) -> CbMapServiceCb {
-    build_cb_inner(inner, config, name)
-}
-
-/// Build the circuit breaker for List-level service.
-fn build_list_cb(
-    inner: CBListService,
-    config: &CircuitBreakerConfig,
-    name: &str,
-) -> CbListServiceCb {
-    build_cb_inner(inner, config, name)
-}
+/// Shared circuit breaker type: an `Arc`-wrapped Tower `CircuitBreaker` wrapping
+/// a `CbTimeoutWrapper<CBStorageService>` with the default failure classifier.
+/// All three layers (DB / Map / List) use this same type.
+type SharedBreaker = Arc<
+    tower_resilience_circuitbreaker::CircuitBreaker<
+        CbTimeoutWrapper<CBStorageService>,
+        DefaultClassifier,
+    >,
+>;
 
 // ---------------------------------------------------------------------------
 // CircuitBrokenDB — public wrapper
@@ -783,7 +854,8 @@ fn build_list_cb(
 /// When the failure rate exceeds the configured threshold, the circuit opens and
 /// subsequent calls fail fast with an error rather than waiting for a timeout.
 pub struct CircuitBrokenDB {
-    service: Arc<Mutex<CbStorageServiceCb>>,
+    /// The DB-level circuit breaker — cloned per-call for concurrency.
+    service: SharedBreaker,
     config: CircuitBreakerConfig,
     /// Raw inner DB for pass-through operations that don't need CB protection
     /// (e.g., map_iter, list_iter, scan). Cloned cheaply from the DB passed to
@@ -794,12 +866,14 @@ pub struct CircuitBrokenDB {
 impl CircuitBrokenDB {
     /// Wrap a `DefaultStorageDB` with a circuit breaker.
     pub fn new(db: DefaultStorageDB, config: CircuitBreakerConfig) -> Self {
-        let inner = db.clone();
         let name = config.name.clone();
-        let inner_svc = CBStorageService { inner: db };
-        let service = build_db_cb(inner_svc, &config, &name);
+        let inner = db.clone();
+        let chain_svc = CBStorageService { inner: db };
+        // CbTimeoutWrapper is inserted inside the CircuitBreaker by build_db_cb,
+        // so timeout → Err → DefaultClassifier counts it as a failure.
+        let service = Arc::new(build_db_cb(chain_svc, &config, &name));
         Self {
-            service: Arc::new(Mutex::new(service)),
+            service,
             config,
             inner,
         }
@@ -811,28 +885,36 @@ impl CircuitBrokenDB {
     }
 
     async fn raw_call(&self, req: CBStorageRequest) -> Result<CBStorageResponse> {
-        let name = &self.config.name;
-        let mut guard = self.service.lock().await;
-        let svc = guard.ready().await.map_err(|e| map_cb_err(e, name))?;
-        svc.call(req).await.map_err(|e| map_cb_err(e, name))
+        // Clone once per call — shares circuit state (Arc), no lock contention.
+        // The CircuitBreaker handles try_acquire (with Open→HalfOpen transition),
+        // dispatch through CbTimeoutWrapper (with optional timeout), and automatic
+        // result recording via DefaultClassifier — all in a single Tower call.
+        let mut svc = self.service.as_ref().clone();
+
+        match svc.call(req).await {
+            Ok(r) => Ok(r),
+            Err(CircuitBreakerError::OpenCircuit) => Err(anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.config.name
+            )),
+            Err(CircuitBreakerError::Inner(e)) => Err(e),
+        }
     }
 
     /// Return a JSON snapshot of the circuit breaker's runtime state & config.
     ///
     /// Analogous to [`StorageDB::info()`] but for the breaker itself. Reads
-    /// atomic-loaded fields (`state`, `is_open`, `health_status`) without
-    /// acquiring the circuit's internal lock, and acquires the lock only for the
-    /// richer [`metrics()`](tower_resilience_circuitbreaker::CircuitBreaker::metrics) snapshot.
+    /// atomic-loaded fields (`state`, `is_open`) without acquiring the
+    /// circuit's internal lock, and acquires the lock only for the richer
+    /// [`metrics()`](tower_resilience_circuitbreaker::CircuitBreaker::metrics) snapshot.
     pub async fn cb_info(&self) -> serde_json::Value {
-        let guard = self.service.lock().await;
-        let metrics = guard.metrics().await;
+        let metrics = self.service.metrics().await;
 
         serde_json::json!({
             "name": self.config.name,
             "state": format!("{:?}", metrics.state),
             "state_code": metrics.state as u8,
-            "is_open": guard.is_open(),
-            "health": guard.health_status(),
+            "is_open": self.service.is_open(),
             "metrics": {
                 "total_calls": metrics.total_calls,
                 "failure_count": metrics.failure_count,
@@ -844,8 +926,17 @@ impl CircuitBrokenDB {
             },
             "config": {
                 "failure_rate_threshold": self.config.failure_rate_threshold,
-                "sliding_window_type": format!("{:?}", self.config.sliding_window_type),
-                "sliding_window_size": self.config.sliding_window_size,
+                "window": match &self.config.window {
+                    WindowConfig::CountBased(cfg) => serde_json::json!({
+                        "type": "CountBased",
+                        "sliding_window_size": cfg.sliding_window_size,
+                    }),
+                    WindowConfig::TimeBased(cfg) => serde_json::json!({
+                        "type": "TimeBased",
+                        "sliding_window_duration_ms": cfg.sliding_window_duration.as_millis() as u64,
+                        "sliding_window_size": cfg.sliding_window_size,
+                    }),
+                },
                 "minimum_number_of_calls": self.config.minimum_number_of_calls,
                 "wait_duration_in_open_ms": self.config.wait_duration_in_open.as_millis() as u64,
                 "slow_call_duration_threshold_ms": self.config.slow_call_duration_threshold.as_millis() as u64,
@@ -858,10 +949,6 @@ impl CircuitBrokenDB {
 
 impl Clone for CircuitBrokenDB {
     fn clone(&self) -> Self {
-        // Clone the Arc (same inner storage, but if we wanted independent breaker
-        // state each clone would need its own service). Here we keep the same breaker.
-        // Use config to rebuild if independent state is desired — for now, sharing the
-        // Arc<Mutex<...>> means all clones share the same breaker state.
         Self {
             service: Arc::clone(&self.service),
             config: self.config.clone(),
@@ -883,29 +970,16 @@ impl StorageDB for CircuitBrokenDB {
         &self,
         name: N,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::MapType> {
-        let req = CBStorageRequest::Map {
-            name: name.as_ref().to_vec(),
-            expire,
-        };
-        let resp = self.raw_call(req).await?;
-        match resp {
-            CBStorageResponse::Map(m) => {
-                let cfg = CircuitBreakerConfig {
-                    name: format!("{}-map", self.config.name),
-                    ..self.config.clone()
-                };
-                Ok(CircuitBrokenMap::new(m, cfg))
-            }
-            _ => Err(anyhow!("unexpected response type for map()")),
-        }
+    ) -> Self::MapType {
+        let raw = self.inner.map(name, expire).await;
+        CircuitBrokenMap::new(raw, Arc::clone(&self.service), self.config.name.clone())
     }
 
     async fn map_remove<K>(&self, name: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        self.raw_call(CBStorageRequest::MapRemove {
+        self.raw_call(CBStorageRequest::DbMapRemove {
             name: name.as_ref().to_vec(),
         })
         .await
@@ -914,12 +988,12 @@ impl StorageDB for CircuitBrokenDB {
 
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self
-            .raw_call(CBStorageRequest::MapContainsKey {
+            .raw_call(CBStorageRequest::DbMapContainsKey {
                 key: key.as_ref().to_vec(),
             })
             .await?
         {
-            CBStorageResponse::MapContainsKey(b) => Ok(b),
+            CBStorageResponse::DbMapContainsKey(b) => Ok(b),
             _ => Err(anyhow!("unexpected response type for map_contains_key()")),
         }
     }
@@ -928,29 +1002,16 @@ impl StorageDB for CircuitBrokenDB {
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::ListType> {
-        let req = CBStorageRequest::List {
-            name: name.as_ref().to_vec(),
-            expire,
-        };
-        let resp = self.raw_call(req).await?;
-        match resp {
-            CBStorageResponse::List(l) => {
-                let cfg = CircuitBreakerConfig {
-                    name: format!("{}-list", self.config.name),
-                    ..self.config.clone()
-                };
-                Ok(CircuitBrokenList::new(l, cfg))
-            }
-            _ => Err(anyhow!("unexpected response type for list()")),
-        }
+    ) -> Self::ListType {
+        let raw = self.inner.list(name, expire).await;
+        CircuitBrokenList::new(raw, Arc::clone(&self.service), self.config.name.clone())
     }
 
     async fn list_remove<K>(&self, name: K) -> Result<()>
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        self.raw_call(CBStorageRequest::ListRemove {
+        self.raw_call(CBStorageRequest::DbListRemove {
             name: name.as_ref().to_vec(),
         })
         .await
@@ -959,12 +1020,12 @@ impl StorageDB for CircuitBrokenDB {
 
     async fn list_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
         match self
-            .raw_call(CBStorageRequest::ListContainsKey {
+            .raw_call(CBStorageRequest::DbListContainsKey {
                 key: key.as_ref().to_vec(),
             })
             .await?
         {
-            CBStorageResponse::ListContainsKey(b) => Ok(b),
+            CBStorageResponse::DbListContainsKey(b) => Ok(b),
             _ => Err(anyhow!("unexpected response type for list_contains_key()")),
         }
     }
@@ -1179,8 +1240,9 @@ impl StorageDB for CircuitBrokenDB {
     }
 
     async fn info(&self) -> Result<serde_json::Value> {
-        let mut base = match self.raw_call(CBStorageRequest::Info).await? {
-            CBStorageResponse::Info(v) => v,
+        let mut base = match self.raw_call(CBStorageRequest::Info).await {
+            Ok(CBStorageResponse::Info(v)) => v,
+            Err(e) => serde_json::Value::String(e.to_string()),
             _ => return Err(anyhow!("unexpected response type for info()")),
         };
 
@@ -1203,42 +1265,41 @@ impl StorageDB for CircuitBrokenDB {
 // ---------------------------------------------------------------------------
 
 /// A circuit-breaker-protected wrapper around [`StorageMap`].
+///
+/// All operations funnel through the **shared DB-level** `CircuitBreaker`,
+/// so Map/List/DB share a single failure metric.  Clone per-call (cheap).
+///
+/// Iterator methods (`iter`, `key_iter`, `prefix_iter`) bypass the breaker
+/// and operate directly on the inner `StorageMap`.
 pub struct CircuitBrokenMap {
-    service: Arc<Mutex<CbMapServiceCb>>,
-    /// Retained for name() and iterator methods that bypass the CB.
+    /// Reference to the shared DB-level circuit breaker.
+    breaker: SharedBreaker,
+    /// Raw inner map for name() and iterator methods that bypass the CB.
     inner: StorageMap,
+    /// Breaker name for error messages.
+    name: String,
 }
 
 impl Clone for CircuitBrokenMap {
     fn clone(&self) -> Self {
         Self {
-            service: Arc::clone(&self.service),
+            breaker: Arc::clone(&self.breaker),
             inner: self.inner.clone(),
+            name: self.name.clone(),
         }
     }
 }
 
 impl CircuitBrokenMap {
-    fn new(m: StorageMap, config: CircuitBreakerConfig) -> Self {
-        let inner = m.clone();
-        let name = config.name.clone();
-        let inner_svc = CBMapService { inner: m };
-        let service = build_map_cb(inner_svc, &config, &name);
+    fn new(m: StorageMap, breaker: SharedBreaker, name: String) -> Self {
         Self {
-            service: Arc::new(Mutex::new(service)),
-            inner,
+            breaker,
+            inner: m,
+            name,
         }
-    }
-
-    async fn raw_call(&self, req: CBMapRequest) -> Result<CBMapResponse> {
-        let mut guard = self.service.lock().await;
-        let svc = guard.ready().await.map_err(|e| map_cb_err(e, "map"))?;
-        svc.call(req).await.map_err(|e| map_cb_err(e, "map"))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Map trait implementation for CircuitBrokenMap
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -1253,12 +1314,20 @@ impl Map for CircuitBrokenMap {
         V: Serialize + Sync + Send + ?Sized,
     {
         let bytes = postcard::to_stdvec(val)?;
-        self.raw_call(CBMapRequest::Insert {
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::MapInsert {
+            map: self.inner.clone(),
             key: key.as_ref().to_vec(),
             val: bytes,
         })
         .await
-        .map(|_| ())
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn get<K, V>(&self, key: K) -> Result<Option<V>>
@@ -1266,14 +1335,22 @@ impl Map for CircuitBrokenMap {
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        match self
-            .raw_call(CBMapRequest::Get {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapGet {
+                map: self.inner.clone(),
                 key: key.as_ref().to_vec(),
             })
-            .await?
-        {
-            CBMapResponse::Get(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
-            CBMapResponse::Get(None) => Ok(None),
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapGet(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
+            CBStorageResponse::MapGet(None) => Ok(None),
             _ => Err(anyhow!("unexpected response type for map::get()")),
         }
     }
@@ -1282,34 +1359,93 @@ impl Map for CircuitBrokenMap {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        self.raw_call(CBMapRequest::Remove {
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::MapRemove {
+            map: self.inner.clone(),
             key: key.as_ref().to_vec(),
         })
         .await
-        .map(|_| ())
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool> {
-        match self
-            .raw_call(CBMapRequest::ContainsKey {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapContainsKey {
+                map: self.inner.clone(),
                 key: key.as_ref().to_vec(),
             })
-            .await?
-        {
-            CBMapResponse::ContainsKey(b) => Ok(b),
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapContainsKey(b) => Ok(b),
             _ => Err(anyhow!("unexpected response type for map::contains_key()")),
         }
     }
 
+    #[cfg(feature = "map_len")]
+    async fn len(&self) -> Result<usize> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapLen {
+                map: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapLen(n) => Ok(n),
+            _ => Err(anyhow!("unexpected response type for map::len()")),
+        }
+    }
+
     async fn is_empty(&self) -> Result<bool> {
-        match self.raw_call(CBMapRequest::IsEmpty).await? {
-            CBMapResponse::IsEmpty(b) => Ok(b),
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapIsEmpty {
+                map: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapIsEmpty(b) => Ok(b),
             _ => Err(anyhow!("unexpected response type for map::is_empty()")),
         }
     }
 
     async fn clear(&self) -> Result<()> {
-        self.raw_call(CBMapRequest::Clear).await.map(|_| ())
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::MapClear {
+            map: self.inner.clone(),
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn remove_and_fetch<K, V>(&self, key: K) -> Result<Option<V>>
@@ -1317,14 +1453,24 @@ impl Map for CircuitBrokenMap {
         K: AsRef<[u8]> + Sync + Send,
         V: DeserializeOwned + Sync + Send,
     {
-        match self
-            .raw_call(CBMapRequest::RemoveAndFetch {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapRemoveAndFetch {
+                map: self.inner.clone(),
                 key: key.as_ref().to_vec(),
             })
-            .await?
-        {
-            CBMapResponse::RemoveAndFetch(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
-            CBMapResponse::RemoveAndFetch(None) => Ok(None),
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapRemoveAndFetch(Some(bytes)) => {
+                Ok(Some(postcard::from_bytes(&bytes)?))
+            }
+            CBStorageResponse::MapRemoveAndFetch(None) => Ok(None),
             _ => Err(anyhow!(
                 "unexpected response type for map::remove_and_fetch()"
             )),
@@ -1335,11 +1481,19 @@ impl Map for CircuitBrokenMap {
     where
         K: AsRef<[u8]> + Sync + Send,
     {
-        self.raw_call(CBMapRequest::RemoveWithPrefix {
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::MapRemoveWithPrefix {
+            map: self.inner.clone(),
             prefix: prefix.as_ref().to_vec(),
         })
         .await
-        .map(|_| ())
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn batch_insert<V>(&self, key_vals: Vec<(Key, V)>) -> Result<()>
@@ -1350,47 +1504,35 @@ impl Map for CircuitBrokenMap {
         for (k, v) in key_vals {
             pairs.push((k, postcard::to_stdvec(&v)?));
         }
-        self.raw_call(CBMapRequest::BatchInsert { key_vals: pairs })
-            .await
-            .map(|_| ())
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::MapBatchInsert {
+            map: self.inner.clone(),
+            key_vals: pairs,
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn batch_remove(&self, keys: Vec<Key>) -> Result<()> {
-        self.raw_call(CBMapRequest::BatchRemove { keys })
-            .await
-            .map(|_| ())
-    }
-
-    #[cfg(feature = "map_len")]
-    async fn len(&self) -> Result<usize> {
-        match self.raw_call(CBMapRequest::Len).await? {
-            CBMapResponse::Len(n) => Ok(n),
-            _ => Err(anyhow!("unexpected response type for map::len()")),
-        }
-    }
-
-    #[cfg(feature = "ttl")]
-    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
-        match self.raw_call(CBMapRequest::ExpireAt(at)).await? {
-            CBMapResponse::ExpireAt(b) => Ok(b),
-            _ => Err(anyhow!("unexpected response type for map::expire_at()")),
-        }
-    }
-
-    #[cfg(feature = "ttl")]
-    async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
-        match self.raw_call(CBMapRequest::Expire(dur)).await? {
-            CBMapResponse::Expire(b) => Ok(b),
-            _ => Err(anyhow!("unexpected response type for map::expire()")),
-        }
-    }
-
-    #[cfg(feature = "ttl")]
-    async fn ttl(&self) -> Result<Option<TimestampMillis>> {
-        match self.raw_call(CBMapRequest::Ttl).await? {
-            CBMapResponse::Ttl(v) => Ok(v),
-            _ => Err(anyhow!("unexpected response type for map::ttl()")),
-        }
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::MapBatchRemove {
+            map: self.inner.clone(),
+            keys,
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     // ---- pass-through: iterator methods bypass CB ----
@@ -1419,6 +1561,68 @@ impl Map for CircuitBrokenMap {
     {
         self.inner.prefix_iter(prefix).await
     }
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapExpireAt {
+                map: self.inner.clone(),
+                at,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapExpireAt(b) => Ok(b),
+            _ => Err(anyhow!("unexpected response type for map::expire_at()")),
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapExpire {
+                map: self.inner.clone(),
+                dur,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapExpire(b) => Ok(b),
+            _ => Err(anyhow!("unexpected response type for map::expire()")),
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn ttl(&self) -> Result<Option<TimestampMillis>> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::MapTtl {
+                map: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::MapTtl(v) => Ok(v),
+            _ => Err(anyhow!("unexpected response type for map::ttl()")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,42 +1630,41 @@ impl Map for CircuitBrokenMap {
 // ---------------------------------------------------------------------------
 
 /// A circuit-breaker-protected wrapper around [`StorageList`].
+///
+/// All operations funnel through the **shared DB-level** `CircuitBreaker`,
+/// so Map/List/DB share a single failure metric.  Clone per-call (cheap).
+///
+/// Iterator methods (`iter`) bypass the breaker and operate directly on
+/// the inner `StorageList`.
 pub struct CircuitBrokenList {
-    service: Arc<Mutex<CbListServiceCb>>,
-    /// Retained for name() and iter() that bypass the CB.
+    /// Reference to the shared DB-level circuit breaker.
+    breaker: SharedBreaker,
+    /// Raw inner list for name() and iter() that bypass the CB.
     inner: StorageList,
+    /// Breaker name for error messages & identifying the list in requests.
+    name: String,
 }
 
 impl Clone for CircuitBrokenList {
     fn clone(&self) -> Self {
         Self {
-            service: Arc::clone(&self.service),
+            breaker: Arc::clone(&self.breaker),
             inner: self.inner.clone(),
+            name: self.name.clone(),
         }
     }
 }
 
 impl CircuitBrokenList {
-    fn new(l: StorageList, config: CircuitBreakerConfig) -> Self {
-        let inner = l.clone();
-        let name = config.name.clone();
-        let inner_svc = CBListService { inner: l };
-        let service = build_list_cb(inner_svc, &config, &name);
+    fn new(l: StorageList, breaker: SharedBreaker, name: String) -> Self {
         Self {
-            service: Arc::new(Mutex::new(service)),
-            inner,
+            breaker,
+            inner: l,
+            name,
         }
-    }
-
-    async fn raw_call(&self, req: CBListRequest) -> Result<CBListResponse> {
-        let mut guard = self.service.lock().await;
-        let svc = guard.ready().await.map_err(|e| map_cb_err(e, "list"))?;
-        svc.call(req).await.map_err(|e| map_cb_err(e, "list"))
     }
 }
 
-// ---------------------------------------------------------------------------
-// List trait implementation for CircuitBrokenList
 // ---------------------------------------------------------------------------
 
 #[async_trait]
@@ -1474,9 +1677,20 @@ impl List for CircuitBrokenList {
     where
         V: Serialize + Sync + Send,
     {
-        self.raw_call(CBListRequest::Push(postcard::to_stdvec(val)?))
-            .await
-            .map(|_| ())
+        let bytes = postcard::to_stdvec(val)?;
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::ListPush {
+            list: self.inner.clone(),
+            val: bytes,
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn pushs<V>(&self, vals: Vec<V>) -> Result<()>
@@ -1487,9 +1701,19 @@ impl List for CircuitBrokenList {
         for v in vals {
             bytes_vec.push(postcard::to_stdvec(&v)?);
         }
-        self.raw_call(CBListRequest::Pushs(bytes_vec))
-            .await
-            .map(|_| ())
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::ListPushs {
+            list: self.inner.clone(),
+            vals: bytes_vec,
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     async fn push_limit<V>(
@@ -1502,16 +1726,26 @@ impl List for CircuitBrokenList {
         V: Serialize + Sync + Send + DeserializeOwned,
     {
         let bytes = postcard::to_stdvec(val)?;
-        match self
-            .raw_call(CBListRequest::PushLimit {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListPushLimit {
+                list: self.inner.clone(),
                 val: bytes,
                 limit,
                 pop_front_if_limited,
             })
-            .await?
-        {
-            CBListResponse::PushLimit(Some(popped)) => Ok(Some(postcard::from_bytes(&popped)?)),
-            CBListResponse::PushLimit(None) => Ok(None),
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListPushLimit(Some(popped)) => {
+                Ok(Some(postcard::from_bytes(&popped)?))
+            }
+            CBStorageResponse::ListPushLimit(None) => Ok(None),
             _ => Err(anyhow!("unexpected response type for list::push_limit()")),
         }
     }
@@ -1520,9 +1754,21 @@ impl List for CircuitBrokenList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        match self.raw_call(CBListRequest::Pop).await? {
-            CBListResponse::Pop(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
-            CBListResponse::Pop(None) => Ok(None),
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListPop {
+                list: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListPop(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
+            CBStorageResponse::ListPop(None) => Ok(None),
             _ => Err(anyhow!("unexpected response type for list::pop()")),
         }
     }
@@ -1531,8 +1777,20 @@ impl List for CircuitBrokenList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        match self.raw_call(CBListRequest::GetAll).await? {
-            CBListResponse::GetAll(vals) => vals
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListGetAll {
+                list: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListGetAll(vals) => vals
                 .into_iter()
                 .map(|bytes| postcard::from_bytes(&bytes).map_err(Into::into))
                 .collect(),
@@ -1544,53 +1802,77 @@ impl List for CircuitBrokenList {
     where
         V: DeserializeOwned + Sync + Send,
     {
-        match self.raw_call(CBListRequest::GetIndex(idx)).await? {
-            CBListResponse::GetIndex(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
-            CBListResponse::GetIndex(None) => Ok(None),
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListGetIndex {
+                list: self.inner.clone(),
+                idx,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListGetIndex(Some(bytes)) => Ok(Some(postcard::from_bytes(&bytes)?)),
+            CBStorageResponse::ListGetIndex(None) => Ok(None),
             _ => Err(anyhow!("unexpected response type for list::get_index()")),
         }
     }
 
     async fn len(&self) -> Result<usize> {
-        match self.raw_call(CBListRequest::Len).await? {
-            CBListResponse::Len(n) => Ok(n),
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListLen {
+                list: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListLen(n) => Ok(n),
             _ => Err(anyhow!("unexpected response type for list::len()")),
         }
     }
 
     async fn is_empty(&self) -> Result<bool> {
-        match self.raw_call(CBListRequest::IsEmpty).await? {
-            CBListResponse::IsEmpty(b) => Ok(b),
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListIsEmpty {
+                list: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListIsEmpty(b) => Ok(b),
             _ => Err(anyhow!("unexpected response type for list::is_empty()")),
         }
     }
 
     async fn clear(&self) -> Result<()> {
-        self.raw_call(CBListRequest::Clear).await.map(|_| ())
-    }
-
-    #[cfg(feature = "ttl")]
-    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
-        match self.raw_call(CBListRequest::ExpireAt(at)).await? {
-            CBListResponse::ExpireAt(b) => Ok(b),
-            _ => Err(anyhow!("unexpected response type for list::expire_at()")),
-        }
-    }
-
-    #[cfg(feature = "ttl")]
-    async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
-        match self.raw_call(CBListRequest::Expire(dur)).await? {
-            CBListResponse::Expire(b) => Ok(b),
-            _ => Err(anyhow!("unexpected response type for list::expire()")),
-        }
-    }
-
-    #[cfg(feature = "ttl")]
-    async fn ttl(&self) -> Result<Option<TimestampMillis>> {
-        match self.raw_call(CBListRequest::Ttl).await? {
-            CBListResponse::Ttl(v) => Ok(v),
-            _ => Err(anyhow!("unexpected response type for list::ttl()")),
-        }
+        let mut svc = self.breaker.as_ref().clone();
+        svc.call(CBStorageRequest::ListClear {
+            list: self.inner.clone(),
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "storage unavailable (circuit breaker open for '{}')",
+                self.name
+            )
+        })?;
+        Ok(())
     }
 
     // ---- pass-through: iterator bypasses CB ----
@@ -1601,6 +1883,68 @@ impl List for CircuitBrokenList {
         V: DeserializeOwned + Sync + Send + 'a + 'static,
     {
         self.inner.iter().await
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire_at(&self, at: TimestampMillis) -> Result<bool> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListExpireAt {
+                list: self.inner.clone(),
+                at,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListExpireAt(b) => Ok(b),
+            _ => Err(anyhow!("unexpected response type for list::expire_at()")),
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn expire(&self, dur: TimestampMillis) -> Result<bool> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListExpire {
+                list: self.inner.clone(),
+                dur,
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListExpire(b) => Ok(b),
+            _ => Err(anyhow!("unexpected response type for list::expire()")),
+        }
+    }
+
+    #[cfg(feature = "ttl")]
+    async fn ttl(&self) -> Result<Option<TimestampMillis>> {
+        let mut svc = self.breaker.as_ref().clone();
+        let resp = svc
+            .call(CBStorageRequest::ListTtl {
+                list: self.inner.clone(),
+            })
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "storage unavailable (circuit breaker open for '{}')",
+                    self.name
+                )
+            })?;
+        match resp {
+            CBStorageResponse::ListTtl(v) => Ok(v),
+            _ => Err(anyhow!("unexpected response type for list::ttl()")),
+        }
     }
 }
 
@@ -1675,7 +2019,7 @@ mod cb_unit_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Map-level mock
+    // Map-level mock (uses CBStorageRequest for uniform testing)
     // -----------------------------------------------------------------------
 
     #[derive(Clone)]
@@ -1693,8 +2037,8 @@ mod cb_unit_tests {
         }
     }
 
-    impl Service<CBMapRequest> for MockMapSvc {
-        type Response = CBMapResponse;
+    impl Service<CBStorageRequest> for MockMapSvc {
+        type Response = CBStorageResponse;
         type Error = anyhow::Error;
         type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
 
@@ -1705,14 +2049,14 @@ mod cb_unit_tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _req: CBMapRequest) -> Self::Future {
+        fn call(&mut self, _req: CBStorageRequest) -> Self::Future {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             let fail_until = self.fail_until;
             Box::pin(async move {
                 if count < fail_until {
                     Err(anyhow!("mock map failure"))
                 } else {
-                    Ok(CBMapResponse::IsEmpty(true))
+                    Ok(CBStorageResponse::MapIsEmpty(true))
                 }
             })
         }
@@ -1737,8 +2081,8 @@ mod cb_unit_tests {
         }
     }
 
-    impl Service<CBListRequest> for MockListSvc {
-        type Response = CBListResponse;
+    impl Service<CBStorageRequest> for MockListSvc {
+        type Response = CBStorageResponse;
         type Error = anyhow::Error;
         type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
 
@@ -1749,14 +2093,14 @@ mod cb_unit_tests {
             Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, _req: CBListRequest) -> Self::Future {
+        fn call(&mut self, _req: CBStorageRequest) -> Self::Future {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             let fail_until = self.fail_until;
             Box::pin(async move {
                 if count < fail_until {
                     Err(anyhow!("mock list failure"))
                 } else {
-                    Ok(CBListResponse::Len(0))
+                    Ok(CBStorageResponse::ListLen(0))
                 }
             })
         }
@@ -1771,13 +2115,15 @@ mod cb_unit_tests {
         CircuitBreakerConfig {
             name: name.into(),
             failure_rate_threshold: 0.5,
-            sliding_window_size: 3,
+            window: CountBasedWindowConfig {
+                sliding_window_size: 3,
+            }
+            .into(),
             minimum_number_of_calls: 3,
             wait_duration_in_open: Duration::from_millis(200),
             slow_call_duration_threshold: Duration::from_secs(1),
             slow_call_rate_threshold: 1.0,
             operation_timeout: None,
-            sliding_window_type: SlidingWindowType::CountBased,
         }
     }
 
@@ -1823,7 +2169,12 @@ mod cb_unit_tests {
         let cfg = fast_cb_config("map_errs");
         let mut cb = build_cb_inner(mock, &cfg, &cfg.name);
 
-        let resp = cb.ready().await.unwrap().call(CBMapRequest::IsEmpty).await;
+        let resp = cb
+            .ready()
+            .await
+            .unwrap()
+            .call(CBStorageRequest::DbSize)
+            .await;
         assert!(resp.is_err(), "map error should propagate");
     }
 
@@ -1837,118 +2188,12 @@ mod cb_unit_tests {
         let cfg = fast_cb_config("list_errs");
         let mut cb = build_cb_inner(mock, &cfg, &cfg.name);
 
-        let resp = cb.ready().await.unwrap().call(CBListRequest::Len).await;
+        let resp = cb
+            .ready()
+            .await
+            .unwrap()
+            .call(CBStorageRequest::DbSize)
+            .await;
         assert!(resp.is_err(), "list error should propagate");
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests — Timeout
-    // -----------------------------------------------------------------------
-
-    /// A mock service that sleeps for 100ms before responding.
-    #[derive(Clone)]
-    struct SlowMockSvc {
-        sleep: Duration,
-    }
-
-    impl Service<CBStorageRequest> for SlowMockSvc {
-        type Response = CBStorageResponse;
-        type Error = anyhow::Error;
-        type Future = Pin<Box<dyn std::future::Future<Output = Result<Self::Response>> + Send>>;
-
-        fn poll_ready(
-            &mut self,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _req: CBStorageRequest) -> Self::Future {
-            let sleep = self.sleep;
-            Box::pin(async move {
-                tokio::time::sleep(sleep).await;
-                Ok(CBStorageResponse::Insert)
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn test_timeout_returns_error() {
-        // Service takes 100ms, but timeout is 10ms → should time out.
-        let mock = SlowMockSvc {
-            sleep: Duration::from_millis(100),
-        };
-        let mut cfg = fast_cb_config("timeout_err");
-        cfg.operation_timeout = Some(Duration::from_millis(10));
-        let mut cb = build_cb_inner(mock, &cfg, &cfg.name);
-
-        let req = CBStorageRequest::Get { key: b"x".to_vec() };
-        let resp = cb.ready().await.unwrap().call(req).await;
-        assert!(resp.is_err(), "expected timeout error");
-        let err = resp.unwrap_err().to_string();
-        assert!(
-            err.contains("timed out"),
-            "expected 'timed out' in error, got: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_timeout_within_limit_succeeds() {
-        // Service takes 10ms, timeout is 200ms → should succeed.
-        let mock = SlowMockSvc {
-            sleep: Duration::from_millis(10),
-        };
-        let mut cfg = fast_cb_config("timeout_ok");
-        cfg.operation_timeout = Some(Duration::from_millis(200));
-        let mut cb = build_cb_inner(mock, &cfg, &cfg.name);
-
-        let req = CBStorageRequest::Get { key: b"y".to_vec() };
-        let resp = cb.ready().await.unwrap().call(req).await;
-        assert!(resp.is_ok(), "expected success, got: {:?}", resp);
-    }
-
-    #[tokio::test]
-    async fn test_timeout_counts_as_failure_and_trips_circuit() {
-        // Make enough calls that all time out → circuit should open.
-        let mock = SlowMockSvc {
-            sleep: Duration::from_millis(100),
-        };
-        let mut cfg = fast_cb_config("timeout_trip");
-        cfg.operation_timeout = Some(Duration::from_millis(10));
-        // minimum_number_of_calls=3, failure_rate_threshold=0.5 →
-        // after 3 failures recorded, the 4th poll_ready should return OpenCircuit.
-        let mut cb = build_cb_inner(mock, &cfg, &cfg.name);
-
-        let req = CBStorageRequest::Get { key: b"t".to_vec() };
-
-        // First three calls: each should get a timeout (Inner error).
-        for i in 0..3 {
-            let resp = cb.ready().await.unwrap().call(req.clone()).await;
-            assert!(resp.is_err(), "call {} should have timed out", i);
-            let err = resp.unwrap_err().to_string();
-            assert!(
-                err.contains("timed out"),
-                "call {} expected 'timed out', got: {}",
-                i,
-                err
-            );
-        }
-
-        // Fourth call: circuit should now be open → OpenCircuit error.
-        // Note: CircuitBreaker checks state in call() (via try_acquire), not in
-        // poll_ready(), when backpressure mode is disabled (the default).
-        let result = cb.ready().await.unwrap().call(req.clone()).await;
-        match result {
-            Err(err) => {
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("circuit is open"),
-                    "expected OpenCircuit error, got: {}",
-                    msg
-                );
-            }
-            Ok(_) => panic!("expected OpenCircuit error on fourth call"),
-        }
     }
 }
