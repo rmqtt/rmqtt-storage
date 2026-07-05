@@ -80,12 +80,15 @@ pub trait StorageDB: Send + Sync {
     /// Concrete List type for this storage
     type ListType: List;
 
-    /// Creates or accesses a named map
+    /// Creates or accesses a named map.
+    ///
+    /// This method never fails — if the backend is unavailable a stub is returned
+    /// and actual errors are deferred to operations on the returned map.
     async fn map<N: AsRef<[u8]> + Sync + Send>(
         &self,
         name: N,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::MapType>;
+    ) -> Self::MapType;
 
     /// Removes an entire map
     async fn map_remove<K>(&self, name: K) -> Result<()>
@@ -95,12 +98,15 @@ pub trait StorageDB: Send + Sync {
     /// Checks if a map exists
     async fn map_contains_key<K: AsRef<[u8]> + Sync + Send>(&self, key: K) -> Result<bool>;
 
-    /// Creates or accesses a named list
+    /// Creates or accesses a named list.
+    ///
+    /// This method never fails — if the backend is unavailable a stub is returned
+    /// and actual errors are deferred to operations on the returned list.
     async fn list<V: AsRef<[u8]> + Sync + Send>(
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::ListType>;
+    ) -> Self::ListType;
 
     /// Removes an entire list
     async fn list_remove<K>(&self, name: K) -> Result<()>
@@ -386,17 +392,17 @@ impl DefaultStorageDB {
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<StorageMap> {
-        Ok(match self {
+    ) -> StorageMap {
+        match self {
             #[cfg(feature = "sled")]
-            DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name, expire).await?),
+            DefaultStorageDB::Sled(db) => StorageMap::Sled(db.map(name, expire).await),
             #[cfg(feature = "redis")]
-            DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name, expire).await?),
+            DefaultStorageDB::Redis(db) => StorageMap::Redis(db.map(name, expire).await),
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => {
-                StorageMap::RedisCluster(db.map(name, expire).await?)
+                StorageMap::RedisCluster(db.map(name, expire).await)
             }
-        })
+        }
     }
 
     /// Removes a named map
@@ -434,17 +440,17 @@ impl DefaultStorageDB {
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<StorageList> {
-        Ok(match self {
+    ) -> StorageList {
+        match self {
             #[cfg(feature = "sled")]
-            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name, expire).await?),
+            DefaultStorageDB::Sled(db) => StorageList::Sled(db.list(name, expire).await),
             #[cfg(feature = "redis")]
-            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name, expire).await?),
+            DefaultStorageDB::Redis(db) => StorageList::Redis(db.list(name, expire).await),
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => {
-                StorageList::RedisCluster(db.list(name, expire).await?)
+                StorageList::RedisCluster(db.list(name, expire).await)
             }
-        })
+        }
     }
 
     /// Removes a named list

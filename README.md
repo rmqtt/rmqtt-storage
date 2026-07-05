@@ -66,6 +66,8 @@ map.insert("k", &"v").await?;
 
 `CircuitBrokenDB` implements the [`StorageDB`] trait, and `CircuitBrokenMap`/`CircuitBrokenList` implement the [`Map`]/[`List`] traits respectively. This means they can be used polymorphically alongside native storage backends in generic contexts.
 
+All Map / List / DB operations funnel through a **single shared circuit breaker** — a failing backend trips the breaker globally, and failure metrics are unified across all operation types.
+
 When the failure rate exceeds the configured threshold, the circuit opens and subsequent calls fail fast instead of waiting for timeouts. After a configurable recovery period, the circuit transitions to half-open to test if the backend has recovered.
 
 #### Operation Timeout
@@ -112,3 +114,12 @@ let config = CircuitBreakerConfig {
 - **Bug fix**: Redis `_batch_insert` now guards against empty input to avoid `MSET` with zero arguments
 - **Tests**: Added 7 new test cases — `push_limit`, `map_remove`/`list_remove` (DB level), empty list pop/get_index, empty map `remove_and_fetch`, large value (100KB), empty `batch_insert`/`batch_remove`
 - **Cleanup**: Removed hanging CB integration tests (redundant with lib.rs `test_init_db` coverage); fixed `init_db` return type and feature-gated imports in `lib.rs`
+
+### 0.10.3
+
+- **Unified breaker**: Map / List / DB now share a **single** `CircuitBreaker` instance instead of having independent breakers — one failure metric for all operation types, simpler concurrency model
+  - Removed outer `Mutex` — switched to clone-per-call `Arc<CircuitBreaker>` for true concurrent access
+  - `CbTimeoutWrapper<S>` — Tower service layer that injects timeouts inside the breaker chain so timeouts are counted as failures by `DefaultClassifier`
+  - Removed `RecordResult` hack and three-step `raw_call` — all three types now use a single `svc.call(req)`
+  - Removed `CBMapRequest` / `CBListRequest` — Map/List operations unified into `CBStorageRequest` with inline `StorageMap` / `StorageList` handles
+  - Removed `build_map_cb` / `build_list_cb` — Map/List share the DB-level breaker directly

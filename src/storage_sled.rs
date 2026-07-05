@@ -549,7 +549,7 @@ impl SledStorageDB {
                         Command::DBMapNew(db, name, expire_ms, res_tx) => {
                             let map =
                                 SledStorageMap::_new_expire(name.as_ref().to_vec(), expire_ms, db);
-                            res_tx.send(map).map_err(|_| err)
+                            res_tx.send(Ok(map)).map_err(|_| err)
                         }
                         Command::DBMapRemove(db, name, res_tx) => {
                             res_tx.send(db._map_remove(name.as_ref())).map_err(|_| err)
@@ -560,7 +560,7 @@ impl SledStorageDB {
                         Command::DBListNew(db, name, expire_ms, res_tx) => {
                             let list =
                                 SledStorageList::_new_expire(name.as_ref().to_vec(), expire_ms, db);
-                            res_tx.send(list).map_err(|_| err)
+                            res_tx.send(Ok(list)).map_err(|_| err)
                         }
                         Command::DBListRemove(db, name, res_tx) => {
                             res_tx.send(db._list_remove(name.as_ref())).map_err(|_| err)
@@ -1507,7 +1507,7 @@ impl StorageDB for SledStorageDB {
         &self,
         name: N,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::MapType> {
+    ) -> Self::MapType {
         SledStorageMap::new_expire(name.as_ref().to_vec(), expire, self.clone()).await
     }
 
@@ -1543,7 +1543,7 @@ impl StorageDB for SledStorageDB {
         &self,
         name: V,
         expire: Option<TimestampMillis>,
-    ) -> Result<Self::ListType> {
+    ) -> Self::ListType {
         SledStorageList::new_expire(name.as_ref().to_vec(), expire, self.clone()).await
     }
 
@@ -1981,33 +1981,74 @@ pub struct SledStorageMap {
 }
 
 impl SledStorageMap {
-    /// Creates a new map with optional expiration
+    /// Creates a new map with optional expiration.
+    ///
+    /// Errors during construction (e.g. command channel full, sled I/O) are
+    /// caught, logged, and a bare map handle is returned. Real errors are
+    /// deferred to operations on the returned map.
     #[inline]
-    async fn new_expire(
-        name: Key,
-        expire_ms: Option<TimestampMillis>,
-        db: SledStorageDB,
-    ) -> Result<Self> {
+    async fn new_expire(name: Key, expire_ms: Option<TimestampMillis>, db: SledStorageDB) -> Self {
         let (tx, rx) = oneshot::channel();
-        db.cmd_send(Command::DBMapNew(db.clone(), name.into(), expire_ms, tx))
-            .await?;
-        rx.await?
+        if db
+            .cmd_send(Command::DBMapNew(
+                db.clone(),
+                name.clone().into(),
+                expire_ms,
+                tx,
+            ))
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "sled command channel full, creating map '{}' without health check",
+                String::from_utf8_lossy(&name)
+            );
+            return Self::_new(name, db);
+        }
+        match rx.await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                log::warn!(
+                    "sled command returned error for map '{}': {e}",
+                    String::from_utf8_lossy(&name)
+                );
+                Self::_new(name, db)
+            }
+            Err(_) => {
+                log::warn!(
+                    "sled command dropped, creating map '{}' without health check",
+                    String::from_utf8_lossy(&name)
+                );
+                Self::_new(name, db)
+            }
+        }
     }
 
-    /// Internal method to create map with expiration
+    /// Internal method to create map with expiration.
+    /// Errors from sled I/O are caught and logged — the map handle is always
+    /// returned.
     #[inline]
-    fn _new_expire(
-        name: Key,
-        _expire_ms: Option<TimestampMillis>,
-        db: SledStorageDB,
-    ) -> Result<Self> {
+    fn _new_expire(name: Key, _expire_ms: Option<TimestampMillis>, db: SledStorageDB) -> Self {
         let m = Self::_new(name, db);
-        m.empty.store(m._is_empty()?, Ordering::SeqCst);
+        match m._is_empty() {
+            Ok(empty) => m.empty.store(empty, Ordering::SeqCst),
+            Err(e) => {
+                log::warn!(
+                    "sled map '{}' is_empty check failed: {e}",
+                    String::from_utf8_lossy(m.name())
+                );
+            }
+        }
         #[cfg(feature = "ttl")]
         if let Some(expire_ms) = _expire_ms.as_ref() {
-            m._expire_at(timestamp_millis() + *expire_ms)?;
+            if let Err(e) = m._expire_at(timestamp_millis() + *expire_ms) {
+                log::warn!(
+                    "sled map '{}' expire_at failed: {e}",
+                    String::from_utf8_lossy(m.name())
+                );
+            }
         }
-        Ok(m)
+        m
     }
 
     /// Internal method to create map
@@ -2777,32 +2818,65 @@ pub struct SledStorageList {
 }
 
 impl SledStorageList {
-    /// Creates a new list with optional expiration
+    /// Creates a new list with optional expiration.
+    ///
+    /// Errors during construction (e.g. command channel full, sled I/O) are
+    /// caught, logged, and a bare list handle is returned. Real errors are
+    /// deferred to operations on the returned list.
     #[inline]
-    async fn new_expire(
-        name: Key,
-        expire_ms: Option<TimestampMillis>,
-        db: SledStorageDB,
-    ) -> Result<Self> {
+    async fn new_expire(name: Key, expire_ms: Option<TimestampMillis>, db: SledStorageDB) -> Self {
         let (tx, rx) = oneshot::channel();
-        db.cmd_send(Command::DBListNew(db.clone(), name.into(), expire_ms, tx))
-            .await?;
-        rx.await?
+        if db
+            .cmd_send(Command::DBListNew(
+                db.clone(),
+                name.clone().into(),
+                expire_ms,
+                tx,
+            ))
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "sled command channel full, creating list '{}' without health check",
+                String::from_utf8_lossy(&name)
+            );
+            return Self::_new(name, db);
+        }
+        match rx.await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => {
+                log::warn!(
+                    "sled command returned error for list '{}': {e}",
+                    String::from_utf8_lossy(&name)
+                );
+                Self::_new(name, db)
+            }
+            Err(_) => {
+                log::warn!(
+                    "sled command dropped, creating list '{}' without health check",
+                    String::from_utf8_lossy(&name)
+                );
+                Self::_new(name, db)
+            }
+        }
     }
 
-    /// Internal method to create list with expiration
+    /// Internal method to create list with expiration.
+    /// Errors from sled I/O are caught and logged — the list handle is always
+    /// returned.
     #[inline]
-    fn _new_expire(
-        name: Key,
-        _expire_ms: Option<TimestampMillis>,
-        db: SledStorageDB,
-    ) -> Result<Self> {
+    fn _new_expire(name: Key, _expire_ms: Option<TimestampMillis>, db: SledStorageDB) -> Self {
         let l = Self::_new(name, db);
         #[cfg(feature = "ttl")]
         if let Some(expire_ms) = _expire_ms {
-            l._expire_at(timestamp_millis() + expire_ms)?;
+            if let Err(e) = l._expire_at(timestamp_millis() + expire_ms) {
+                log::warn!(
+                    "sled list '{}' expire_at failed: {e}",
+                    String::from_utf8_lossy(l.name())
+                );
+            }
         }
-        Ok(l)
+        l
     }
 
     /// Internal method to create list
