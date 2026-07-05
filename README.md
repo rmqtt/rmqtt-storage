@@ -115,7 +115,7 @@ let config = CircuitBreakerConfig {
 - **Tests**: Added 7 new test cases — `push_limit`, `map_remove`/`list_remove` (DB level), empty list pop/get_index, empty map `remove_and_fetch`, large value (100KB), empty `batch_insert`/`batch_remove`
 - **Cleanup**: Removed hanging CB integration tests (redundant with lib.rs `test_init_db` coverage); fixed `init_db` return type and feature-gated imports in `lib.rs`
 
-### 0.10.3
+### 0.10.2
 
 - **Unified breaker**: Map / List / DB now share a **single** `CircuitBreaker` instance instead of having independent breakers — one failure metric for all operation types, simpler concurrency model
   - Removed outer `Mutex` — switched to clone-per-call `Arc<CircuitBreaker>` for true concurrent access
