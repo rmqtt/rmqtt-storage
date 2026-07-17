@@ -240,7 +240,7 @@ fn def_cleanup(_db: &SledStorageDB) {
     {
         let db = _db.clone();
         std::thread::spawn(move || {
-            let limit = 500;
+            let limit = 5000;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 let mut total_cleanups = 0;
@@ -531,7 +531,7 @@ impl SledStorageDB {
         let active_count = Arc::new(AtomicIsize::new(0));
         let active_count1 = active_count.clone();
 
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<Command>(300_000);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<Command>(10_000);
         spawn_blocking(move || {
             Handle::current().block_on(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
