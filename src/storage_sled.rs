@@ -112,7 +112,7 @@ impl KeyType {
 /// Enum representing all possible storage operations
 enum Command {
     // Database operations
-    DBInsert(SledStorageDB, Key, Vec<u8>, oneshot::Sender<Result<()>>),
+    DBInsert(SledStorageDB, IVec, IVec, oneshot::Sender<Result<()>>),
     DBGet(SledStorageDB, IVec, oneshot::Sender<Result<Option<IVec>>>),
     DBRemove(SledStorageDB, IVec, oneshot::Sender<Result<()>>),
     DBMapNew(
@@ -480,8 +480,11 @@ impl BytesReplace for &[u8] {
 }
 
 /// Main database handle for Sled storage
-#[derive(Clone)]
-pub struct SledStorageDB {
+/// Internal fields shared via Arc to make clone cheap
+/// Internal fields shared via Arc to make clone cheap.
+/// Public for technical reasons; not part of the API contract.
+#[doc(hidden)]
+pub struct SledStorageDBInner {
     /// Underlying sled database
     pub(crate) db: Arc<sled::Db>,
     /// Tree for key-value storage
@@ -500,6 +503,18 @@ pub struct SledStorageDB {
     cmd_tx: mpsc::Sender<Command>,
     /// Count of active commands
     active_count: Arc<AtomicIsize>,
+}
+
+#[derive(Clone)]
+pub struct SledStorageDB {
+    inner: Arc<SledStorageDBInner>,
+}
+
+impl std::ops::Deref for SledStorageDB {
+    type Target = SledStorageDBInner;
+    fn deref(&self) -> &SledStorageDBInner {
+        &self.inner
+    }
 }
 
 impl SledStorageDB {
@@ -538,7 +553,7 @@ impl SledStorageDB {
                     let err = anyhow::Error::msg("send result fail");
                     let snd_res = match cmd {
                         Command::DBInsert(db, key, val, res_tx) => res_tx
-                            .send(db._insert(key.as_slice(), val.as_slice()))
+                            .send(db._insert(key.as_ref(), val.as_ref()))
                             .map_err(|_| err),
                         Command::DBGet(db, key, res_tx) => {
                             res_tx.send(db._get(key.as_ref())).map_err(|_| err)
@@ -707,14 +722,16 @@ impl SledStorageDB {
         });
 
         let db = Self {
-            db,
-            kv_tree,
-            map_tree,
-            list_tree,
-            expire_key_tree,
-            key_expire_tree,
-            cmd_tx,
-            active_count,
+            inner: Arc::new(SledStorageDBInner {
+                db,
+                kv_tree,
+                map_tree,
+                list_tree,
+                expire_key_tree,
+                key_expire_tree,
+                cmd_tx,
+                active_count,
+            }),
         };
 
         (cfg.cleanup_f)(&db);
@@ -1588,8 +1605,8 @@ impl StorageDB for SledStorageDB {
         let (tx, rx) = oneshot::channel();
         self.cmd_send(Command::DBInsert(
             self.clone(),
-            key.as_ref().to_vec(),
-            val,
+            key.as_ref().into(),
+            val.into(),
             tx,
         ))
         .await?;
@@ -1922,13 +1939,8 @@ impl SledStorageDB {
     #[inline]
     pub(crate) async fn insert_raw(&self, key: &[u8], val: &[u8]) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_send(Command::DBInsert(
-            self.clone(),
-            key.to_vec(),
-            val.to_vec(),
-            tx,
-        ))
-        .await?;
+        self.cmd_send(Command::DBInsert(self.clone(), key.into(), val.into(), tx))
+            .await?;
         rx.await??;
         Ok(())
     }
@@ -1967,13 +1979,13 @@ impl SledStorageDB {
 #[derive(Clone)]
 pub struct SledStorageMap {
     /// Map name
-    name: Key,
+    name: Arc<Key>,
     /// Prefix for map keys
-    map_prefix_name: Key,
+    map_prefix_name: Arc<Key>,
     /// Prefix for map items
-    map_item_prefix_name: Key,
+    map_item_prefix_name: Arc<Key>,
     /// Key for map count
-    map_count_key_name: Key,
+    map_count_key_name: Arc<Key>,
     /// Flag indicating if map is empty
     empty: Arc<AtomicBool>,
     /// Database handle
@@ -2054,11 +2066,12 @@ impl SledStorageMap {
     /// Internal method to create map
     #[inline]
     fn _new(name: Key, db: SledStorageDB) -> Self {
-        let map_prefix_name = SledStorageDB::make_map_prefix_name(name.as_slice());
-        let map_item_prefix_name = SledStorageDB::make_map_item_prefix_name(name.as_slice());
-        let map_count_key_name = SledStorageDB::make_map_count_key_name(name.as_slice());
+        let map_prefix_name = Arc::new(SledStorageDB::make_map_prefix_name(name.as_slice()));
+        let map_item_prefix_name =
+            Arc::new(SledStorageDB::make_map_item_prefix_name(name.as_slice()));
+        let map_count_key_name = Arc::new(SledStorageDB::make_map_count_key_name(name.as_slice()));
         SledStorageMap {
-            name,
+            name: Arc::new(name),
             map_prefix_name,
             map_item_prefix_name,
             map_count_key_name,
@@ -2327,12 +2340,10 @@ impl SledStorageMap {
     #[inline]
     fn _remove_with_prefix(&self, prefix: IVec) -> Result<()> {
         let tree = self.tree();
-        let prefix = [self.map_item_prefix_name.as_slice(), prefix.as_ref()]
-            .concat()
-            .to_vec();
+        let prefix = [self.map_item_prefix_name.as_slice(), prefix.as_ref()].concat();
 
         #[cfg(feature = "map_len")]
-        let map_count_key_name = self.map_count_key_name.to_vec();
+        let map_count_key_name = &self.map_count_key_name;
         {
             let mut removeds = Batch::default();
             #[cfg(feature = "map_len")]
@@ -2810,9 +2821,9 @@ impl Map for SledStorageMap {
 #[derive(Clone)]
 pub struct SledStorageList {
     /// List name
-    name: Key,
+    name: Arc<Key>,
     /// Prefix for list keys
-    prefix_name: Key,
+    prefix_name: Arc<Key>,
     /// Database handle
     pub(crate) db: SledStorageDB,
 }
@@ -2882,9 +2893,9 @@ impl SledStorageList {
     /// Internal method to create list
     #[inline]
     fn _new(name: Key, db: SledStorageDB) -> Self {
-        let prefix_name = SledStorageDB::make_list_prefix(name.as_slice());
+        let prefix_name = Arc::new(SledStorageDB::make_list_prefix(name.as_slice()));
         SledStorageList {
-            name,
+            name: Arc::new(name),
             prefix_name,
             db,
         }

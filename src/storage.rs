@@ -1,4 +1,4 @@
-//! Abstract storage layer with support for multiple backends (sled, Redis, Redis Cluster)
+//! Abstract storage layer with support for multiple backends (sled, Redis, Redis Cluster, Redb)
 //!
 //! Defines core storage traits and unified interfaces for:
 //! - Key-value storage (StorageDB)
