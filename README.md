@@ -14,7 +14,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rmqtt-storage = "0.10"
+rmqtt-storage = "0.11"
 ```
 
 ## Features
@@ -26,15 +26,17 @@ rmqtt-storage = "0.10"
 - Provides an implementation for 'sled'.
 - Provides an implementation for 'redis'.
 - Provides an implementation for 'redis cluster'. Note: the 'len' feature is not supported yet.
+- Provides an implementation for 'redb' (embedded ACID transactional B-Tree).
 - Uses [`postcard`](https://crates.io/crates/postcard) for binary serialization.
 - Asynchronous API with command-based architecture for thread-safe operations.
-- **Circuit Breaker** (optional): Protects Redis/Redis Cluster backends from cascading failures using [`tower-resilience-circuitbreaker`](https://crates.io/crates/tower-resilience-circuitbreaker). Configure failure thresholds, sliding windows, and automatic recovery.
+- **Circuit Breaker** (optional): Protects Redis/Redis Cluster/Redb backends from cascading failures using [`tower-resilience-circuitbreaker`](https://crates.io/crates/tower-resilience-circuitbreaker). Configure failure thresholds, sliding windows, and automatic recovery.
 
 ## Feature Flags
 
 | Feature | Description | Default |
 |---------|-------------|---------|
 | `sled` | Sled embedded database backend | no |
+| `redb` | Redb embedded ACID transactional backend | no |
 | `redis` | Single-node Redis backend | no |
 | `redis-cluster` | Redis Cluster distributed backend | no |
 | `ttl` | Key expiration / TTL support | no |
@@ -48,7 +50,7 @@ Enable the feature and wrap your storage with `CircuitBrokenDB`:
 
 ```toml
 [dependencies]
-rmqtt-storage = { version = "0.10", features = ["sled", "circuit-breaker"] }
+rmqtt-storage = { version = "0.11", features = ["sled", "circuit-breaker"] }
 ```
 
 ```rust
@@ -82,6 +84,26 @@ let config = CircuitBreakerConfig {
     operation_timeout: Some(Duration::from_secs(5)),
     ..CircuitBreakerConfig::default()
 };
+```
+
+## Examples
+
+The [`examples/session_storage_demo.rs`](examples/session_storage_demo.rs) simulates MQTT Broker session management, demonstrating all three core data structures:
+
+- **DB (KV)**: Client session info + counters
+- **Map**: Topic subscription management
+- **List**: Offline message queue
+
+Run with the sled backend (default):
+
+```bash
+cargo run --example session_storage_demo --features "sled,ttl,map_len,len"
+```
+
+Run with the redb backend:
+
+```bash
+cargo run --example session_storage_demo --features "redb,ttl,map_len,len" -- redb
 ```
 
 ## Changelog
@@ -123,3 +145,20 @@ let config = CircuitBreakerConfig {
   - Removed `RecordResult` hack and three-step `raw_call` — all three types now use a single `svc.call(req)`
   - Removed `CBMapRequest` / `CBListRequest` — Map/List operations unified into `CBStorageRequest` with inline `StorageMap` / `StorageList` handles
   - Removed `build_map_cb` / `build_list_cb` — Map/List share the DB-level breaker directly
+
+### 0.11.0 (current)
+
+- **Redb embedded backend** (new feature `redb`): Full ACID transactional storage backend built on [`redb`](https://github.com/cberner/redb) 4.1.0 — embedded B-Tree with MVCC, WAL, and fsync-guaranteed durability
+  - Same command-channel + `spawn_blocking` async architecture as sled
+  - 5 typed `TableDefinition<&[u8], &[u8]>` tables (`KV_TABLE`, `MAP_TABLE`, `LIST_TABLE`, `EXPIRE_KEYS_TABLE`, `KEY_EXPIRE_TABLE`)
+  - Every write operation wrapped in `begin_write()` + `commit()` for ACID guarantees
+  - Read operations use `begin_read()` for snapshot isolation
+  - Snapshot-collection iterators (eager `collect::<Vec>()` in read transaction)
+  - Full feature support: `ttl`, `len`, `map_len`, `circuit-breaker`
+  - Configurable cache size (default: 1GB) via `RedbConfig`
+  - Single-file storage — deployment-friendly, no external processes
+- **Test coverage (P0/P1/P2)**: 6 new tests covering previously untested `StorageDB::info()`, empty container iterators, `remove_with_prefix` edge cases, complex type ser/de through all 3 storage types, TTL on created Map/List, and scan with no match
+- **6-dimension test expansion**: 23 additional tests from 6 angles — cross-feature interaction (TTL+batch, TTL+counter, map_iter+modify, list state chain), concurrency (counter atomicity, concurrent read/write, map_iter consistency), data integrity (overwrite, clear+insert, counter sequence including isize::MAX/MIN, batch duplicate keys, remove_and_fetch idempotence), edge cases (empty/Unicode/binary keys, 1MB values, special characters in names, limit=0 push_limit, map/list name conflict), error handling (get/remove non-existent, double remove), dispatch correctness (name roundtrip for Map/List)
+- **Total test count**: 37 → **65** (redb) / 65+ (sled with circuit-breaker)
+- **Cross-backend compatibility**: Fixed `test_list_push_limit_zero` divergence between sled and redb; fixed `test_map_iter_while_modifying` cleanup approach; fixed `test_name_with_special_chars` name conflict
+- **Bug fix**: `exec_map_is_expired` and `exec_list_is_expired` in `storage_redb.rs` — fixed compilation error when using `_db` parameter name with `ttl` feature (compilation failed with `error[E0425]: cannot find value db`)

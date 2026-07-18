@@ -14,6 +14,8 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+#[cfg(feature = "redb")]
+use crate::storage_redb::{RedbStorageDB, RedbStorageList, RedbStorageMap};
 #[cfg(feature = "redis")]
 use crate::storage_redis::{RedisStorageDB, RedisStorageList, RedisStorageMap};
 #[cfg(feature = "redis-cluster")]
@@ -383,6 +385,9 @@ pub enum DefaultStorageDB {
     #[cfg(feature = "redis-cluster")]
     /// Redis Cluster backend
     RedisCluster(RedisClusterStorageDB),
+    #[cfg(feature = "redb")]
+    /// Redb backend
+    Redb(RedbStorageDB),
 }
 
 impl DefaultStorageDB {
@@ -402,6 +407,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::RedisCluster(db) => {
                 StorageMap::RedisCluster(db.map(name, expire).await)
             }
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => StorageMap::Redb(db.map(name, expire).await),
         }
     }
 
@@ -418,6 +425,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.map_remove(name).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.map_remove(name).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.map_remove(name).await,
         }
     }
 
@@ -431,6 +440,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.map_contains_key(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.map_contains_key(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.map_contains_key(key).await,
         }
     }
 
@@ -450,6 +461,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::RedisCluster(db) => {
                 StorageList::RedisCluster(db.list(name, expire).await)
             }
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => StorageList::Redb(db.list(name, expire).await),
         }
     }
 
@@ -466,6 +479,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.list_remove(name).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.list_remove(name).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.list_remove(name).await,
         }
     }
 
@@ -479,6 +494,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.list_contains_key(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.list_contains_key(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.list_contains_key(key).await,
         }
     }
 
@@ -496,6 +513,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.insert(key, val).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.insert(key, val).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.insert(key, val).await,
         }
     }
 
@@ -513,6 +532,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.get(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.get(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.get(key).await,
         }
     }
 
@@ -529,6 +550,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.remove(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.remove(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.remove(key).await,
         }
     }
 
@@ -545,6 +568,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.batch_insert(key_vals).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.batch_insert(key_vals).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.batch_insert(key_vals).await,
         }
     }
 
@@ -558,6 +583,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.batch_remove(keys).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.batch_remove(keys).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.batch_remove(keys).await,
         }
     }
 
@@ -574,6 +601,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.counter_incr(key, increment).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_incr(key, increment).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.counter_incr(key, increment).await,
         }
     }
 
@@ -590,6 +619,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.counter_decr(key, decrement).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_decr(key, decrement).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.counter_decr(key, decrement).await,
         }
     }
 
@@ -606,6 +637,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.counter_get(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_get(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.counter_get(key).await,
         }
     }
 
@@ -622,6 +655,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.counter_set(key, val).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.counter_set(key, val).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.counter_set(key, val).await,
         }
     }
 
@@ -636,6 +671,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.len().await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.len().await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.len().await,
         }
     }
 
@@ -649,6 +686,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.db_size().await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.db_size().await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.db_size().await,
         }
     }
 
@@ -662,6 +701,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.contains_key(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.contains_key(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.contains_key(key).await,
         }
     }
 
@@ -679,6 +720,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.expire_at(key, at).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.expire_at(key, at).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.expire_at(key, at).await,
         }
     }
 
@@ -696,6 +739,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.expire(key, dur).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.expire(key, dur).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.expire(key, dur).await,
         }
     }
 
@@ -713,6 +758,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.ttl(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.ttl(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.ttl(key).await,
         }
     }
 
@@ -728,6 +775,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.map_iter().await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.map_iter().await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.map_iter().await,
         }
     }
 
@@ -743,6 +792,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.list_iter().await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.list_iter().await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.list_iter().await,
         }
     }
 
@@ -762,6 +813,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.scan(pattern).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.scan(pattern).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.scan(pattern).await,
         }
     }
 
@@ -775,6 +828,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.info().await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.info().await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.info().await,
         }
     }
 }
@@ -792,6 +847,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.insert_raw(key, val).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.insert_raw(key, val).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.insert_raw(key, val).await,
         }
     }
 
@@ -803,6 +860,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.get_raw(key).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.get_raw(key).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.get_raw(key).await,
         }
     }
 
@@ -814,6 +873,8 @@ impl DefaultStorageDB {
             DefaultStorageDB::Redis(db) => db.batch_insert_raw(key_vals).await,
             #[cfg(feature = "redis-cluster")]
             DefaultStorageDB::RedisCluster(db) => db.batch_insert_raw(key_vals).await,
+            #[cfg(feature = "redb")]
+            DefaultStorageDB::Redb(db) => db.batch_insert_raw(key_vals).await,
         }
     }
 }
@@ -830,6 +891,9 @@ pub enum StorageMap {
     #[cfg(feature = "redis-cluster")]
     /// Redis Cluster map implementation
     RedisCluster(RedisClusterStorageMap),
+    #[cfg(feature = "redb")]
+    /// Redb map implementation
+    Redb(RedbStorageMap),
 }
 
 #[async_trait]
@@ -842,6 +906,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.name(),
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.name(),
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.name(),
         }
     }
 
@@ -857,6 +923,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.insert(key, val).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.insert(key, val).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.insert(key, val).await,
         }
     }
 
@@ -872,6 +940,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.get(key).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.get(key).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.get(key).await,
         }
     }
 
@@ -886,6 +956,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.remove(key).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove(key).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.remove(key).await,
         }
     }
 
@@ -897,6 +969,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.contains_key(key).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.contains_key(key).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.contains_key(key).await,
         }
     }
 
@@ -909,6 +983,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.len().await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.len().await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.len().await,
         }
     }
 
@@ -920,6 +996,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.is_empty().await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.is_empty().await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.is_empty().await,
         }
     }
 
@@ -931,6 +1009,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.clear().await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.clear().await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.clear().await,
         }
     }
 
@@ -946,6 +1026,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.remove_and_fetch(key).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove_and_fetch(key).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.remove_and_fetch(key).await,
         }
     }
 
@@ -960,6 +1042,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.remove_with_prefix(prefix).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove_with_prefix(prefix).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.remove_with_prefix(prefix).await,
         }
     }
 
@@ -974,6 +1058,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.batch_insert(key_vals).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.batch_insert(key_vals).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.batch_insert(key_vals).await,
         }
     }
 
@@ -985,6 +1071,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.batch_remove(keys).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.batch_remove(keys).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.batch_remove(keys).await,
         }
     }
 
@@ -1001,6 +1089,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.iter().await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.iter().await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.iter().await,
         }
     }
 
@@ -1014,6 +1104,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.key_iter().await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.key_iter().await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.key_iter().await,
         }
     }
 
@@ -1032,6 +1124,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.prefix_iter(prefix).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.prefix_iter(prefix).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.prefix_iter(prefix).await,
         }
     }
 
@@ -1044,6 +1138,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.expire_at(at).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.expire_at(at).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.expire_at(at).await,
         }
     }
 
@@ -1056,6 +1152,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.expire(dur).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.expire(dur).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.expire(dur).await,
         }
     }
 
@@ -1068,6 +1166,8 @@ impl Map for StorageMap {
             StorageMap::Redis(m) => m.ttl().await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.ttl().await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.ttl().await,
         }
     }
 }
@@ -1087,6 +1187,8 @@ impl StorageMap {
             StorageMap::Redis(m) => m.insert_raw(key, val).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.insert_raw(key, val).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.insert_raw(key, val).await,
         }
     }
 
@@ -1099,6 +1201,8 @@ impl StorageMap {
             StorageMap::Redis(m) => m.get_raw(key).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.get_raw(key).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.get_raw(key).await,
         }
     }
 
@@ -1111,6 +1215,8 @@ impl StorageMap {
             StorageMap::Redis(m) => m.remove_and_fetch_raw(key).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.remove_and_fetch_raw(key).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.remove_and_fetch_raw(key).await,
         }
     }
 
@@ -1123,6 +1229,8 @@ impl StorageMap {
             StorageMap::Redis(m) => m.batch_insert_raw(key_vals).await,
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(m) => m.batch_insert_raw(key_vals).await,
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(m) => m.batch_insert_raw(key_vals).await,
         }
     }
 }
@@ -1139,6 +1247,9 @@ pub enum StorageList {
     #[cfg(feature = "redis-cluster")]
     /// Redis Cluster list implementation
     RedisCluster(RedisClusterStorageList),
+    #[cfg(feature = "redb")]
+    /// Redb list implementation
+    Redb(RedbStorageList),
 }
 
 impl fmt::Debug for StorageList {
@@ -1150,6 +1261,8 @@ impl fmt::Debug for StorageList {
             StorageList::Redis(list) => list.name(),
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.name(),
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.name(),
         };
 
         f.debug_tuple(&format!("StorageList({:?})", String::from_utf8_lossy(name)))
@@ -1167,6 +1280,8 @@ impl List for StorageList {
             StorageList::Redis(m) => m.name(),
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(m) => m.name(),
+            #[cfg(feature = "redb")]
+            StorageList::Redb(m) => m.name(),
         }
     }
 
@@ -1181,6 +1296,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.push(val).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.push(val).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.push(val).await,
         }
     }
 
@@ -1195,6 +1312,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.pushs(vals).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.pushs(vals).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.pushs(vals).await,
         }
     }
 
@@ -1217,6 +1336,8 @@ impl List for StorageList {
             StorageList::RedisCluster(list) => {
                 list.push_limit(val, limit, pop_front_if_limited).await
             }
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.push_limit(val, limit, pop_front_if_limited).await,
         }
     }
 
@@ -1231,6 +1352,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.pop().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.pop().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.pop().await,
         }
     }
 
@@ -1245,6 +1368,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.all().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.all().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.all().await,
         }
     }
 
@@ -1259,6 +1384,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.get_index(idx).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.get_index(idx).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.get_index(idx).await,
         }
     }
 
@@ -1270,6 +1397,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.len().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.len().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.len().await,
         }
     }
 
@@ -1281,6 +1410,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.is_empty().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.is_empty().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.is_empty().await,
         }
     }
 
@@ -1292,6 +1423,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.clear().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.clear().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.clear().await,
         }
     }
 
@@ -1308,6 +1441,8 @@ impl List for StorageList {
             StorageList::Redis(list) => list.iter().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(list) => list.iter().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(list) => list.iter().await,
         }
     }
 
@@ -1320,6 +1455,8 @@ impl List for StorageList {
             StorageList::Redis(l) => l.expire_at(at).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.expire_at(at).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.expire_at(at).await,
         }
     }
 
@@ -1332,6 +1469,8 @@ impl List for StorageList {
             StorageList::Redis(l) => l.expire(dur).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.expire(dur).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.expire(dur).await,
         }
     }
 
@@ -1344,6 +1483,8 @@ impl List for StorageList {
             StorageList::Redis(l) => l.ttl().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.ttl().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.ttl().await,
         }
     }
 }
@@ -1361,6 +1502,8 @@ impl StorageList {
             StorageList::Redis(l) => l.push_raw(val).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.push_raw(val).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.push_raw(val).await,
         }
     }
 
@@ -1372,6 +1515,8 @@ impl StorageList {
             StorageList::Redis(l) => l.pushs_raw(vals).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.pushs_raw(vals).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.pushs_raw(vals).await,
         }
     }
 
@@ -1390,6 +1535,8 @@ impl StorageList {
             StorageList::RedisCluster(l) => {
                 l.push_limit_raw(val, limit, pop_front_if_limited).await
             }
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.push_limit_raw(val, limit, pop_front_if_limited).await,
         }
     }
 
@@ -1401,6 +1548,8 @@ impl StorageList {
             StorageList::Redis(l) => l.pop_raw().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.pop_raw().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.pop_raw().await,
         }
     }
 
@@ -1412,6 +1561,8 @@ impl StorageList {
             StorageList::Redis(l) => l.all_raw().await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.all_raw().await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.all_raw().await,
         }
     }
 
@@ -1423,6 +1574,8 @@ impl StorageList {
             StorageList::Redis(l) => l.get_index_raw(idx).await,
             #[cfg(feature = "redis-cluster")]
             StorageList::RedisCluster(l) => l.get_index_raw(idx).await,
+            #[cfg(feature = "redb")]
+            StorageList::Redb(l) => l.get_index_raw(idx).await,
         }
     }
 }

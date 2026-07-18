@@ -67,6 +67,8 @@ impl fmt::Debug for StorageMap {
             StorageMap::Redis(_) => write!(f, "RedisMap"),
             #[cfg(feature = "redis-cluster")]
             StorageMap::RedisCluster(_) => write!(f, "RedisClusterMap"),
+            #[cfg(feature = "redb")]
+            StorageMap::Redb(_) => write!(f, "RedbMap"),
         }
     }
 }

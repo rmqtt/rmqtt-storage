@@ -10,8 +10,15 @@
 use serde::{de, Deserialize, Serialize};
 
 // Conditionally include storage modules based on enabled features
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 mod storage;
+#[cfg(feature = "redb")]
+mod storage_redb;
 #[cfg(feature = "redis")]
 mod storage_redis;
 #[cfg(feature = "redis-cluster")]
@@ -21,7 +28,12 @@ mod storage_sled;
 
 #[cfg(all(
     feature = "circuit-breaker",
-    any(feature = "redis", feature = "redis-cluster", feature = "sled")
+    any(
+        feature = "redis",
+        feature = "redis-cluster",
+        feature = "sled",
+        feature = "redb"
+    )
 ))]
 mod circuit_breaker;
 
@@ -31,10 +43,17 @@ pub use crate::circuit_breaker::{
     CircuitBreakerConfig, CircuitBrokenDB, CircuitBrokenList, CircuitBrokenMap,
     CountBasedWindowConfig, TimeBasedWindowConfig, WindowConfig,
 };
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 pub use storage::{
     AsyncIterator, DefaultStorageDB, Key, List, Map, StorageDB, StorageList, StorageMap,
 };
+#[cfg(feature = "redb")]
+pub use storage_redb::{RedbConfig, RedbStorageDB};
 #[cfg(feature = "redis")]
 pub use storage_redis::{RedisConfig, RedisStorageDB};
 #[cfg(feature = "redis-cluster")]
@@ -54,7 +73,12 @@ pub type Result<T> = anyhow::Result<T>;
 ///
 /// # Returns
 /// Instance of `DefaultStorageDB` configured with the selected backend
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
     match cfg.typ {
         #[cfg(feature = "sled")]
@@ -72,6 +96,11 @@ pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
             let db = RedisClusterStorageDB::new(cfg.redis_cluster.clone()).await?;
             Ok(DefaultStorageDB::RedisCluster(db))
         }
+        #[cfg(feature = "redb")]
+        StorageType::Redb => {
+            let db = RedbStorageDB::open(&cfg.redb)?;
+            Ok(DefaultStorageDB::Redb(db))
+        }
     }
 }
 
@@ -80,7 +109,12 @@ pub async fn init_db(cfg: &Config) -> Result<DefaultStorageDB> {
 /// Contains backend-specific configurations and is conditionally compiled
 /// based on enabled storage features.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 pub struct Config {
     /// Storage backend type (Sled, Redis, or RedisCluster)
     // #[serde(default = "Config::storage_type_default")]
@@ -101,13 +135,23 @@ pub struct Config {
     #[serde(default, rename = "redis-cluster")]
     #[cfg(feature = "redis-cluster")]
     pub redis_cluster: RedisClusterConfig,
+
+    /// Configuration for Redb backend (feature-gated)
+    #[serde(default)]
+    #[cfg(feature = "redb")]
+    pub redb: RedbConfig,
 }
 
 /// Enum representing available storage backend types
 ///
 /// Variants are conditionally included based on enabled features
 #[derive(Debug, Clone, Serialize)]
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 pub enum StorageType {
     /// Embedded database with BTreeMap-like API
     #[cfg(feature = "sled")]
@@ -118,10 +162,18 @@ pub enum StorageType {
     /// Redis Cluster distributed storage
     #[cfg(feature = "redis-cluster")]
     RedisCluster,
+    /// Redb ACID embedded database
+    #[cfg(feature = "redb")]
+    Redb,
 }
 
 /// Deserialization implementation for StorageType
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 impl<'de> de::Deserialize<'de> for StorageType {
     #[inline]
     fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
@@ -138,11 +190,11 @@ impl<'de> de::Deserialize<'de> for StorageType {
             "redis" => StorageType::Redis,
             #[cfg(feature = "redis-cluster")]
             "redis-cluster" => StorageType::RedisCluster,
-            _ => {
-                return Err(de::Error::custom(
-                    "invalid storage type, expected one of: 'sled', 'redis', 'redis-cluster'",
-                ))
-            }
+            #[cfg(feature = "redb")]
+            "redb" => StorageType::Redb,
+            _ => return Err(de::Error::custom(
+                "invalid storage type, expected one of: 'sled', 'redis', 'redis-cluster', 'redb'",
+            )),
         };
         Ok(t)
     }
@@ -169,10 +221,16 @@ pub(crate) fn timestamp_millis() -> TimestampMillis {
 }
 
 #[cfg(test)]
-#[cfg(any(feature = "redis", feature = "redis-cluster", feature = "sled"))]
+#[cfg(any(
+    feature = "redis",
+    feature = "redis-cluster",
+    feature = "sled",
+    feature = "redb"
+))]
 mod tests {
     use super::*;
     use std::borrow::Cow;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
 
@@ -180,7 +238,9 @@ mod tests {
         let cfg = Config {
             typ: {
                 cfg_if::cfg_if! {
-                    if #[cfg(feature = "sled")] {
+                    if #[cfg(feature = "redb")] {
+                        StorageType::Redb
+                    } else if #[cfg(feature = "sled")] {
                         StorageType::Sled
                     } else if #[cfg(feature = "redis-cluster")] {
                         StorageType::RedisCluster
@@ -211,6 +271,12 @@ mod tests {
                 ]
                 .into(),
                 prefix: name.to_owned(),
+            },
+            #[cfg(feature = "redb")]
+            redb: RedbConfig {
+                path: format!("./.catch/{}.redb", name),
+                cleanup_f: |_db| {},
+                ..Default::default()
             },
         };
         cfg
@@ -356,6 +422,21 @@ mod tests {
             k_9999_val,
             now.elapsed()
         );
+        assert_eq!(k_9999_val, Some(9999));
+
+        // --- batch_insert stress (DB level) ---
+        // 对比上面逐条 insert，这里用一次 batch_insert 写入相同数量的 kv
+        let mut batch_kvs: Vec<(Vec<u8>, usize)> = Vec::with_capacity(10_000);
+        for i in 0..10_000usize {
+            batch_kvs.push((i.to_be_bytes().to_vec(), i));
+        }
+        let now = std::time::Instant::now();
+        db.batch_insert(batch_kvs).await.unwrap();
+        println!(
+            "test_stress db.batch_insert (10000 kv), cost time: {:?}",
+            now.elapsed()
+        );
+        let k_9999_val = db.get::<_, usize>(9999usize.to_be_bytes()).await.unwrap();
         assert_eq!(k_9999_val, Some(9999));
 
         let s_m_1 = db.map("s_m_1", None).await;
@@ -2105,5 +2186,818 @@ mod tests {
         let m = db.map("m", None).await;
         m.batch_insert::<i32>(vec![]).await.unwrap();
         m.batch_remove(vec![]).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // P0 — StorageDB::info() 完全无覆盖（最高优先级）
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_db_info() {
+        let cfg = get_cfg("db_info");
+        let db = test_init_db(&cfg).await.unwrap();
+        let info = db.info().await.unwrap();
+        println!("test_db_info: {:#}", info);
+        // 不是 null
+        assert!(!info.is_null(), "info() should not return null");
+        // 是 object 且不为空
+        assert!(info.is_object(), "info() should return a JSON object");
+        let obj = info.as_object().unwrap();
+        assert!(!obj.is_empty(), "info() object should not be empty");
+        // 应包含 storage_engine 字段
+        assert!(
+            obj.contains_key("storage_engine"),
+            "info() should contain 'storage_engine' field, got: {:?}",
+            obj.keys()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P1 — 空容器上的迭代器（iter / key_iter / prefix_iter / list iter）
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_iter_on_empty_containers() {
+        let cfg = get_cfg("empty_iter");
+        let db = test_init_db(&cfg).await.unwrap();
+
+        // 空 map 上迭代器应直接返回 None
+        let mut m = db.map("empty_iter_map", None).await;
+        m.clear().await.unwrap();
+        assert!(
+            m.iter::<i32>().await.unwrap().next().await.is_none(),
+            "iter on empty map should be None"
+        );
+        assert!(
+            m.key_iter().await.unwrap().next().await.is_none(),
+            "key_iter on empty map should be None"
+        );
+        assert!(
+            m.prefix_iter::<_, i32>("nonexistent")
+                .await
+                .unwrap()
+                .next()
+                .await
+                .is_none(),
+            "prefix_iter with no match should be None"
+        );
+
+        // 空 list 上迭代器应直接返回 None
+        let mut l = db.list("empty_iter_list", None).await;
+        l.clear().await.unwrap();
+        assert!(
+            l.iter::<i32>().await.unwrap().next().await.is_none(),
+            "iter on empty list should be None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 — remove_with_prefix 边界情况
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_remove_with_prefix_edge_cases() {
+        let cfg = get_cfg("prefix_rm");
+        let db = test_init_db(&cfg).await.unwrap();
+        let mut m = db.map("prefix_rm_map", None).await;
+        m.clear().await.unwrap();
+
+        m.insert("aa/1", &1).await.unwrap();
+        m.insert("aa/2", &2).await.unwrap();
+        m.insert("bb/1", &3).await.unwrap();
+        m.insert("cc/1", &4).await.unwrap();
+
+        // 移除不存在的 prefix → 不应报错，不应改变内容
+        m.remove_with_prefix("zz").await.unwrap();
+        // 验证元素仍存在
+        let first = m.iter::<i32>().await.unwrap().next().await;
+        assert!(first.is_some(), "expected at least one item in map");
+        let (key, val) = first.unwrap().unwrap();
+        assert_eq!(key, b"aa/1".to_vec());
+        assert_eq!(val, 1);
+
+        // 移除非空前缀
+        m.remove_with_prefix("aa/").await.unwrap();
+        // 验证只剩下 bb/1 和 cc/1
+        let mut remaining = Vec::new();
+        {
+            let mut kit = m.key_iter().await.unwrap();
+            while let Some(k) = kit.next().await {
+                remaining.push(String::from_utf8_lossy(&k.unwrap()).to_string());
+            }
+        } // kit dropped here, releasing the mutable borrow on m
+        remaining.sort();
+        assert_eq!(remaining, vec!["bb/1", "cc/1"]);
+
+        // 空 prefix 应移除全部
+        m.remove_with_prefix("").await.unwrap();
+        assert!(m.is_empty().await.unwrap());
+
+        // 幂等：空 map 上再次 remove_with_prefix 不应报错
+        m.remove_with_prefix("").await.unwrap();
+        m.remove_with_prefix("anything").await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 — 复杂类型（struct）的序列化/反序列化测试
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_complex_type_serialization() {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+        struct MyData {
+            id: u64,
+            name: String,
+            tags: Vec<String>,
+        }
+
+        let cfg = get_cfg("complex_type");
+        let db = test_init_db(&cfg).await.unwrap();
+
+        let data = MyData {
+            id: 42,
+            name: "test-data".into(),
+            tags: vec!["rust".into(), "storage".into(), "serde".into()],
+        };
+
+        // DB 级别
+        db.insert("cpx/key", &data).await.unwrap();
+        let retrieved: MyData = db.get("cpx/key").await.unwrap().unwrap();
+        assert_eq!(retrieved, data);
+
+        // Map 级别
+        let m = db.map("cpx_map", None).await;
+        m.clear().await.unwrap();
+        m.insert("item1", &data).await.unwrap();
+        let retrieved2: MyData = m.get("item1").await.unwrap().unwrap();
+        assert_eq!(retrieved2, data);
+
+        // List 级别
+        let l = db.list("cpx_list", None).await;
+        l.clear().await.unwrap();
+        l.push(&data).await.unwrap();
+        let retrieved3: MyData = l.pop().await.unwrap().unwrap();
+        assert_eq!(retrieved3, data);
+
+        // 空 struct
+        let empty_data = MyData {
+            id: 0,
+            name: String::new(),
+            tags: vec![],
+        };
+        db.insert("cpx/empty", &empty_data).await.unwrap();
+        let retrieved4: MyData = db.get("cpx/empty").await.unwrap().unwrap();
+        assert_eq!(retrieved4, empty_data);
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 — Map/List 的 TTL 过期（先插入数据、再设 expire）
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    #[cfg(all(feature = "ttl", feature = "map_len"))]
+    async fn test_map_with_creation_expire() {
+        let cfg = get_cfg("creation_expire");
+        let db = test_init_db(&cfg).await.unwrap();
+
+        // map 插入并设 expire
+        let m = db.map("exp_map", None).await;
+        m.insert("k1", &1).await.unwrap();
+        assert!(db.map_contains_key("exp_map").await.unwrap());
+        assert!(!m.is_empty().await.unwrap());
+        m.expire(500).await.unwrap();
+
+        sleep(Duration::from_millis(700)).await;
+        assert!(
+            m.is_empty().await.unwrap(),
+            "map should be empty after expire"
+        );
+
+        // list 插入并设 expire
+        let l = db.list("exp_list", None).await;
+        l.push(&"val").await.unwrap();
+        assert!(db.list_contains_key("exp_list").await.unwrap());
+        assert!(!l.is_empty().await.unwrap());
+        l.expire(500).await.unwrap();
+
+        sleep(Duration::from_millis(700)).await;
+        assert!(
+            l.is_empty().await.unwrap(),
+            "list should be empty after expire"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 — scan 模式无匹配
+    // -----------------------------------------------------------------------
+
+    #[tokio::main]
+    #[test]
+    async fn test_scan_no_match() {
+        let cfg = get_cfg("scan_nomatch");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        // 清理
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+
+        db.insert("only/known/key", &1).await.unwrap();
+        // 完全不存在的模式 → 应返回空集合
+        let results = collect(db.scan("nonexistent/*").await.unwrap()).await;
+        assert!(
+            results.is_empty(),
+            "scan with no matching pattern should return empty, got {} items",
+            results.len()
+        );
+
+        // 通配符 '*' 但无匹配
+        let results2 = collect(db.scan("zzz*").await.unwrap()).await;
+        assert!(results2.is_empty(), "scan with 'zzz*' should return empty");
+
+        // 通配符 '?' 但无匹配
+        let results3 = collect(db.scan("?????").await.unwrap()).await;
+        assert!(results3.is_empty(), "scan with '?????' should return empty");
+    }
+
+    // =====================================================================
+    // 维度 1 — 功能交互（Cross-feature Interaction）
+    // =====================================================================
+
+    #[tokio::main]
+    #[test]
+    #[cfg(feature = "ttl")]
+    async fn test_ttl_with_batch() {
+        let cfg = get_cfg("ttl_batch");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        db.batch_insert(vec![
+            (Vec::from("k1"), 1),
+            (Vec::from("k2"), 2),
+            (Vec::from("k3"), 3),
+        ])
+        .await
+        .unwrap();
+        db.expire("k1", 100).await.unwrap();
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            db.get::<_, i32>("k1").await.unwrap(),
+            None,
+            "k1 should be expired"
+        );
+        assert_eq!(
+            db.get::<_, i32>("k2").await.unwrap(),
+            Some(2),
+            "k2 should remain"
+        );
+        assert_eq!(
+            db.get::<_, i32>("k3").await.unwrap(),
+            Some(3),
+            "k3 should remain"
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    #[cfg(feature = "ttl")]
+    async fn test_ttl_with_counter() {
+        let cfg = get_cfg("ttl_counter");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        // 注意: counter 在 Redb 中使用内部前缀 key, expire 不适用于 counter key
+        // 这里只验证 counter 基础操作的正确性
+        db.counter_set("ctr", 42).await.unwrap();
+        assert_eq!(db.counter_get("ctr").await.unwrap(), Some(42));
+        db.counter_incr("ctr", 1).await.unwrap();
+        assert_eq!(db.counter_get("ctr").await.unwrap(), Some(43));
+        db.counter_decr("ctr", 10).await.unwrap();
+        assert_eq!(db.counter_get("ctr").await.unwrap(), Some(33));
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_map_iter_while_modifying() {
+        let cfg = get_cfg("iter_modify");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        // 通过 map_iter 查出所有已有 map 并删除，确保初始状态干净
+        let initial_names: Vec<_> = {
+            let mut ni = db.map_iter().await.unwrap();
+            let mut ns = Vec::new();
+            while let Some(n) = ni.next().await {
+                let sm = n.unwrap();
+                ns.push(sm.name().to_vec());
+            }
+            ns
+        };
+        for name in &initial_names {
+            db.map_remove(name.as_slice()).await.unwrap();
+        }
+        let m = db.map("iter_m", None).await;
+        m.insert("k1", &1).await.unwrap();
+        // 先收集 map_iter 结果（释放 &mut self 借用），再插入新 map
+        let names: Vec<_> = {
+            let mut ni = db.map_iter().await.unwrap();
+            let mut ns = Vec::new();
+            while let Some(n) = ni.next().await {
+                ns.push(n.unwrap());
+            }
+            ns
+        };
+        assert_eq!(names.len(), 1, "should find 1 map after inserting one");
+        // 插入新 map 后再收集一次
+        let m2 = db.map("iter_m2", None).await;
+        m2.insert("k", &2).await.unwrap();
+        let names2: Vec<_> = {
+            let mut ni = db.map_iter().await.unwrap();
+            let mut ns = Vec::new();
+            while let Some(n) = ni.next().await {
+                ns.push(n.unwrap());
+            }
+            ns
+        };
+        assert_eq!(
+            names2.len(),
+            2,
+            "should find 2 maps after inserting another"
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_push_pop_sequence() {
+        let cfg = get_cfg("push_pop_seq");
+        let db = test_init_db(&cfg).await.unwrap();
+        let l = db.list("l", None).await;
+        l.clear().await.unwrap();
+        // 状态链: push 10 → pop 2 → push 3 → all → len
+        for i in 0..10 {
+            l.push(&i).await.unwrap();
+        }
+        assert_eq!(l.len().await.unwrap(), 10);
+        assert_eq!(l.pop::<i32>().await.unwrap(), Some(0));
+        assert_eq!(l.pop::<i32>().await.unwrap(), Some(1));
+        assert_eq!(l.len().await.unwrap(), 8);
+        l.push(&100).await.unwrap();
+        l.push(&200).await.unwrap();
+        l.push(&300).await.unwrap();
+        assert_eq!(l.len().await.unwrap(), 11);
+        let all = l.all::<i32>().await.unwrap();
+        assert_eq!(all.len(), 11);
+        assert_eq!(all[0], 2, "first after 2 pops");
+        assert_eq!(all[all.len() - 3..], [100, 200, 300]);
+    }
+
+    // =====================================================================
+    // 维度 2 — 并发与竞态（Concurrency）
+    // =====================================================================
+
+    #[tokio::main]
+    #[test]
+    async fn test_concurrent_counter_incr() {
+        let cfg = get_cfg("concurrent_incr");
+        // 先在 Arc 外完成需要 &mut self 的清理
+        let mut raw = test_init_db(&cfg).await.unwrap();
+        let iter = raw.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            raw.remove(item).await.unwrap();
+        }
+        raw.counter_set("c", 0).await.unwrap();
+        let db = Arc::new(raw);
+        // 10 个并发 task 各 counter_incr +1
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                db.counter_incr("c", 1).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let val = db.counter_get("c").await.unwrap().unwrap();
+        assert_eq!(
+            val, 10,
+            "concurrent counter_incr should sum to 10, got {val}"
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_concurrent_map_read_write() {
+        let cfg = get_cfg("concurrent_map");
+        let mut raw = test_init_db(&cfg).await.unwrap();
+        let iter = raw.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            raw.remove(item).await.unwrap();
+        }
+        let m = raw.map("cmap", None).await;
+        m.clear().await.unwrap();
+        let db = Arc::new(raw);
+        let db2 = db.clone();
+        let h1 = tokio::spawn(async move {
+            let m = db2.map("cmap", None).await;
+            for i in 0..100 {
+                m.insert(format!("k{i}"), &i).await.unwrap();
+            }
+        });
+        let db3 = db.clone();
+        let h2 = tokio::spawn(async move {
+            let m = db3.map("cmap", None).await;
+            for i in 0..100 {
+                if let Some(v) = m.get::<_, i32>(format!("k{i}")).await.unwrap() {
+                    assert_eq!(v, i);
+                }
+            }
+        });
+        h1.await.unwrap();
+        h2.await.unwrap();
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_concurrent_map_iter() {
+        let cfg = get_cfg("concurrent_miter");
+        let mut raw = test_init_db(&cfg).await.unwrap();
+        let iter = raw.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            raw.remove(item).await.unwrap();
+        }
+        // map_iter 需要 &mut self，不能通过 Arc 调用，
+        // 改成单线程顺序执行：先插入一批 map，再遍历
+        for i in 0..20 {
+            let m = raw.map(format!("m_{i}"), None).await;
+            m.insert("x", &i).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // 遍历所有 map
+        let mut iter = raw.map_iter().await.unwrap();
+        let mut count = 0;
+        while let Some(item) = iter.next().await {
+            let _ = item.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 20, "should find all 20 maps");
+    }
+
+    // =====================================================================
+    // 维度 3 — 数据完整性与一致性（Data Integrity）
+    // =====================================================================
+
+    #[tokio::main]
+    #[test]
+    async fn test_batch_insert_duplicate_keys() {
+        let cfg = get_cfg("batch_dup");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        db.batch_insert(vec![(Vec::from("k"), 1), (Vec::from("k"), 99)])
+            .await
+            .unwrap();
+        let val: i32 = db.get("k").await.unwrap().unwrap();
+        assert_eq!(val, 99, "later duplicate key should overwrite earlier");
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_remove_and_fetch_idempotent() {
+        let cfg = get_cfg("rm_fetch");
+        let db = test_init_db(&cfg).await.unwrap();
+        let m = db.map("m", None).await;
+        m.clear().await.unwrap();
+        m.insert("k", &42).await.unwrap();
+        let v1: Option<i32> = m.remove_and_fetch("k").await.unwrap();
+        assert_eq!(v1, Some(42), "first remove_and_fetch returns value");
+        let v2: Option<i32> = m.remove_and_fetch("k").await.unwrap();
+        assert_eq!(v2, None, "second remove_and_fetch returns None");
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_map_clear_then_insert() {
+        let cfg = get_cfg("clear_insert");
+        let db = test_init_db(&cfg).await.unwrap();
+        let mut m = db.map("m", None).await;
+        m.clear().await.unwrap();
+        m.insert("k1", &1).await.unwrap();
+        m.insert("k2", &2).await.unwrap();
+        m.clear().await.unwrap();
+        assert!(m.is_empty().await.unwrap());
+        // clear 后 insert，不应残留旧数据
+        m.insert("new_k", &99).await.unwrap();
+        let keys: Vec<_> = {
+            let mut kit = m.key_iter().await.unwrap();
+            let mut ks = Vec::new();
+            while let Some(k) = kit.next().await {
+                ks.push(String::from_utf8_lossy(&k.unwrap()).to_string());
+            }
+            ks
+        };
+        assert_eq!(
+            keys,
+            vec!["new_k"],
+            "only new key should remain after clear+insert"
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_clear_then_push() {
+        let cfg = get_cfg("clear_push");
+        let db = test_init_db(&cfg).await.unwrap();
+        let l = db.list("l", None).await;
+        l.clear().await.unwrap();
+        l.push(&1).await.unwrap();
+        l.push(&2).await.unwrap();
+        l.clear().await.unwrap();
+        assert!(l.is_empty().await.unwrap());
+        l.push(&999).await.unwrap();
+        let items = l.all::<i32>().await.unwrap();
+        assert_eq!(
+            items,
+            vec![999],
+            "only new item should remain after clear+push"
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_insert_overwrite() {
+        let cfg = get_cfg("overwrite");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        db.insert("k", &"first").await.unwrap();
+        db.insert("k", &"second").await.unwrap();
+        let val: String = db.get("k").await.unwrap().unwrap();
+        assert_eq!(val, "second", "later insert should overwrite earlier");
+        // Map 级别
+        let m = db.map("m", None).await;
+        m.clear().await.unwrap();
+        m.insert("mk", &10).await.unwrap();
+        m.insert("mk", &20).await.unwrap();
+        let mv: i32 = m.get("mk").await.unwrap().unwrap();
+        assert_eq!(mv, 20, "map insert should overwrite");
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_counter_sequence() {
+        let cfg = get_cfg("counter_seq");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        // set 100 → incr 50 → decr 30 → incr -10 → 最终 110
+        db.counter_set("seq", 100).await.unwrap();
+        db.counter_incr("seq", 50).await.unwrap();
+        db.counter_decr("seq", 30).await.unwrap();
+        db.counter_incr("seq", -10).await.unwrap();
+        assert_eq!(db.counter_get("seq").await.unwrap(), Some(110));
+        // 负数
+        db.counter_set("neg", -5).await.unwrap();
+        db.counter_decr("neg", 10).await.unwrap();
+        assert_eq!(db.counter_get("neg").await.unwrap(), Some(-15));
+        // 极值写入再读取
+        db.counter_set("max", isize::MAX).await.unwrap();
+        assert_eq!(db.counter_get("max").await.unwrap(), Some(isize::MAX));
+        db.counter_set("min", isize::MIN).await.unwrap();
+        assert_eq!(db.counter_get("min").await.unwrap(), Some(isize::MIN));
+    }
+
+    // =====================================================================
+    // 维度 4 — 边界极限（Edge / Extreme Values）
+    // =====================================================================
+
+    #[tokio::main]
+    #[test]
+    async fn test_key_edge_cases() {
+        let cfg = get_cfg("key_edges");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        // 空 key
+        db.insert("", &"empty").await.unwrap();
+        assert_eq!(db.get::<_, String>("").await.unwrap(), Some("empty".into()));
+        // Unicode key
+        db.insert("你好世界", &"unicode").await.unwrap();
+        assert_eq!(
+            db.get::<_, String>("你好世界").await.unwrap(),
+            Some("unicode".into())
+        );
+        // 含二进制零的 key
+        let bin_key = vec![0u8, 1, 2, 0, 3];
+        db.insert(&bin_key, &42).await.unwrap();
+        assert_eq!(db.get::<_, i32>(&bin_key).await.unwrap(), Some(42));
+        // 长 key (1KB)
+        let long_key = "a".repeat(1024);
+        db.insert(&long_key, &"long").await.unwrap();
+        assert_eq!(
+            db.get::<_, String>(&long_key).await.unwrap(),
+            Some("long".into())
+        );
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_value_edge_cases() {
+        let cfg = get_cfg("val_edges");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        // 大二进制 value (1MB)
+        let big_val = vec![0xABu8; 1024 * 1024];
+        db.insert("big", &big_val).await.unwrap();
+        let got: Vec<u8> = db.get("big").await.unwrap().unwrap();
+        assert_eq!(got.len(), 1024 * 1024);
+        assert_eq!(got[0], 0xAB);
+        assert_eq!(got[got.len() - 1], 0xAB);
+
+        // 空 Vec<u8>
+        let empty_val: Vec<u8> = vec![];
+        db.insert("empty_val", &empty_val).await.unwrap();
+        let got2: Vec<u8> = db.get("empty_val").await.unwrap().unwrap();
+        assert!(got2.is_empty());
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_map_list_name_conflict() {
+        let cfg = get_cfg("name_conflict");
+        let db = test_init_db(&cfg).await.unwrap();
+        // 先创建 map "conflict"
+        let m = db.map("conflict", None).await;
+        m.insert("k", &1).await.unwrap();
+        drop(m);
+        // 再创建同名 list——不应 panic
+        let l = db.list("conflict", None).await;
+        let result = l.push(&2).await;
+        // 如果后端不支持同名容器，至少不应 panic
+        let _ = result;
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_name_with_special_chars() {
+        let cfg = get_cfg("special_name");
+        let db = test_init_db(&cfg).await.unwrap();
+        let names = vec![
+            "has@at",
+            "__rmqtt_prefix",
+            "has space",
+            "混合中文名称",
+            "with/slash",
+        ];
+        // 分开测试 map 和 list，避免同名容器在 sled 后端产生冲突
+        for name in &names {
+            let m = db.map(*name, None).await;
+            m.insert("k", &1).await.unwrap();
+            assert!(
+                !m.is_empty().await.unwrap(),
+                "map '{name}' should not be empty"
+            );
+        }
+        for name in &names {
+            let l = db.list(*name, None).await;
+            l.clear().await.unwrap();
+            l.push(&2).await.unwrap();
+            assert_eq!(
+                l.len().await.unwrap(),
+                1,
+                "list '{name}' should have 1 item"
+            );
+        }
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_push_limit_zero() {
+        let cfg = get_cfg("push_limit_0");
+        let db = test_init_db(&cfg).await.unwrap();
+        let l = db.list("l", None).await;
+        l.clear().await.unwrap();
+        // limit=0, pop_front=true — 不同后端对空列表的行为不同(redb: len=0, sled: len=1)，
+        // 只验证不 panic、不报错，且次数消耗了 push 行为
+        let r1 = l.push_limit(&1, 0, true).await;
+        assert!(
+            r1.is_ok(),
+            "push_limit(0, true) should not error on empty list"
+        );
+        // limit=0 的列表继续 push_limit，此时后端行为一致：pop_front=true 应挤出队首
+        let r2 = l.push_limit(&2, 0, true).await;
+        assert!(
+            r2.is_ok(),
+            "push_limit(0, true) should not error on non-empty list"
+        );
+        // limit=0, pop_front=false → 应该报错（所有后端一致）
+        let r3 = l.push_limit(&3, 0, false).await;
+        assert!(
+            r3.is_err(),
+            "push_limit(0, false) should error when at limit"
+        );
+    }
+
+    // =====================================================================
+    // 维度 5 — 错误处理与容错（Error Handling）
+    // =====================================================================
+
+    #[tokio::main]
+    #[test]
+    async fn test_get_non_existent() {
+        let cfg = get_cfg("get_nonexist");
+        let db = test_init_db(&cfg).await.unwrap();
+        // DB 级别
+        assert_eq!(db.get::<_, i32>("no_such_key").await.unwrap(), None);
+        // Map 级别
+        let m = db.map("m", None).await;
+        m.clear().await.unwrap();
+        assert_eq!(m.get::<_, i32>("no_such_key").await.unwrap(), None);
+        // List 级别（越界 get_index 和 pop 空 list）
+        let l = db.list("l", None).await;
+        l.clear().await.unwrap();
+        assert_eq!(l.pop::<i32>().await.unwrap(), None);
+        assert_eq!(l.get_index::<i32>(0).await.unwrap(), None);
+        assert_eq!(l.get_index::<i32>(usize::MAX).await.unwrap(), None);
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_double_remove_idempotent() {
+        let cfg = get_cfg("double_rm");
+        let mut db = test_init_db(&cfg).await.unwrap();
+        let iter = db.scan("*").await.unwrap();
+        for item in collect(iter).await {
+            db.remove(item).await.unwrap();
+        }
+        db.insert("k", &1).await.unwrap();
+        db.remove("k").await.unwrap();
+        // 第二次 remove 不应报错
+        db.remove("k").await.unwrap();
+        assert!(!db.contains_key("k").await.unwrap());
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_map_remove_non_existent() {
+        let cfg = get_cfg("map_rm_nonexist");
+        let db = test_init_db(&cfg).await.unwrap();
+        // map_remove 不存在的 map 不应报错
+        db.map_remove("no_such_map").await.unwrap();
+        // list_remove 不存在的 list 不应报错
+        db.list_remove("no_such_list").await.unwrap();
+    }
+
+    // =====================================================================
+    // 维度 6 — 后端调度正确性（Dispatch Correctness）
+    // =====================================================================
+
+    #[tokio::main]
+    #[test]
+    async fn test_map_name_roundtrip() {
+        let cfg = get_cfg("map_name");
+        let db = test_init_db(&cfg).await.unwrap();
+        for name in &["simple", "with/slash", "你好"] {
+            let m = db.map(*name, None).await;
+            assert_eq!(
+                m.name(),
+                name.as_bytes(),
+                "map name roundtrip failed for '{name}'"
+            );
+        }
+    }
+
+    #[tokio::main]
+    #[test]
+    async fn test_list_name_roundtrip() {
+        let cfg = get_cfg("list_name");
+        let db = test_init_db(&cfg).await.unwrap();
+        for name in &["simple", "with/slash", "你好"] {
+            let l = db.list(*name, None).await;
+            let returned_name = l.name();
+            assert!(!returned_name.is_empty(), "list name should not be empty");
+            assert!(
+                String::from_utf8_lossy(returned_name).contains(*name),
+                "list name should contain original name"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rmqtt-storage"
-version = "0.10.2"
+version = "0.11.0"
 authors = ["rmqtt <rmqttd@126.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -24,12 +24,14 @@ map_len = []
 len = []
 sled = ["dep:sled"]
 redis = ["dep:redis"]
+redb = ["dep:redb"]
 redis-cluster = ["redis", "redis/cluster", "redis/cluster-async"]
 circuit-breaker = ["dep:tower", "dep:tower-resilience-circuitbreaker"]
 
 [dependencies]
 sled = { version = "0.34", optional = true }
 redis = { version = "=0.32.6", features = [ "tokio-comp", "safe_iterators", "connection-manager"], optional = true }
+redb = { version = "=4.1.0", optional = true }
 
 tokio = { version = "1", features = ["sync", "rt", "time"] }
 futures = "0.3"
