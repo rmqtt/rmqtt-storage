@@ -79,7 +79,9 @@ async fn init_database() -> DefaultStorageDB {
                     ..Default::default()
                 },
             };
-            rmqtt_storage::init_db(&cfg).await.expect("sled init failed")
+            rmqtt_storage::init_db(&cfg)
+                .await
+                .expect("sled init failed")
         }
         #[cfg(feature = "redb")]
         "redb" => {
@@ -90,7 +92,9 @@ async fn init_database() -> DefaultStorageDB {
                     ..Default::default()
                 },
             };
-            rmqtt_storage::init_db(&cfg).await.expect("redb init failed")
+            rmqtt_storage::init_db(&cfg)
+                .await
+                .expect("redb init failed")
         }
         _ => {
             let available: Vec<&str> = vec![
@@ -141,7 +145,9 @@ async fn session_management(db: &DefaultStorageDB) {
     };
 
     let key = format!("session:{}", client_id);
-    db.insert(&key, &session).await.expect("insert session failed");
+    db.insert(&key, &session)
+        .await
+        .expect("insert session failed");
     ok!("inserted session: {}", client_id);
 
     let exists = db.contains_key(&key).await.expect("contains_key failed");
@@ -158,19 +164,34 @@ async fn session_management(db: &DefaultStorageDB) {
     let counter_key = "stat:connections";
 
     for _ in 0..5 {
-        db.counter_incr(counter_key, 1).await.expect("counter_incr failed");
+        db.counter_incr(counter_key, 1)
+            .await
+            .expect("counter_incr failed");
     }
-    let count: Option<isize> = db.counter_get(counter_key).await.expect("counter_get failed");
+    let count: Option<isize> = db
+        .counter_get(counter_key)
+        .await
+        .expect("counter_get failed");
     assert_eq!(count, Some(5));
     ok!("counter value: {:?}", count);
 
-    db.counter_decr(counter_key, 2).await.expect("counter_decr failed");
-    let count: Option<isize> = db.counter_get(counter_key).await.expect("counter_get failed");
+    db.counter_decr(counter_key, 2)
+        .await
+        .expect("counter_decr failed");
+    let count: Option<isize> = db
+        .counter_get(counter_key)
+        .await
+        .expect("counter_get failed");
     assert_eq!(count, Some(3));
     ok!("counter after decrement: {:?}", count);
 
-    db.counter_set(counter_key, 100).await.expect("counter_set failed");
-    let count: Option<isize> = db.counter_get(counter_key).await.expect("counter_get failed");
+    db.counter_set(counter_key, 100)
+        .await
+        .expect("counter_set failed");
+    let count: Option<isize> = db
+        .counter_get(counter_key)
+        .await
+        .expect("counter_get failed");
     assert_eq!(count, Some(100));
     ok!("counter after reset: {:?}", count);
 
@@ -193,15 +214,22 @@ async fn session_management(db: &DefaultStorageDB) {
 
     // --- 2d. Remove ---
     info!("--- 2d. Remove sessions ---");
-    db.remove("session:client_003").await.expect("remove failed");
-    let exists = db.contains_key("session:client_003").await.expect("contains_key failed");
+    db.remove("session:client_003")
+        .await
+        .expect("remove failed");
+    let exists = db
+        .contains_key("session:client_003")
+        .await
+        .expect("contains_key failed");
     assert!(!exists);
     ok!("removed session:client_003");
 
     let keys_to_remove: Vec<_> = (4..=5)
         .map(|i| format!("session:client_{:03}", i).into_bytes())
         .collect();
-    db.batch_remove(keys_to_remove).await.expect("batch_remove failed");
+    db.batch_remove(keys_to_remove)
+        .await
+        .expect("batch_remove failed");
     ok!("batch removed session:client_004, client_005");
 }
 
@@ -225,7 +253,10 @@ async fn subscription_management(db: &DefaultStorageDB) {
     ];
 
     for (topic, qos) in &topics {
-        sub_map.insert(topic, qos).await.expect("insert subscription failed");
+        sub_map
+            .insert(topic, qos)
+            .await
+            .expect("insert subscription failed");
     }
     ok!("inserted {} topic subscriptions", topics.len());
 
@@ -235,7 +266,10 @@ async fn subscription_management(db: &DefaultStorageDB) {
     assert_eq!(qos, Some(1));
     ok!("sensor/temperature QoS: {:?}", qos);
 
-    let exists = sub_map.contains_key("home/kitchen/light").await.expect("contains_key failed");
+    let exists = sub_map
+        .contains_key("home/kitchen/light")
+        .await
+        .expect("contains_key failed");
     assert!(exists);
     ok!("home/kitchen/light exists: {:?}", exists);
 
@@ -298,7 +332,10 @@ async fn subscription_management(db: &DefaultStorageDB) {
         .remove_with_prefix("home/")
         .await
         .expect("remove_with_prefix failed");
-    let exists = sub_map.contains_key("home/livingroom/light").await.expect("contains_key failed");
+    let exists = sub_map
+        .contains_key("home/livingroom/light")
+        .await
+        .expect("contains_key failed");
     assert!(!exists);
     ok!("all subscriptions under home/ removed");
 
@@ -309,7 +346,10 @@ async fn subscription_management(db: &DefaultStorageDB) {
         let k = format!("device/{}/status", i);
         batch.push((k.into_bytes(), i));
     }
-    sub_map.batch_insert(batch).await.expect("batch_insert failed");
+    sub_map
+        .batch_insert(batch)
+        .await
+        .expect("batch_insert failed");
     #[cfg(feature = "map_len")]
     {
         let map_len = sub_map.len().await.expect("map len failed");
@@ -320,7 +360,10 @@ async fn subscription_management(db: &DefaultStorageDB) {
     let batch_keys: Vec<_> = (0..50)
         .map(|i| format!("device/{}/status", i).into_bytes())
         .collect();
-    sub_map.batch_remove(batch_keys).await.expect("batch_remove failed");
+    sub_map
+        .batch_remove(batch_keys)
+        .await
+        .expect("batch_remove failed");
     ok!("batch removed 50 subscriptions");
 
     // --- 3i. is_empty & clear ---
@@ -461,7 +504,9 @@ async fn ttl_demo(db: &DefaultStorageDB) {
 
     // --- 5a. DB-level TTL ---
     info!("--- 5a. DB-level TTL ---");
-    db.insert("temp_key", &"will_expire".to_string()).await.expect("insert failed");
+    db.insert("temp_key", &"will_expire".to_string())
+        .await
+        .expect("insert failed");
 
     let ttl_before = db.ttl("temp_key").await.expect("ttl failed");
     info!("TTL before setting: {:?}", ttl_before);
@@ -491,7 +536,10 @@ async fn ttl_demo(db: &DefaultStorageDB) {
     info!("Sleeping 2.5s to wait for expiration...");
     tokio::time::sleep(Duration::from_millis(2500)).await;
 
-    let exists = db.contains_key("temp_key").await.expect("contains_key failed");
+    let exists = db
+        .contains_key("temp_key")
+        .await
+        .expect("contains_key failed");
     ok!("temp_key expired: {:?}", !exists);
 
     // expire_at
@@ -583,14 +631,24 @@ async fn cleanup_map_and_list(db: &DefaultStorageDB) {
     info!("\n===== 7. Cleanup Map and List =====");
 
     info!("--- 7a. Remove Map ---");
-    db.map_remove("subscriptions:client_001").await.expect("map_remove failed");
-    let exists = db.map_contains_key("subscriptions:client_001").await.expect("map_contains_key failed");
+    db.map_remove("subscriptions:client_001")
+        .await
+        .expect("map_remove failed");
+    let exists = db
+        .map_contains_key("subscriptions:client_001")
+        .await
+        .expect("map_contains_key failed");
     assert!(!exists);
     ok!("Map removed");
 
     info!("--- 7b. Remove List ---");
-    db.list_remove("offline:client_001").await.expect("list_remove failed");
-    let exists = db.list_contains_key("offline:client_001").await.expect("list_contains_key failed");
+    db.list_remove("offline:client_001")
+        .await
+        .expect("list_remove failed");
+    let exists = db
+        .list_contains_key("offline:client_001")
+        .await
+        .expect("list_contains_key failed");
     assert!(!exists);
     ok!("List removed");
 }
@@ -660,7 +718,9 @@ async fn main() {
             let key = format!("bench:{}", i);
             batch.push((key.into_bytes(), i));
         }
-        db.batch_insert(batch).await.expect("batch bench insert failed");
+        db.batch_insert(batch)
+            .await
+            .expect("batch bench insert failed");
         let elapsed = now.elapsed();
         info!(
             "batch insert 10,000 items: {:?} ({:.0} ops/s)",
@@ -668,7 +728,10 @@ async fn main() {
             10_000.0 / elapsed.as_secs_f64()
         );
 
-        let v: Option<usize> = db.get("bench:19999").await.expect("batch bench verify failed");
+        let v: Option<usize> = db
+            .get("bench:19999")
+            .await
+            .expect("batch bench verify failed");
         assert_eq!(v, Some(19999));
         ok!("verified bench:19999 = {}", v.unwrap());
     }

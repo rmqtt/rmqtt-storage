@@ -19,17 +19,19 @@ rmqtt-storage = "0.11"
 
 ## Features
 
-- Supports basic operations of key-value libraries.
-- Supports Map data type and related operations.
-- Supports List data type and related operations.
-- Supports key expiration.
-- Provides an implementation for 'sled'.
-- Provides an implementation for 'redis'.
-- Provides an implementation for 'redis cluster'. Note: the 'len' feature is not supported yet.
-- Provides an implementation for 'redb' (embedded ACID transactional B-Tree).
-- Uses [`postcard`](https://crates.io/crates/postcard) for binary serialization.
-- Asynchronous API with command-based architecture for thread-safe operations.
-- **Circuit Breaker** (optional): Protects Redis/Redis Cluster/Redb backends from cascading failures using [`tower-resilience-circuitbreaker`](https://crates.io/crates/tower-resilience-circuitbreaker). Configure failure thresholds, sliding windows, and automatic recovery.
+- **KV operations**: Insert, get, remove, contains_key, batch insert/remove
+- **Map data type**: Named key-value maps with iter, prefix_iter, key_iter, clear, remove_with_prefix, remove_and_fetch, batch ops, and TTL support
+- **List data type**: Ordered lists with push, pop, pushs, push_limit, get_index, all, iter, clear, and TTL support
+- **Counters**: Atomic increment/decrement/set/get for isize values
+- **Key expiration** (`ttl` feature): Per-key and per-collection TTL with background cleanup
+- **Storage backends**:
+  - **sled**: Embedded database (BTreeMap-like). Supports all optional features (`ttl`, `len`, `map_len`).
+  - **redis**: Single-node Redis backend. Supports all optional features.
+  - **redis cluster**: Distributed Redis cluster. Note: the `len` feature is not supported yet.
+  - **redb**: Embedded ACID transactional B-Tree. Supports all optional features (`ttl`, `len`, `map_len`).
+- Binary serialization via [`postcard`](https://crates.io/crates/postcard) — fast, compact
+- Asynchronous API with command-channel architecture for thread-safe operations
+- **Circuit Breaker** (optional): Protects all storage backends (sled, Redis, Redis Cluster, Redb) from cascading failures using [`tower-resilience-circuitbreaker`](https://crates.io/crates/tower-resilience-circuitbreaker). Configure failure thresholds, sliding windows, half-open recovery, and per-call operation timeouts.
 
 ## Feature Flags
 

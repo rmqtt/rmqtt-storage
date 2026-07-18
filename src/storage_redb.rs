@@ -19,7 +19,7 @@ use core::fmt;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -509,189 +509,217 @@ impl RedbStorageDB {
                 match cmd {
                     // ============ DB Operations ============
                     Command::DBInsert { key, val, tx } => {
-                        let result = Self::exec_db_insert(&db, &key, &val);
+                        let result =
+                            Self::exec_db_insert(&db, &key, &val).context("redb: db_insert");
                         let _ = tx.send(result);
                     }
                     Command::DBGet { key, tx } => {
-                        let result = Self::exec_db_get(&db, &key);
+                        let result = Self::exec_db_get(&db, &key).context("redb: db_get");
                         let _ = tx.send(result);
                     }
                     Command::DBRemove { key, tx } => {
-                        let result = Self::exec_db_remove(&db, &key);
+                        let result = Self::exec_db_remove(&db, &key).context("redb: db_remove");
                         let _ = tx.send(result);
                     }
                     Command::DBContainsKey { key, tx } => {
-                        let result = Self::exec_db_contains_key(&db, &key);
+                        let result =
+                            Self::exec_db_contains_key(&db, &key).context("redb: db_contains_key");
                         let _ = tx.send(result);
                     }
                     Command::DBBatchInsert { key_vals, tx } => {
-                        let result = Self::exec_db_batch_insert(&db, key_vals);
+                        let result = Self::exec_db_batch_insert(&db, key_vals)
+                            .context("redb: db_batch_insert");
                         let _ = tx.send(result);
                     }
                     Command::DBBatchRemove { keys, tx } => {
-                        let result = Self::exec_db_batch_remove(&db, keys);
+                        let result =
+                            Self::exec_db_batch_remove(&db, keys).context("redb: db_batch_remove");
                         let _ = tx.send(result);
                     }
                     Command::DBCounterIncr { key, increment, tx } => {
-                        let result = Self::exec_counter_incr(&db, &key, increment);
+                        let result = Self::exec_counter_incr(&db, &key, increment)
+                            .context("redb: counter_incr");
                         let _ = tx.send(result);
                     }
                     Command::DBCounterDecr { key, decrement, tx } => {
-                        let result = Self::exec_counter_decr(&db, &key, decrement);
+                        let result = Self::exec_counter_decr(&db, &key, decrement)
+                            .context("redb: counter_decr");
                         let _ = tx.send(result);
                     }
                     Command::DBCounterGet { key, tx } => {
-                        let result = Self::exec_counter_get(&db, &key);
+                        let result = Self::exec_counter_get(&db, &key).context("redb: counter_get");
                         let _ = tx.send(result);
                     }
                     Command::DBCounterSet { key, val, tx } => {
-                        let result = Self::exec_counter_set(&db, &key, val);
+                        let result =
+                            Self::exec_counter_set(&db, &key, val).context("redb: counter_set");
                         let _ = tx.send(result);
                     }
                     Command::DBLen { tx } => {
-                        let result = Self::exec_db_len(&db);
+                        let result = Self::exec_db_len(&db).context("redb: db_len");
                         let _ = tx.send(result);
                     }
                     Command::DBSize { tx } => {
-                        let result = Self::exec_db_size(&db);
+                        let result = Self::exec_db_size(&db).context("redb: db_size");
                         let _ = tx.send(result);
                     }
                     Command::DBInfo { tx } => {
-                        let result = Self::exec_db_info(&db);
+                        let result = Self::exec_db_info(&db).context("redb: db_info");
                         let _ = tx.send(result);
                     }
 
                     // ============ Map/List Container Management ============
                     Command::DBMapGet { key, tx } => {
-                        let result = Self::exec_db_map_contains_key(&db, &key);
+                        let result = Self::exec_db_map_contains_key(&db, &key)
+                            .context("redb: db_map_contains_key");
                         let _ = tx.send(result);
                     }
                     Command::DBListGet { key, tx } => {
-                        let result = Self::exec_db_list_contains_key(&db, &key);
+                        let result = Self::exec_db_list_contains_key(&db, &key)
+                            .context("redb: db_list_contains_key");
                         let _ = tx.send(result);
                     }
 
                     // ============ Iterators ============
                     Command::DBMapIter { tx } => {
-                        let result = Self::exec_db_map_iter(&db);
+                        let result = Self::exec_db_map_iter(&db).context("redb: db_map_iter");
                         let _ = tx.send(result);
                     }
                     Command::DBListIter { tx } => {
-                        let result = Self::exec_db_list_iter(&db);
+                        let result = Self::exec_db_list_iter(&db).context("redb: db_list_iter");
                         let _ = tx.send(result);
                     }
                     Command::DBScanIter { pattern, tx } => {
-                        let result = Self::exec_db_scan(&db, &pattern);
+                        let result = Self::exec_db_scan(&db, &pattern).context("redb: db_scan");
                         let _ = tx.send(result);
                     }
 
                     // ============ TTL ============
                     #[cfg(feature = "ttl")]
                     Command::DBExpireAt { key, at, tx } => {
-                        let result = Self::exec_db_expire_at(&db, &key, at);
+                        let result =
+                            Self::exec_db_expire_at(&db, &key, at).context("redb: db_expire_at");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::DBExpire { key, dur, tx } => {
-                        let result = Self::exec_db_expire(&db, &key, dur);
+                        let result =
+                            Self::exec_db_expire(&db, &key, dur).context("redb: db_expire");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::DBTtl { key, tx } => {
-                        let result = Self::exec_db_ttl(&db, &key);
+                        let result = Self::exec_db_ttl(&db, &key).context("redb: db_ttl");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::DBCleanup { tx } => {
-                        let result = Self::exec_cleanup(&db, 1000);
+                        let result = Self::exec_cleanup(&db, 1000).context("redb: cleanup");
                         let _ = tx.send(result);
                     }
 
                     // ============ Map Operations ============
                     Command::MapInsert { map, key, val, tx } => {
-                        let result = Self::exec_map_insert(&db, &map.name, &key, &val);
+                        let result = Self::exec_map_insert(&db, &map.name, &key, &val)
+                            .context("redb: map_insert");
                         let _ = tx.send(result);
                     }
                     Command::MapGet { map, key, tx } => {
-                        let result = Self::exec_map_get(&db, &map.name, &key);
+                        let result =
+                            Self::exec_map_get(&db, &map.name, &key).context("redb: map_get");
                         let _ = tx.send(result);
                     }
                     Command::MapRemove { map, key, tx } => {
-                        let result = Self::exec_map_remove(&db, &map.name, &key);
+                        let result =
+                            Self::exec_map_remove(&db, &map.name, &key).context("redb: map_remove");
                         let _ = tx.send(result);
                     }
                     Command::MapContainsKey { map, key, tx } => {
-                        let result = Self::exec_map_contains_key(&db, &map.name, &key);
+                        let result = Self::exec_map_contains_key(&db, &map.name, &key)
+                            .context("redb: map_contains_key");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "map_len")]
                     Command::MapLen { map, tx } => {
-                        let result = Self::exec_map_len(&db, &map.name);
+                        let result = Self::exec_map_len(&db, &map.name).context("redb: map_len");
                         let _ = tx.send(result);
                     }
                     Command::MapIsEmpty { map, tx } => {
-                        let result = Self::exec_map_is_empty(&db, &map.name);
+                        let result =
+                            Self::exec_map_is_empty(&db, &map.name).context("redb: map_is_empty");
                         let _ = tx.send(result);
                     }
                     Command::MapClear { map, tx } => {
-                        let result = Self::exec_map_clear(&db, &map.name);
+                        let result =
+                            Self::exec_map_clear(&db, &map.name).context("redb: map_clear");
                         let _ = tx.send(result);
                     }
                     Command::MapRemoveAndFetch { map, key, tx } => {
-                        let result = Self::exec_map_remove_and_fetch(&db, &map.name, &key);
+                        let result = Self::exec_map_remove_and_fetch(&db, &map.name, &key)
+                            .context("redb: map_remove_and_fetch");
                         let _ = tx.send(result);
                     }
                     Command::MapRemoveWithPrefix { map, prefix, tx } => {
-                        let result = Self::exec_map_remove_with_prefix(&db, &map.name, &prefix);
+                        let result = Self::exec_map_remove_with_prefix(&db, &map.name, &prefix)
+                            .context("redb: map_remove_with_prefix");
                         let _ = tx.send(result);
                     }
                     Command::MapBatchInsert { map, key_vals, tx } => {
-                        let result = Self::exec_map_batch_insert(&db, &map.name, key_vals);
+                        let result = Self::exec_map_batch_insert(&db, &map.name, key_vals)
+                            .context("redb: map_batch_insert");
                         let _ = tx.send(result);
                     }
                     Command::MapBatchRemove { map, keys, tx } => {
-                        let result = Self::exec_map_batch_remove(&db, &map.name, keys);
+                        let result = Self::exec_map_batch_remove(&db, &map.name, keys)
+                            .context("redb: map_batch_remove");
                         let _ = tx.send(result);
                     }
                     Command::MapIter { map, tx } => {
-                        let result = Self::exec_map_iter(&db, &map.name);
+                        let result = Self::exec_map_iter(&db, &map.name).context("redb: map_iter");
                         let _ = tx.send(result);
                     }
                     Command::MapKeyIter { map, tx } => {
-                        let result = Self::exec_map_key_iter(&db, &map.name);
+                        let result =
+                            Self::exec_map_key_iter(&db, &map.name).context("redb: map_key_iter");
                         let _ = tx.send(result);
                     }
                     Command::MapPrefixIter { map, prefix, tx } => {
-                        let result = Self::exec_map_prefix_iter(&db, &map.name, &prefix);
+                        let result = Self::exec_map_prefix_iter(&db, &map.name, &prefix)
+                            .context("redb: map_prefix_iter");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::MapExpireAt { map, at, tx } => {
-                        let result = Self::exec_map_expire_at(&db, &map.name, at);
+                        let result = Self::exec_map_expire_at(&db, &map.name, at)
+                            .context("redb: map_expire_at");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::MapExpire { map, dur, tx } => {
-                        let result = Self::exec_map_expire(&db, &map.name, dur);
+                        let result =
+                            Self::exec_map_expire(&db, &map.name, dur).context("redb: map_expire");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::MapTTL { map, tx } => {
-                        let result = Self::exec_map_ttl(&db, &map.name);
+                        let result = Self::exec_map_ttl(&db, &map.name).context("redb: map_ttl");
                         let _ = tx.send(result);
                     }
                     Command::MapIsExpired { map, tx } => {
-                        let result = Self::exec_map_is_expired(&db, &map.name);
+                        let result = Self::exec_map_is_expired(&db, &map.name)
+                            .context("redb: map_is_expired");
                         let _ = tx.send(result);
                     }
 
                     // ============ List Operations ============
                     Command::ListPush { list, val, tx } => {
-                        let result = Self::exec_list_push(&db, &list.name, &val);
+                        let result =
+                            Self::exec_list_push(&db, &list.name, &val).context("redb: list_push");
                         let _ = tx.send(result);
                     }
                     Command::ListPushs { list, vals, tx } => {
-                        let result = Self::exec_list_pushs(&db, &list.name, vals);
+                        let result = Self::exec_list_pushs(&db, &list.name, vals)
+                            .context("redb: list_pushs");
                         let _ = tx.send(result);
                     }
                     Command::ListPushLimit {
@@ -707,71 +735,80 @@ impl RedbStorageDB {
                             &val,
                             limit,
                             pop_front_if_limited,
-                        );
+                        )
+                        .context("redb: list_push_limit");
                         let _ = tx.send(result);
                     }
                     Command::ListPop { list, tx } => {
-                        let result = Self::exec_list_pop(&db, &list.name);
+                        let result = Self::exec_list_pop(&db, &list.name).context("redb: list_pop");
                         let _ = tx.send(result);
                     }
                     Command::ListAll { list, tx } => {
-                        let result = Self::exec_list_all(&db, &list.name);
+                        let result = Self::exec_list_all(&db, &list.name).context("redb: list_all");
                         let _ = tx.send(result);
                     }
                     Command::ListGetIndex { list, idx, tx } => {
-                        let result = Self::exec_list_get_index(&db, &list.name, idx);
+                        let result = Self::exec_list_get_index(&db, &list.name, idx)
+                            .context("redb: list_get_index");
                         let _ = tx.send(result);
                     }
                     Command::ListLen { list, tx } => {
-                        let result = Self::exec_list_len(&db, &list.name);
+                        let result = Self::exec_list_len(&db, &list.name).context("redb: list_len");
                         let _ = tx.send(result);
                     }
                     Command::ListIsEmpty { list, tx } => {
-                        let result = Self::exec_list_is_empty(&db, &list.name);
+                        let result = Self::exec_list_is_empty(&db, &list.name)
+                            .context("redb: list_is_empty");
                         let _ = tx.send(result);
                     }
                     Command::ListClear { list, tx } => {
-                        let result = Self::exec_list_clear(&db, &list.name);
+                        let result =
+                            Self::exec_list_clear(&db, &list.name).context("redb: list_clear");
                         let _ = tx.send(result);
                     }
                     Command::ListIter { list, tx } => {
-                        let result = Self::exec_list_iter(&db, &list.name);
+                        let result =
+                            Self::exec_list_iter(&db, &list.name).context("redb: list_iter");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::ListExpireAt { list, at, tx } => {
-                        let result = Self::exec_list_expire_at(&db, &list.name, at);
+                        let result = Self::exec_list_expire_at(&db, &list.name, at)
+                            .context("redb: list_expire_at");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::ListExpire { list, dur, tx } => {
-                        let result = Self::exec_list_expire(&db, &list.name, dur);
+                        let result = Self::exec_list_expire(&db, &list.name, dur)
+                            .context("redb: list_expire");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "ttl")]
                     Command::ListTTL { list, tx } => {
-                        let result = Self::exec_list_ttl(&db, &list.name);
+                        let result = Self::exec_list_ttl(&db, &list.name).context("redb: list_ttl");
                         let _ = tx.send(result);
                     }
                     Command::ListIsExpired { list, tx } => {
-                        let result = Self::exec_list_is_expired(&db, &list.name);
+                        let result = Self::exec_list_is_expired(&db, &list.name)
+                            .context("redb: list_is_expired");
                         let _ = tx.send(result);
                     }
 
                     // ============ Raw Operations (circuit-breaker) ============
                     #[cfg(feature = "circuit-breaker")]
                     Command::DBInsertRaw { key, val, tx } => {
-                        let result = Self::exec_db_insert(&db, &key, &val);
+                        let result =
+                            Self::exec_db_insert(&db, &key, &val).context("redb: db_insert_raw");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "circuit-breaker")]
                     Command::DBGetRaw { key, tx } => {
-                        let result = Self::exec_db_get(&db, &key);
+                        let result = Self::exec_db_get(&db, &key).context("redb: db_get_raw");
                         let _ = tx.send(result);
                     }
                     #[cfg(feature = "circuit-breaker")]
                     Command::DBRemoveRaw { key, tx } => {
-                        let result = Self::exec_db_remove(&db, &key);
+                        let result = Self::exec_db_remove(&db, &key).context("redb: db_remove_raw");
                         let _ = tx.send(result);
                     }
 
@@ -949,15 +986,10 @@ impl RedbStorageDB {
             let mut table = txn.open_table(KV_TABLE)?;
             let current: isize = table
                 .get(key)?
-                .map(|g| {
-                    let bytes = g.value();
-                    if bytes.len() >= 8 {
-                        let arr: [u8; 8] = bytes[..8].try_into().unwrap();
-                        isize::from_be_bytes(arr)
-                    } else {
-                        // sled behavior: on parse error, use increment
-                        increment
-                    }
+                .and_then(|g| {
+                    <[u8; 8]>::try_from(g.value())
+                        .ok()
+                        .map(isize::from_be_bytes)
                 })
                 .unwrap_or(0);
             let new = current + increment;
@@ -976,8 +1008,7 @@ impl RedbStorageDB {
         let table = txn.open_table(KV_TABLE)?;
         match table.get(key)? {
             Some(g) => {
-                let bytes = g.value();
-                let arr: [u8; 8] = bytes[..8.min(bytes.len())].try_into().unwrap_or([0; 8]);
+                let arr: [u8; 8] = <[u8; 8]>::try_from(g.value()).unwrap_or([0; 8]);
                 let val = isize::from_be_bytes(arr);
                 Ok(Some(val))
             }
@@ -1271,8 +1302,9 @@ impl RedbStorageDB {
                         if key_bytes.len() < 8 {
                             return None;
                         }
-                        let expire_at = u64::from_be_bytes(key_bytes[..8].try_into().unwrap())
-                            as TimestampMillis;
+                        let expire_at = u64::from_be_bytes(
+                            <[u8; 8]>::try_from(&key_bytes[..8]).unwrap_or([0; 8]),
+                        ) as TimestampMillis;
                         if expire_at <= now {
                             // Copy out of the read transaction before it drops
                             Some(key_bytes.to_vec())
@@ -2331,7 +2363,7 @@ enum Command {
 #[derive(Clone)]
 pub struct RedbStorageMap {
     db: RedbStorageDB,
-    name: Key,
+    name: Arc<Key>,
     #[allow(dead_code)]
     expire: Option<TimestampMillis>,
     empty: Arc<AtomicBool>,
@@ -2349,7 +2381,7 @@ impl RedbStorageMap {
     fn new(db: RedbStorageDB, name: Key, expire: Option<TimestampMillis>) -> Self {
         RedbStorageMap {
             db,
-            name,
+            name: Arc::new(name),
             expire,
             empty: Arc::new(AtomicBool::new(true)),
         }
@@ -2623,7 +2655,7 @@ impl Map for RedbStorageMap {
 #[derive(Clone)]
 pub struct RedbStorageList {
     db: RedbStorageDB,
-    name: Key,
+    name: Arc<Key>,
     #[allow(dead_code)]
     expire: Option<TimestampMillis>,
     empty: Arc<AtomicBool>,
@@ -2641,7 +2673,7 @@ impl RedbStorageList {
     fn new(db: RedbStorageDB, name: Key, expire: Option<TimestampMillis>) -> Self {
         RedbStorageList {
             db,
-            name,
+            name: Arc::new(name),
             expire,
             empty: Arc::new(AtomicBool::new(true)),
         }
@@ -2874,7 +2906,7 @@ impl StorageDB for RedbStorageDB {
         if let Some(expire_ms) = expire {
             if let Err(e) = self
                 .send_cmd(|tx| Command::DBExpireAt {
-                    key: map.name.clone(),
+                    key: map.name.to_vec(),
                     at: timestamp_millis() + expire_ms,
                     tx,
                 })
@@ -2922,7 +2954,7 @@ impl StorageDB for RedbStorageDB {
         if let Some(expire_ms) = expire {
             if let Err(e) = self
                 .send_cmd(|tx| Command::DBExpireAt {
-                    key: list.name.clone(),
+                    key: list.name.to_vec(),
                     at: timestamp_millis() + expire_ms,
                     tx,
                 })

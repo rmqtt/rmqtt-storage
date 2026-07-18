@@ -1,8 +1,9 @@
-//! Provides a unified storage abstraction with multiple backend implementations (sled, redis, redis-cluster).
+//! Provides a unified storage abstraction with multiple backend implementations (sled, redis, redis-cluster, redb).
 //!
 //! This module defines generic storage interfaces (`StorageDB`, `Map`, `List`) and implements them
 //! for different storage backends. It includes configuration handling, initialization functions,
-//! and common storage operations with support for expiration and batch operations.
+//! and common storage operations with support for expiration, batch operations, counters, and
+//! an optional circuit breaker for fault tolerance.
 
 #![deny(unsafe_code)]
 
