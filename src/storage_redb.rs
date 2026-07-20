@@ -317,7 +317,7 @@ fn def_cleanup(_db: &RedbStorageDB) {
         std::thread::spawn(move || {
             let limit = 5000;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_secs(60));
                 let mut total_cleanups = 0;
                 let now = std::time::Instant::now();
                 loop {
